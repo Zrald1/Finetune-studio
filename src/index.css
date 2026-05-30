@@ -1,0 +1,289 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-serif: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --color-editorial-primary: #050505;
+  --color-editorial-card: #0a0a0a;
+  --color-editorial-sidebar: #080808;
+  --color-editorial-accent: #F27D26;
+  --color-editorial-muted: #e0e0e0;
+
+  /* Professional desktop compact radiuses (Adobe / VSCode style) */
+  --radius-3xl: 10px;
+  --radius-2xl: 8px;
+  --radius-xl: 6px;
+  --radius-lg: 5px;
+  --radius-md: 4px;
+  --radius-sm: 2px;
+}
+
+:root {
+  font-family: var(--font-sans);
+  color-scheme: dark;
+  font-size: 14px; /* Slightly tighter base size for dense control panel layouts */
+  line-height: 1.42;
+  text-rendering: geometricPrecision;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+
+  /* Fluid Typography */
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-base: 13px;
+  --text-lg: 15px;
+  --text-xl: 18px;
+
+  /* Semantic Theme Variables - Default (Ember Pro) */
+  --app-bg: #0c0c0f;
+  --app-bg-soft: #111114;
+  --app-panel: #161619;
+  --app-panel-soft: #1e1e22;
+  --app-field: rgba(255, 255, 255, 0.03);
+  --app-border: rgba(255, 255, 255, 0.065);
+  --app-border-strong: rgba(255, 255, 255, 0.12);
+  --app-text: rgba(255, 255, 255, 0.95);
+  --app-muted: rgba(255, 255, 255, 0.6);
+  --app-faint: rgba(255, 255, 255, 0.35);
+  --app-accent: #f27d26;
+  --app-accent-soft: rgba(242, 125, 38, 0.08);
+  --app-accent-border: rgba(242, 125, 38, 0.25);
+  --app-accent-text: #ff9d4e;
+  --app-selection: rgba(242, 125, 38, 0.18);
+}
+
+:root[data-theme="graphite"] {
+  --app-bg: #141416;
+  --app-bg-soft: #1a1a1d;
+  --app-panel: #1e1e22;
+  --app-panel-soft: #26262b;
+  --app-field: rgba(255, 255, 255, 0.035);
+  --app-border: rgba(255, 255, 255, 0.07);
+  --app-border-strong: rgba(255, 255, 255, 0.12);
+  --app-accent: #3b82f6; /* Modern Blue accent */
+  --app-accent-soft: rgba(59, 130, 246, 0.08);
+  --app-accent-border: rgba(59, 130, 246, 0.25);
+  --app-accent-text: #60a5fa;
+  --app-selection: rgba(59, 130, 246, 0.18);
+}
+
+:root[data-theme="azure"] {
+  --app-bg: #0b0f17;
+  --app-bg-soft: #111824;
+  --app-panel: #162030;
+  --app-panel-soft: #1e293b;
+  --app-field: rgba(255, 255, 255, 0.03);
+  --app-border: rgba(255, 255, 255, 0.07);
+  --app-border-strong: rgba(255, 255, 255, 0.12);
+  --app-accent: #0ea5e9;
+  --app-accent-soft: rgba(14, 165, 233, 0.08);
+  --app-accent-border: rgba(14, 165, 233, 0.25);
+  --app-accent-text: #38bdf8;
+  --app-selection: rgba(14, 165, 233, 0.18);
+}
+
+:root[data-theme="sage"] {
+  --app-bg: #0d120f;
+  --app-bg-soft: #131b17;
+  --app-panel: #18231e;
+  --app-panel-soft: #202e27;
+  --app-field: rgba(255, 255, 255, 0.03);
+  --app-border: rgba(255, 255, 255, 0.07);
+  --app-border-strong: rgba(255, 255, 255, 0.12);
+  --app-accent: #10b981;
+  --app-accent-soft: rgba(16, 185, 129, 0.08);
+  --app-accent-border: rgba(16, 185, 129, 0.25);
+  --app-accent-text: #34d399;
+  --app-selection: rgba(16, 185, 129, 0.18);
+}
+
+:root[data-theme="noir"] {
+  --app-bg: #000000;
+  --app-bg-soft: #080808;
+  --app-panel: #0e0e0e;
+  --app-panel-soft: #161616;
+  --app-field: rgba(255, 255, 255, 0.02);
+  --app-border: rgba(255, 255, 255, 0.06);
+  --app-border-strong: rgba(255, 255, 255, 0.1);
+  --app-accent: #ffffff;
+  --app-accent-soft: rgba(255, 255, 255, 0.06);
+  --app-accent-border: rgba(255, 255, 255, 0.2);
+  --app-accent-text: #ffffff;
+  --app-selection: rgba(255, 255, 255, 0.15);
+}
+
+:root {
+  /* Premium UI Enhancements - Compact Flat Drop Shadows */
+  --premium-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  --glass-bg: rgba(255, 255, 255, 0.012);
+  --glass-border: rgba(255, 255, 255, 0.06);
+}
+
+/* Flat panel depth style */
+.glass-panel {
+  background: var(--glass-bg);
+  backdrop-filter: blur(8px);
+  border: 1px solid var(--glass-border);
+}
+
+.premium-card {
+  background: var(--app-panel);
+  border: 1px solid var(--app-border);
+  box-shadow: var(--premium-shadow);
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+
+.premium-card:hover {
+  border-color: var(--app-accent-border);
+  background: color-mix(in srgb, var(--app-panel) 98%, white 2%);
+}
+
+.premium-button {
+  transition: all 0.12s ease;
+  position: relative;
+  overflow: hidden;
+}
+
+.premium-button:hover {
+  brightness: 1.05;
+}
+
+.premium-input {
+  background: var(--app-field);
+  border: 1px solid var(--app-border);
+  transition: border-color 0.12s ease, background-color 0.12s ease;
+}
+
+.premium-input:focus {
+  background: rgba(0,0,0,0.45);
+  border-color: var(--app-accent);
+  box-shadow: none; /* Matte flat software look */
+}
+
+@keyframes fadeInScale {
+  from { opacity: 0; transform: translateY(2px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.animate-premium {
+  animation: fadeInScale 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+body {
+  margin: 0;
+  background-color: var(--app-bg);
+  color: var(--app-text);
+  font-size: var(--text-sm);
+  overflow: hidden;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+/* Fluid Typography Utilities */
+.text-xs-fluid { font-size: var(--text-xs); }
+.text-sm-fluid { font-size: var(--text-sm); }
+.text-base-fluid { font-size: var(--text-base); }
+.text-lg-fluid { font-size: var(--text-lg); }
+.text-xl-fluid { font-size: var(--text-xl); }
+
+/* Theme Utility Classes */
+.theme-app-bg {
+  background-color: var(--app-bg);
+  color: var(--app-text);
+}
+
+.theme-app-main {
+  background-color: var(--app-bg-soft);
+}
+
+.theme-header {
+  background-color: var(--app-bg);
+  border-color: var(--app-border);
+}
+
+.theme-tabbar {
+  background-color: var(--app-bg-soft);
+  border-color: var(--app-border);
+}
+
+.theme-surface {
+  background-color: var(--app-panel);
+  border-color: var(--app-border);
+  color: var(--app-text);
+}
+
+.theme-surface-soft {
+  background-color: var(--app-panel-soft);
+  border-color: var(--app-border);
+}
+
+.theme-field {
+  background-color: var(--app-field);
+  border-color: var(--app-border);
+  color: var(--app-text);
+}
+
+.theme-field:focus {
+  border-color: var(--app-accent);
+  background-color: color-mix(in srgb, var(--app-panel) 82%, black);
+}
+
+.theme-accent {
+  color: var(--app-accent-text);
+}
+
+.theme-accent-bg,
+.bg-theme-accent {
+  background-color: var(--app-accent);
+}
+
+.border-theme-accent {
+  border-color: var(--app-accent);
+}
+
+.theme-accent-soft {
+  background-color: var(--app-accent-soft);
+  border-color: var(--app-accent-border);
+  color: var(--app-accent-text);
+}
+
+.theme-muted {
+  color: var(--app-muted);
+}
+
+.theme-faint {
+  color: var(--app-faint);
+}
+
+.theme-selection::selection {
+  background-color: var(--app-selection);
+}
+
+/* Custom Scrollbars for Pro desktop applications */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+

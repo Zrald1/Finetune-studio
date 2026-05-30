@@ -1,0 +1,460 @@
+use crate::error::{AppError, Result};
+use crate::ingest;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use tokio::fs;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SshConfig {
+    pub host: String,
+    #[serde(default = "default_ssh_port")]
+    pub port: u16,
+    #[serde(default = "default_username")]
+    pub username: String,
+    pub private_key_path: Option<String>,
+    pub private_key: Option<String>, // raw PEM contents
+    pub password: Option<String>,
+}
+
+fn default_ssh_port() -> u16 {
+    22
+}
+fn default_username() -> String {
+    "root".to_string()
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct QdrantConfig {
+    /// Base URL of the Qdrant instance. For the self-hosted GPU-server flow this
+    /// is `http://<droplet-ip>:6333`. `api_key` is blank for the local instance.
+    pub endpoint: String,
+    pub api_key: String,
+    /// Default/legacy single-collection name. Multi-embedder ingest uses each
+    /// embedder's own `collection` instead (see `EmbedderConfig`).
+    pub collection: String,
+}
+
+/// One self-hosted embedding model served on the GPU server via
+/// `vllm serve <model_id> --runner pooling --port <port>` (or `--task embed` on older vLLM). Each embedder owns its
+/// own Qdrant collection (different models produce different vector dims, so
+/// collections can't be shared). The user can add as many as the GPU allows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct EmbedderConfig {
+    /// Human label, e.g. "law", "math", "science". Drives the default collection.
+    pub name: String,
+    /// Hugging Face model id served on vLLM, e.g. "Qwen/Qwen3-Embedding-8B".
+    pub model_id: String,
+    /// Dedicated host port the embedder's vLLM `/v1/embeddings` listens on.
+    pub port: u16,
+    /// Qdrant collection that holds this embedder's chunks. Defaults to a slug
+    /// of `name` (e.g. "kb_law") when blank.
+    pub collection: String,
+    /// In-flight embed requests during ingest for this embedder.
+    pub concurrency: u32,
+    /// Detected on first successful embed; used to create the collection with the
+    /// matching vector size. `None` until the first ingest probes the model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_dim: Option<usize>,
+    /// Whether this embedder participates in "Setup all embedding models".
+    pub enabled: bool,
+}
+
+impl Default for EmbedderConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            model_id: "Qwen/Qwen3-Embedding-8B".to_string(),
+            port: 8100,
+            collection: String::new(),
+            concurrency: 2,
+            vector_dim: None,
+            enabled: true,
+        }
+    }
+}
+
+impl EmbedderConfig {
+    /// The collection name to use, falling back to a slug of `name`.
+    pub fn effective_collection(&self) -> String {
+        let c = self.collection.trim();
+        if !c.is_empty() {
+            return c.to_string();
+        }
+        let slug: String = self
+            .name
+            .trim()
+            .to_lowercase()
+            .chars()
+            .map(|ch| if ch.is_alphanumeric() { ch } else { '_' })
+            .collect();
+        let slug = slug.trim_matches('_');
+        if slug.is_empty() {
+            "kb_default".to_string()
+        } else {
+            format!("kb_{}", slug)
+        }
+    }
+
+    /// OpenAI-compatible base URL for this embedder against the given host.
+    pub fn api_url(&self, host: &str) -> String {
+        format!("http://{}:{}", host, self.port)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ServingEngine {
+    Vllm,
+    Sglang,
+}
+
+impl Default for ServingEngine {
+    fn default() -> Self {
+        Self::Vllm
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TeacherConfig {
+    pub repo_id: String,
+    pub vllm_port: u16,
+    pub max_model_len: u32,
+    pub dtype: String,
+    pub tensor_parallel: u32,
+    pub gpu_memory_utilization: f32,
+    pub auto_tune: bool,
+    pub enable_chunked_prefill: bool,
+    pub max_num_batched_tokens: Option<u32>,
+    pub max_num_seqs: Option<u32>,
+    pub enable_auto_tool_choice: bool,
+    pub tool_call_parser: Option<String>,
+    pub custom_serve_cmd: Option<String>,
+    #[serde(default)]
+    pub serving_engine: ServingEngine,
+}
+
+impl Default for TeacherConfig {
+    fn default() -> Self {
+        Self {
+            repo_id: "deepseek-ai/DeepSeek-V3".to_string(),
+            vllm_port: 8000,
+            max_model_len: 32768,
+            dtype: "bfloat16".to_string(),
+            tensor_parallel: 1,
+            gpu_memory_utilization: 0.95,
+            auto_tune: true,
+            enable_chunked_prefill: true,
+            max_num_batched_tokens: Some(8192),
+            max_num_seqs: Some(16),
+            enable_auto_tool_choice: false,
+            tool_call_parser: None,
+            custom_serve_cmd: None,
+            serving_engine: ServingEngine::Sglang,
+        }
+    }
+}
+
+impl TeacherConfig {
+    pub fn resolved_for_gpu(&self, gpu_memory_total_mb: Option<f64>) -> Self {
+        let mut resolved = self.clone();
+        if !resolved.auto_tune
+            || resolved
+                .custom_serve_cmd
+                .as_ref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+        {
+            return resolved;
+        }
+
+        let repo = resolved.repo_id.to_lowercase();
+        let memory_gb = gpu_memory_total_mb.unwrap_or(0.0) / 1024.0;
+        let is_qwen3 = repo.contains("qwen3");
+        let is_vl = repo.contains("-vl") || repo.contains("vision");
+        let is_gguf = repo.contains("gguf");
+
+        resolved.dtype = "bfloat16".to_string();
+        resolved.gpu_memory_utilization = if resolved.serving_engine == ServingEngine::Sglang {
+            0.85
+        } else {
+            0.95
+        };
+        resolved.tensor_parallel = resolved.tensor_parallel.max(1);
+        resolved.enable_chunked_prefill = true;
+
+        resolved.max_model_len = if is_qwen3 && is_vl && memory_gb >= 180.0 {
+            100000
+        } else if (is_qwen3 || is_vl) && memory_gb >= 96.0 {
+            65536
+        } else if is_gguf {
+            32768
+        } else {
+            resolved.max_model_len.max(32768)
+        };
+
+        resolved.max_num_batched_tokens = Some(if memory_gb > 0.0 && memory_gb < 64.0 {
+            4096
+        } else {
+            8192
+        });
+
+        resolved.max_num_seqs = Some(if memory_gb > 0.0 && memory_gb < 64.0 {
+            4
+        } else if memory_gb > 0.0 && memory_gb < 128.0 {
+            8
+        } else {
+            16
+        });
+
+        if is_qwen3 {
+            resolved.enable_auto_tool_choice = true;
+            resolved.tool_call_parser = Some("qwen3_coder".to_string());
+        } else {
+            resolved.enable_auto_tool_choice = false;
+            resolved.tool_call_parser = None;
+        }
+
+        resolved
+    }
+
+    pub fn vllm_extra_args(&self) -> String {
+        let mut args = Vec::new();
+        if self.enable_chunked_prefill {
+            args.push("--enable-chunked-prefill".to_string());
+        }
+        if let Some(tokens) = self.max_num_batched_tokens.filter(|n| *n > 0) {
+            args.push(format!("--max-num-batched-tokens {}", tokens));
+        }
+        if let Some(seqs) = self.max_num_seqs.filter(|n| *n > 0) {
+            args.push(format!("--max-num-seqs {}", seqs));
+        }
+        if self.enable_auto_tool_choice {
+            args.push("--enable-auto-tool-choice".to_string());
+            if let Some(parser) = self.tool_call_parser.as_ref().filter(|s| !s.trim().is_empty()) {
+                args.push(format!("--tool-call-parser {}", parser.trim()));
+            }
+        }
+        args.join(" ")
+    }
+
+    pub fn vllm_runtime_prepare_cmd(&self) -> String {
+        let repo = self.repo_id.to_lowercase();
+        if !(repo.contains("deepseek-v4") || repo.contains("deepseek_v4")) {
+            return String::new();
+        }
+
+        "python3 -c \"from transformers.models.auto.configuration_auto import CONFIG_MAPPING; import sys; sys.exit(0 if \\\"deepseek_v4\\\" in CONFIG_MAPPING else 1)\" || { echo [compat] installing Transformers with DeepSeek V4 support; python3 -m pip install --no-cache-dir --upgrade git+https://github.com/huggingface/transformers.git || exit 42; }; ".to_string()
+    }
+
+    pub fn sglang_extra_args(&self) -> String {
+        let mut args = Vec::new();
+        let repo = self.repo_id.to_lowercase();
+        // If it's a DeepSeek V3 or R1 model, optimize with FP8
+        if repo.contains("deepseek") && (repo.contains("v3") || repo.contains("r1")) {
+            args.push("--quantization fp8".to_string());
+        }
+        args.join(" ")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct StudentConfig {
+    pub repo_id: String,
+    pub output_dir: String,
+}
+
+impl Default for StudentConfig {
+    fn default() -> Self {
+        Self {
+            repo_id: "Qwen/Qwen2.5-7B-Instruct".to_string(),
+            output_dir: "/root/fine-tune/runs".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct DockerConfig {
+    pub enabled: bool,
+    pub container_name: String,
+    pub image_name: String,
+    pub start_args: String,
+    pub bypass_terminal: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct DigitalOceanConfig {
+    pub api_key: String,
+    pub droplet_name: String,
+    pub region: String,
+    pub size: String,
+    pub image: String,
+    pub ssh_keys: String,
+    pub project_id: String,
+    pub tags: String,
+    pub backups: bool,
+    pub ipv6: bool,
+    pub monitoring: bool,
+    pub user_data: String,
+}
+
+impl Default for DigitalOceanConfig {
+    fn default() -> Self {
+        Self {
+            api_key: String::new(),
+            droplet_name: String::new(),
+            region: String::new(),
+            size: String::new(),
+            image: "220895104".to_string(),
+            ssh_keys: String::new(),
+            project_id: String::new(),
+            tags: String::new(),
+            backups: false,
+            ipv6: false,
+            monitoring: true,
+            user_data: String::new(),
+        }
+    }
+}
+
+impl Default for DockerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            container_name: "rocm-vllm".to_string(),
+            image_name: "rocm/vllm:latest".to_string(),
+            start_args: "--device=/dev/kfd --device=/dev/dri --network=host --ipc=host --group-add video -v /root:/root".to_string(),
+            bypass_terminal: false,
+        }
+    }
+}
+
+/// Mirror of the frontend's AIAgentConfig (src/types.ts). Persisting this
+/// server-side lets the API key the user types into the AI terminal panel
+/// survive an app restart — previously the field was silently dropped here,
+/// so on reload the frontend fell back to DEFAULT_AI_AGENT (provider:
+/// featherless) and the user had to retype the key every session.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AiAgentConfig {
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub api_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub model_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PaddleOcrConfig {
+    pub enabled: bool,
+    #[serde(default)]
+    pub port: u16,
+    #[serde(default)]
+    pub model_name: String,
+    #[serde(default)]
+    pub docker_image: String,
+}
+
+impl Default for PaddleOcrConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: 8118,
+            model_name: "PaddleOCR-VL-1.6-0.9B".to_string(),
+            docker_image: "ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-vllm-server:latest-amd-gpu".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AppConfig {
+    pub ssh: SshConfig,
+    #[serde(default)]
+    pub digital_ocean: DigitalOceanConfig,
+    pub qdrant: QdrantConfig,
+    pub hf_token: Option<String>,
+    /// Deprecated: Featherless cloud embedding/teacher was removed in favour of
+    /// self-hosted vLLM embedders on the GPU server. Kept here only so existing
+    /// config.json files (which still carry this key) continue to parse. Never
+    /// read, never written.
+    #[serde(default, skip_serializing)]
+    pub featherless_api_key: Option<String>,
+    /// Self-hosted embedding models served on the GPU server. Each owns a Qdrant
+    /// collection. Replaces the old cloud-embedding config.
+    #[serde(default)]
+    pub embedders: Vec<EmbedderConfig>,
+    pub teacher: TeacherConfig,
+    pub student: StudentConfig,
+    pub docker: DockerConfig,
+    #[serde(default)]
+    pub paddle_ocr: PaddleOcrConfig,
+    #[serde(default)]
+    pub ai_agent: Option<AiAgentConfig>,
+    #[serde(default)]
+    pub prompt_template: Option<String>,
+    pub embedding: Option<ingest::EmbeddingConfig>,
+}
+
+pub fn app_dir() -> Result<PathBuf> {
+    let base = dirs::config_dir()
+        .ok_or_else(|| AppError::config("no OS config dir available"))?;
+    Ok(base.join("fine-tune"))
+}
+
+pub fn config_path() -> Result<PathBuf> {
+    Ok(app_dir()?.join("config.json"))
+}
+
+pub fn runs_dir() -> Result<PathBuf> {
+    Ok(app_dir()?.join("runs"))
+}
+
+pub async fn ensure_dirs() -> Result<()> {
+    fs::create_dir_all(app_dir()?).await?;
+    fs::create_dir_all(runs_dir()?).await?;
+    Ok(())
+}
+
+pub async fn load() -> Result<AppConfig> {
+    ensure_dirs().await?;
+    let path = config_path()?;
+    if !path.exists() {
+        return Ok(AppConfig::default());
+    }
+    let txt = fs::read_to_string(&path).await?;
+    let mut cfg: AppConfig = serde_json::from_str(&txt)
+        .map_err(|e| AppError::config(format!("parse config.json: {e}")))?;
+    if cfg.qdrant.endpoint.is_empty() && !cfg.ssh.host.is_empty() {
+        cfg.qdrant.endpoint = format!("http://{}:6333", cfg.ssh.host);
+    }
+
+    // Migrate old PaddleOCR config values
+    let default_pocr = PaddleOcrConfig::default();
+    if !cfg.paddle_ocr.docker_image.is_empty()
+        && cfg.paddle_ocr.docker_image != default_pocr.docker_image
+    {
+        cfg.paddle_ocr.docker_image = default_pocr.docker_image.clone();
+    }
+    if cfg.paddle_ocr.model_name != default_pocr.model_name {
+        cfg.paddle_ocr.model_name = default_pocr.model_name.clone();
+    }
+    Ok(cfg)
+}
+
+pub async fn save(cfg: &AppConfig) -> Result<()> {
+    ensure_dirs().await?;
+    let txt = serde_json::to_string_pretty(cfg)?;
+    fs::write(config_path()?, txt).await?;
+    Ok(())
+}

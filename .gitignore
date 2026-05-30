@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+coverage/
+
+# Rust / Tauri build artifacts
+src-tauri/target/
+src-tauri/gen/
+
+# Logs
+*.log
+vite.dev.out.log
+vite.dev.err.log
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Local editor / agent state
+.claude/
+.DS_Store
+.idea/
+.vscode/
+
+# Scratch & work-in-progress notes (not part of the shipped app)
+scratch/
+*_FIX.txt
+src/components/*.tsx_FIX.txt
