@@ -478,25 +478,27 @@ export default function CredentialsPanel({
   };
 
   return (
-    <div className="premium-card rounded-2xl overflow-hidden animate-premium">
-      <div className="px-8 py-6 border-b theme-surface-soft flex items-start justify-between gap-4 bg-white/[0.02] backdrop-blur-md">
-        <div className="space-y-1.5">
-          <div className="flex items-center gap-2">
-            <div className="w-1.5 h-6 theme-accent-bg rounded-full shadow-[0_0_10px_rgba(var(--app-accent-rgb),0.5)]" />
-            <p className="text-[10px] uppercase tracking-[0.3em] theme-accent font-black font-mono">
+    <div className="xl:col-span-2 premium-card rounded-3xl overflow-hidden animate-premium relative">
+      {/* Accent rail across the top of the whole panel */}
+      <div className="absolute top-0 left-0 w-full h-px bg-gradient-to-r from-transparent via-theme-accent/40 to-transparent" />
+      <div className="px-8 py-7 border-b border-white/5 flex items-start justify-between gap-4 bg-gradient-to-br from-white/[0.04] via-white/[0.015] to-transparent backdrop-blur-md">
+        <div className="space-y-2">
+          <div className="flex items-center gap-2.5">
+            <div className="w-1.5 h-6 theme-accent-bg rounded-full shadow-[0_0_12px_rgba(var(--app-accent-rgb),0.6)]" />
+            <p className="text-[10px] uppercase tracking-[0.35em] theme-accent font-black font-mono">
               Access Control
             </p>
           </div>
-          <h2 className="text-2xl-fluid font-serif italic text-white tracking-tight font-black">
+          <h2 className="text-2xl-fluid font-serif italic text-white tracking-tight font-black leading-none">
             System Credentials
           </h2>
-          <p className="text-sm-fluid theme-muted font-medium opacity-80">
+          <p className="text-sm-fluid theme-muted font-medium opacity-70">
             SSH, vector store, and model provider settings
           </p>
         </div>
-        <div className={`shrink-0 inline-flex items-center gap-2.5 rounded-full border px-4 py-2 text-[10px] uppercase tracking-widest font-black font-mono transition-all duration-500 shadow-lg ${
+        <div className={`shrink-0 inline-flex items-center gap-2.5 rounded-full border px-4 py-2 text-[10px] uppercase tracking-widest font-black font-mono transition-all duration-500 shadow-lg backdrop-blur-md ${
           connection.isConnected
-            ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
+            ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400 shadow-emerald-500/10"
             : "theme-surface-soft theme-muted border-white/5"
         }`}>
           <span className={`w-2 h-2 rounded-full shadow-[0_0_8px_currentColor] ${connection.isConnected ? "bg-emerald-400 animate-pulse" : "theme-faint"}`} />
@@ -504,9 +506,10 @@ export default function CredentialsPanel({
         </div>
       </div>
 
+      {/* Body: responsive two-column dashboard of credential cards */}
+      <div className="p-6 sm:p-8 grid grid-cols-1 xl:grid-cols-2 gap-6 items-start">
       {/* SSH */}
-      <div className="p-8 space-y-8">
-      <div className="space-y-5">
+      <div className="space-y-5 rounded-2xl border border-white/5 bg-white/[0.015] p-6 shadow-inner transition-colors hover:border-white/10 xl:row-span-2">
         <div className="flex items-center gap-3 pb-3 border-b border-white/5">
           <div className="w-10 h-10 rounded-xl theme-accent-soft theme-accent flex items-center justify-center glass-panel shadow-inner group transition-transform duration-300 hover:scale-105">
             <LockKeyhole className="w-5 h-5 group-hover:rotate-12 transition-transform" />
@@ -629,7 +632,7 @@ export default function CredentialsPanel({
       </div>
 
       {/* DigitalOcean */}
-      <div className="pt-8 border-t border-white/5 space-y-4">
+      <div className="space-y-4 rounded-2xl border border-white/5 bg-white/[0.015] p-6 shadow-inner transition-colors hover:border-white/10">
         <div className="flex items-center gap-3">
           <div className="w-10 h-10 rounded-xl theme-surface-soft theme-muted flex items-center justify-center glass-panel shadow-inner transition-transform duration-300 hover:scale-105 border border-white/5">
             <Cloud className="w-5 h-5" />
@@ -661,7 +664,7 @@ export default function CredentialsPanel({
       </div>
 
       {/* Qdrant */}
-      <div className="pt-8 border-t border-white/5 space-y-5">
+      <div className="space-y-5 rounded-2xl border border-white/5 bg-white/[0.015] p-6 shadow-inner transition-colors hover:border-white/10">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-xl theme-accent-soft theme-accent flex items-center justify-center glass-panel shadow-inner transition-transform duration-300 hover:scale-105">
@@ -733,7 +736,7 @@ export default function CredentialsPanel({
 
       {/* Qdrant Database Manager */}
       {qd.endpoint && (
-        <div className="pt-8 border-t border-white/5 space-y-5">
+        <div className="xl:col-span-2 space-y-5 rounded-2xl border border-white/5 bg-white/[0.015] p-6 shadow-inner transition-colors hover:border-white/10">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
               <div className="w-10 h-10 rounded-xl theme-accent-soft theme-accent flex items-center justify-center glass-panel shadow-inner transition-transform duration-300 hover:scale-105">
@@ -934,7 +937,7 @@ export default function CredentialsPanel({
       )}
 
       {/* Tokens */}
-      <div className="pt-8 border-t border-white/5 space-y-6">
+      <div className="xl:col-span-2 space-y-6 rounded-2xl border border-white/5 bg-white/[0.015] p-6 shadow-inner transition-colors hover:border-white/10">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-xl theme-surface-soft theme-muted flex items-center justify-center glass-panel shadow-inner transition-transform duration-300 hover:scale-105 border border-white/5">
@@ -974,6 +977,8 @@ export default function CredentialsPanel({
           </div>
         </div>
 
+        {/* Service config cards — responsive grid on wide screens */}
+        <div className="grid grid-cols-1 xl:grid-cols-2 gap-5 items-start">
         {/* Embedding Configuration */}
         <div className="space-y-4 glass-panel rounded-2xl p-5 border border-white/5 relative overflow-hidden group">
           <div className="absolute top-0 left-0 w-1 h-full theme-accent-bg opacity-30" />
@@ -1190,7 +1195,7 @@ export default function CredentialsPanel({
         </div>
 
         {/* AI Copilot Agent Configuration */}
-        <div className="space-y-4 glass-panel rounded-2xl p-5 border border-white/5 relative overflow-hidden group">
+        <div className="xl:col-span-2 space-y-4 glass-panel rounded-2xl p-5 border border-white/5 relative overflow-hidden group">
           <div className="absolute top-0 left-0 w-1 h-full theme-accent-bg opacity-30" />
           <div className="flex items-center justify-between">
             <label className="text-[10px] uppercase tracking-[0.2em] theme-accent font-black italic font-serif flex items-center gap-2">
@@ -1307,10 +1312,11 @@ export default function CredentialsPanel({
             </div>
           )}
         </div>
+        </div>
       </div>
 
       {/* Docker */}
-      <div className="pt-8 border-t border-white/5 space-y-6">
+      <div className="space-y-6 rounded-2xl border border-white/5 bg-white/[0.015] p-6 shadow-inner transition-colors hover:border-white/10">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-xl theme-surface-soft theme-muted flex items-center justify-center glass-panel shadow-inner transition-transform duration-300 hover:scale-105 border border-white/5">
@@ -1386,7 +1392,7 @@ export default function CredentialsPanel({
       </div>
 
       {/* Actions */}
-      <div className="pt-8 border-t border-white/5 space-y-4">
+      <div className="xl:col-span-2 space-y-4 rounded-2xl border border-theme-accent/10 bg-gradient-to-br from-theme-accent/[0.04] to-transparent p-6 shadow-inner">
         <button
           onClick={onTestConnection}
           disabled={connection.isTesting || !ssh.host}
