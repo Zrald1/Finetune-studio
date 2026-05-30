@@ -218,15 +218,16 @@ export const DEFAULT_DIGITAL_OCEAN: DigitalOceanConfig = {
   userData: "",
 };
 
+// Curated fallback lists — at most 5 per provider, freshest first. Used only
+// when no API key is set; once a key is entered we fetch the live /models list
+// (also capped at 5 by the backend). Keep these short and current.
 export const POPULAR_MODELS: Record<string, string[]> = {
   openai: [
     "gpt-5.5",
     "gpt-5.5-instant",
     "gpt-5.4-mini",
     "gpt-4o",
-    "gpt-4o-mini",
-    "o1",
-    "o1-mini"
+    "o1"
   ],
   anthropic: [
     "claude-opus-4-7",
@@ -238,8 +239,8 @@ export const POPULAR_MODELS: Record<string, string[]> = {
   gemini: [
     "gemini-3.5-flash",
     "gemini-3.1-pro",
-    "gemini-1.5-flash",
-    "gemini-1.5-pro"
+    "gemini-1.5-pro",
+    "gemini-1.5-flash"
   ],
   groq: [
     "llama-3.3-70b-versatile",
@@ -250,17 +251,14 @@ export const POPULAR_MODELS: Record<string, string[]> = {
   xai: [
     "grok-4.3",
     "grok-2",
-    "grok-beta",
-    "grok-2-mini"
+    "grok-2-mini",
+    "grok-beta"
   ],
   vultr: [
     "MiniMax-M2.7",
     "MiMo-V2.5-Pro",
     "Kimi-K2.6",
     "DeepSeek-V3.2-NVFP4",
-    "Llama-3.1-Nemotron-Safety-Guard-8B-v3",
-    "Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16",
-    "Nemotron-Cascade-2-30B-A3B",
     "GLM-5.1-FP8"
   ],
   custom: []

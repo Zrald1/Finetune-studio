@@ -3,6 +3,7 @@ import type { AppConfig, GPUState, ShellDoneEvent, ShellLogEvent } from "./types
 import { DEFAULT_AI_AGENT, DEFAULT_DIGITAL_OCEAN, DEFAULT_EMBEDDING, DEFAULT_LORA, DEFAULT_TEACHER } from "./types";
 import { api, events } from "./lib/tauri";
 import { startGlobalSubscription } from "./lib/runStreams";
+import { startSetupLogSubscription } from "./lib/setupLogs";
 import CredentialsPanel from "./components/CredentialsPanel";
 import AITerminalPanel from "./components/AITerminalPanel";
 import GPUStatsDashboard from "./components/GPUStatsDashboard";
@@ -130,11 +131,18 @@ export default function App() {
   // tab and RunDashboard is unmounted.
   useEffect(() => {
     let teardown: (() => void) | null = null;
+    let teardownSetup: (() => void) | null = null;
     startGlobalSubscription().then((fn) => {
       teardown = fn;
     });
+    // Also mirror all setup://log events (teacher serving, embedder/OCR boot)
+    // into a global buffer so the AI agent can read them on any page.
+    startSetupLogSubscription().then((fn) => {
+      teardownSetup = fn;
+    });
     return () => {
       teardown?.();
+      teardownSetup?.();
     };
   }, []);
 
@@ -347,9 +355,6 @@ export default function App() {
               {connection.isConnected ? "Droplet Live" : "Offline"}
             </span>
           </div>
-          <span className="text-[10px] bg-white/5 border border-white/10 theme-accent font-mono tracking-[0.2em] font-black px-4 py-1.5 rounded-lg shadow-inner">
-            V0.1 // TAURI
-          </span>
         </div>
       </header>
 

@@ -108,7 +108,6 @@ const SELECT_CLASS =
 const OPTION_CLASS = "theme-surface theme-text";
 
 const PRESET_TEACHER_MODELS = [
-  { value: "deepseek-ai/DeepSeek-V3", label: "DeepSeek V3 (685B MoE, Optimized for MI350X)" },
   { value: "Qwen/Qwen3.6-35B-A3B", label: "Qwen 3.6 35B A3B (Recommended MoE)" },
   { value: "Qwen/Qwen2.5-72B-Instruct", label: "Qwen 2.5 72B Instruct (High Parameter)" },
   { value: "Qwen/Qwen2.5-32B-Instruct", label: "Qwen 2.5 32B Instruct" },
@@ -117,7 +116,6 @@ const PRESET_TEACHER_MODELS = [
   { value: "Qwen/Qwen2.5-Coder-32B-Instruct", label: "Qwen 2.5 Coder 32B Instruct" },
   { value: "Qwen/Qwen2.5-Coder-7B-Instruct", label: "Qwen 2.5 Coder 7B Instruct" },
   { value: "deepseek-ai/DeepSeek-R1-Distill-Llama-70B", label: "DeepSeek R1 Distill Llama 70B" },
-  { value: "unsloth/DeepSeek-R1-Distill-Llama-70B-GGUF:Q4_K_M", label: "DeepSeek R1 Distill Llama 70B (GGUF)" },
 ];
 
 function autoTuneTeacherConfig(base: TeacherConfig, gpuStatus?: GPUState | null): TeacherConfig {

@@ -18,6 +18,7 @@ import type { AppConfig, GPUState, AIAgentConfig, Run } from "../types";
 import { DEFAULT_AI_AGENT, POPULAR_MODELS } from "../types";
 import { api } from "../lib/tauri";
 import { getStream as getRunStream, hydrateFromDisk as hydrateRunFromDisk } from "../lib/runStreams";
+import { getSetupLogTail, hasSetupLogs } from "../lib/setupLogs";
 
 interface Message {
   role: "user" | "assistant" | "system";
@@ -63,7 +64,7 @@ export default function AITerminalPanel({
     {
       role: "assistant",
       content:
-        "Hello! I am your Fine-Tune Studio AI agent. I can **run commands on your GPU server over SSH** AND **read the live Execution Logs of your training runs directly** (stage messages, step metrics, loss curves). Ask me about the training run, `rocm-smi`, containers, anything — I'll fetch the right info and explain it."
+        "Hello! I am your Fine-Tune Studio AI agent. I can **run commands on your GPU server over SSH** AND **read your live logs directly** — training runs (stage messages, step metrics, loss curves), teacher / embedder / OCR boot logs, and the visible terminal console. I automatically look at whatever page you're on. Ask me about the training run, the teacher serving, an embedder, `rocm-smi`, containers — anything."
     }
   ]);
   const [isLoadingResponse, setIsLoadingResponse] = useState(false);
@@ -104,11 +105,14 @@ export default function AITerminalPanel({
     return cmds;
   };
 
-  // Special marker the AI uses to request local execution logs (no SSH).
+  // Special marker the AI uses to request local logs (no SSH).
   // Syntax inside a ```bash block:
-  //   __exec_logs__              → tail of the most recently active run
+  //   __exec_logs__              → tail of the most recently active TRAINING run
   //   __exec_logs__ <runId>      → tail of a specific run
   //   __exec_logs__ <runId> 400  → last 400 lines of a specific run
+  //   __exec_logs__ setup        → teacher serving / embedder / OCR boot logs
+  //   __exec_logs__ terminal     → the live terminal console the user sees
+  //   __exec_logs__ setup 600    → setup/terminal logs with a custom line count
   const EXEC_LOGS_MARKER = "__exec_logs__";
   const isExecLogsCommand = (cmd: string) => cmd.trim().startsWith(EXEC_LOGS_MARKER);
 
@@ -138,6 +142,31 @@ export default function AITerminalPanel({
     const parts = rawCmd.trim().split(/\s+/).slice(1); // drop marker
     const runToken = parts[0];
     const tailLines = Math.min(parseInt(parts[1] || "300", 10) || 300, 2000);
+
+    // --- Non-run log sources --------------------------------------------
+    // "terminal" → the live console the user sees in the right pane.
+    if (runToken === "terminal") {
+      const text = logs || "";
+      if (!text.trim()) {
+        return "(the terminal console is empty — no command output yet.)";
+      }
+      const trimmed = text.split(/\r?\n/).slice(-tailLines).join("\n");
+      return ["--- Live terminal console ---", trimmed].join("\n");
+    }
+
+    // "setup" → teacher serving / embedder / PaddleOCR / Qdrant boot logs.
+    // These are emitted as setup://log events and captured globally so they
+    // survive tab navigation.
+    if (runToken === "setup") {
+      if (!hasSetupLogs()) {
+        return "(no setup/serving logs captured yet — nothing has been booted this session. Start a teacher, embedder, or OCR service from the Pipeline/Credentials tab, or check the SSH host is reachable.)";
+      }
+      const trimmed = getSetupLogTail(tailLines);
+      return [
+        "--- Teacher / embedder / OCR setup & serving logs ---",
+        trimmed || "(setup log buffer empty)",
+      ].join("\n");
+    }
 
     const run = await resolveRunForLogs(runToken);
     if (!run) {
@@ -196,7 +225,19 @@ export default function AITerminalPanel({
 
   const provider = config.aiAgent?.provider ?? "vultr";
   const staticModels = POPULAR_MODELS[provider] || [];
-  const displayModels = React.useMemo(() => Array.from(new Set([...staticModels, ...availableModels])), [staticModels, availableModels, provider]);
+  // Show at most 5 models per provider. Prefer the live-fetched list (already
+  // capped + freshest-first by the backend); fall back to the curated static
+  // list when no models were fetched. The currently-selected model is always
+  // kept in the list so the dropdown never drops the active selection.
+  const displayModels = React.useMemo(() => {
+    const source = availableModels.length > 0 ? availableModels : staticModels;
+    const capped = Array.from(new Set(source)).slice(0, 5);
+    const selected = config.aiAgent?.modelId ?? "";
+    if (selected && !capped.includes(selected)) {
+      return [selected, ...capped].slice(0, 6);
+    }
+    return capped;
+  }, [staticModels, availableModels, provider, config.aiAgent?.modelId]);
   const PROVIDER_NAMES: Record<string, string> = {
     vultr: "Vultr",
     openai: "OpenAI",
@@ -501,6 +542,33 @@ export default function AITerminalPanel({
       const stepLabels = ["Knowledge Base", "Teacher Configuration", "Dataset / Synthesis", "Student & Train"];
       const stepName = stepLabels[wizardStep] || `Step ${wizardStep}`;
 
+      // Derive what the user is currently looking at, and which log source the
+      // agent should reach for FIRST when they ask about "the logs" / progress.
+      let pageContext: string;
+      let preferredLogSource: string;
+      if (activeTab === "credentials") {
+        pageContext = "Credentials tab (SSH / Qdrant / embedders / OCR setup)";
+        preferredLogSource = "`__exec_logs__ setup` (embedder / OCR / Qdrant boot logs)";
+      } else if (activeTab === "gpu") {
+        pageContext = "GPU Servers tab (droplet & GPU management)";
+        preferredLogSource = "`__exec_logs__ setup` for any serving/boot output, or `__exec_logs__ terminal` for the visible console";
+      } else if (activeTab === "runs") {
+        pageContext = "Runs tab (training run dashboard)";
+        preferredLogSource = "`__exec_logs__` (the most recent training run — metrics, loss, stages)";
+      } else if (activeTab === "pipeline") {
+        pageContext = `Pipeline tab → Step "${stepName}"`;
+        if (wizardStep <= 1) {
+          // Step 0 Knowledge Base / Step 1 Teacher → serving & setup logs.
+          preferredLogSource = "`__exec_logs__ setup` (teacher serving + embedder boot logs)";
+        } else {
+          // Step 2 Dataset / Step 3 Student & Train → training run logs.
+          preferredLogSource = "`__exec_logs__` (the active training run)";
+        }
+      } else {
+        pageContext = activeTab;
+        preferredLogSource = "`__exec_logs__` (training run) or `__exec_logs__ setup` / `__exec_logs__ terminal`";
+      }
+
       const gpuDesc = gpuStatus
         ? `${gpuStatus.gpuName} | Temp: ${gpuStatus.temperature}°C | Util: ${gpuStatus.utilizationGpu}% | VRAM: ${(gpuStatus.memoryUsed / 1024).toFixed(1)}GB / ${(gpuStatus.memoryTotal / 1024).toFixed(0)}GB`
         : "Offline / Unknown";
@@ -537,23 +605,28 @@ You have TWO execution channels. Use whichever fits the question:
 
 **(A) Remote SSH commands** — any shell command in a fenced \`\`\`bash or \`\`\`sh block runs on the GPU server over SSH, and the stdout/stderr is streamed back to you in the next turn as a system message labeled "Command output".
 
-**(B) Local execution-log reader** — to inspect the live Pipeline/Training Execution Logs (the same logs the user sees on the right pane, with \`[stage]\`, step metrics, etc.), emit a \`\`\`bash block whose ONLY content starts with the literal token \`__exec_logs__\`. Examples:
+**(B) Local log reader** — to inspect any logs WITHOUT going over SSH, emit a \`\`\`bash block whose ONLY content starts with the literal token \`__exec_logs__\`. There are THREE log sources:
+
+1. **Training runs** (default):
 \`\`\`bash
 __exec_logs__
 \`\`\`
-→ returns the tail of the MOST RECENTLY ACTIVE run (run metadata + status + metrics + last 300 log lines).
+→ tail of the MOST RECENTLY ACTIVE training run (metadata + status + metrics + last 300 lines).
+\`__exec_logs__ <runId>\` targets a specific run (IDs in "Recent runs" below); \`__exec_logs__ <runId> 600\` sets the line count (max 2000).
 
+2. **Teacher / embedder / OCR setup & serving logs**:
 \`\`\`bash
-__exec_logs__ <runId>
+__exec_logs__ setup
 \`\`\`
-→ targets a specific run. Run IDs are listed in the "Recent runs" section below.
+→ the boot/serving output for the teacher (vLLM/SGLang), embedder models, PaddleOCR, and Qdrant — i.e. the logs shown while a model is loading on the Credentials/Pipeline pages. \`__exec_logs__ setup 600\` for more lines.
 
+3. **The live terminal console** (what the user sees in the right pane):
 \`\`\`bash
-__exec_logs__ <runId> 600
+__exec_logs__ terminal
 \`\`\`
-→ same, with last 600 lines instead of 300 (max 2000).
+→ the raw output of the last commands run in the terminal.
 
-This reader works **even when the SSH server is unreachable** — it pulls from the local in-memory event stream + on-disk log tail. **When the user asks about training progress, [stage] messages, step/epoch/loss, or anything about "the run" / "the training" / "the execution logs" → use \`__exec_logs__\` first, before any SSH command.**
+This reader works **even when the SSH server is unreachable** — it reads local in-memory buffers + on-disk tails. **When the user asks about logs / progress / "what's happening", pick the source that matches the page they're on (see "Current page" below) and use it BEFORE any SSH command.** For training/loss/step questions use source 1; for teacher-loading or embedder-boot questions use source 2; for "what did that command print" use source 3.
 
 Rules for command execution:
 1. When the user asks to check status, run diagnostics, inspect logs, restart services, or operate the server — **just run the command yourself**. Never tell the user to switch modes, click buttons, or copy/paste anything.
@@ -581,6 +654,8 @@ Rules for command execution:
 - Active GPU: ${gpuDesc}
 - Working dir: ${cwd}
 - Wizard step: ${stepName}
+
+**Current page:** The user is currently viewing the **${pageContext}**. When they ask about "the logs", progress, or what's happening, prefer ${preferredLogSource} first. \`__exec_logs__ terminal\` is always available for the visible console.
 
 **Recent runs (most recent first):**
 ${runsSummary}

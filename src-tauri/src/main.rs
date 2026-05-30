@@ -2882,14 +2882,33 @@ async fn ai_list_models(
     let v: serde_json::Value = serde_json::from_str(&body)
         .map_err(|e| AppError::pipeline(format!("models response not JSON: {e}")))?;
     // Both OpenAI-compatible and Anthropic responses use {"data":[{"id":...}]}.
-    let ids = v
+    // Capture each model's optional `created` timestamp (OpenAI/xAI/Gemini
+    // include it) so we can surface the newest models first.
+    let mut entries: Vec<(String, i64)> = v
         .get("data")
         .and_then(|d| d.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(|s| s.to_string()))
-                .collect::<Vec<String>>()
+                .filter_map(|m| {
+                    let id = m.get("id").and_then(|i| i.as_str())?.to_string();
+                    let created = m.get("created").and_then(|c| c.as_i64()).unwrap_or(0);
+                    Some((id, created))
+                })
+                .collect::<Vec<(String, i64)>>()
         })
         .unwrap_or_default();
+
+    // If any model carries a `created` timestamp, sort newest-first by it.
+    // Otherwise preserve the provider's original ordering (a stable no-op sort).
+    if entries.iter().any(|(_, created)| *created > 0) {
+        entries.sort_by(|a, b| b.1.cmp(&a.1));
+    }
+
+    // Limit to at most 5 models per provider to keep the picker focused.
+    let ids = entries
+        .into_iter()
+        .map(|(id, _)| id)
+        .take(5)
+        .collect::<Vec<String>>();
     Ok(ids)
 }
