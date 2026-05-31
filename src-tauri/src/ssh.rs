@@ -396,7 +396,7 @@ impl SshSession {
 #[derive(Clone)]
 pub struct SshSessionManager {
     cfg: SshConfig,
-    session: Arc<tokio::sync::Mutex<Option<SshSession>>>,
+    session: Arc<tokio::sync::Mutex<Option<(SshSession, std::time::Instant)>>>,
 }
 
 impl SshSessionManager {
@@ -409,27 +409,22 @@ impl SshSessionManager {
 
     pub async fn get_session(&self) -> Result<SshSession> {
         let mut lock = self.session.lock().await;
-        if let Some(ref s) = *lock {
-            // Check if the session is currently in use by another thread.
-            // Storing the session in Option<SshSession> counts as 1. If another thread cloned it,
-            // the strong count will be greater than 1.
-            let in_use = Arc::strong_count(&s.handle) > 1;
-            
-            if !in_use {
-                // Verify if the session is still alive
-                let check_fut = s.exec_blocking("true");
-                match tokio::time::timeout(std::time::Duration::from_secs(3), check_fut).await {
-                    Ok(Ok(res)) if res.exit_code == 0 => {
-                        return Ok(s.clone());
-                    }
-                    _ => {
-                        println!("SSH session health check failed. Reconnecting...");
-                        let _ = s.disconnect().await;
-                        *lock = None;
-                    }
+        if let Some((ref s, ref mut last_checked)) = *lock {
+            if last_checked.elapsed() < std::time::Duration::from_secs(10) {
+                return Ok(s.clone());
+            }
+            // Verify if the session is still alive
+            let check_fut = s.exec_blocking("true");
+            match tokio::time::timeout(std::time::Duration::from_secs(3), check_fut).await {
+                Ok(Ok(res)) if res.exit_code == 0 => {
+                    *last_checked = std::time::Instant::now();
+                    return Ok(s.clone());
                 }
-            } else {
-                println!("SSH cached session is currently in use by another thread. Opening an isolated session...");
+                _ => {
+                    println!("SSH session health check failed. Reconnecting...");
+                    let _ = s.disconnect().await;
+                    *lock = None;
+                }
             }
         }
 
@@ -440,7 +435,7 @@ impl SshSessionManager {
                 Ok(new_s) => {
                     // Only cache the session if the cached slot is empty (no active idle session)
                     if lock.is_none() {
-                        *lock = Some(new_s.clone());
+                        *lock = Some((new_s.clone(), std::time::Instant::now()));
                     }
                     return Ok(new_s);
                 }
@@ -456,7 +451,7 @@ impl SshSessionManager {
 
     pub async fn clear_session(&self) {
         let mut lock = self.session.lock().await;
-        if let Some(ref s) = *lock {
+        if let Some((ref s, _)) = *lock {
             let _ = s.disconnect().await;
         }
         *lock = None;

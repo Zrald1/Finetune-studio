@@ -402,6 +402,7 @@ function EmbedderCard({
   onRemove,
   onIngestComplete,
   showRemove,
+  gpuStatus,
 }: {
   embedder: EmbedderConfig;
   idx: number;
@@ -410,6 +411,7 @@ function EmbedderCard({
   onRemove: () => void;
   onIngestComplete: () => void;
   showRemove?: boolean;
+  gpuStatus?: GPUState | null;
 }) {
   const [files, setFiles] = useState<string[]>([]);
   const [tag, setTag] = useState<string>("");
@@ -503,7 +505,8 @@ function EmbedderCard({
         if (e.stage === "read") {
           logLine = `[${timestamp}] [OCR/Read] Reading ${e.file}...`;
         } else if (e.stage === "ocr_start") {
-          logLine = `[${timestamp}] [PaddleOCR] Starting remote OCR on MI300X for ${e.file}...`;
+          const gpuName = gpuStatus?.success && gpuStatus.gpuName ? gpuStatus.gpuName : "GPU";
+          logLine = `[${timestamp}] [PaddleOCR] Starting remote OCR on ${gpuName} for ${e.file}...`;
         } else if (e.stage === "ocr_page") {
           logLine = `[${timestamp}] [PaddleOCR] Processed page ${e.done}/${e.total} of ${e.file}`;
         } else if (e.stage === "embed") {
@@ -601,7 +604,7 @@ function EmbedderCard({
       multiple: true,
       filters: [
         { name: "All Files", extensions: ["*"] },
-        { name: "Documents & Images", extensions: ["pdf", "txt", "md", "docx", "png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "tif"] }
+        { name: "Documents & Images", extensions: ["pdf", "txt", "md", "docx", "pptx", "ppt", "png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "tif"] }
       ]
     });
     if (!sel) return;
@@ -1534,6 +1537,7 @@ setSetupAllLoading(true); setSetupAllError(null); setSetupAllLog([]);
                 embedder={embedder}
                 idx={idx}
                 config={config}
+                gpuStatus={gpuStatus}
                 onUpdate={patch => updateEmbedder(idx, patch)}
                 onRemove={() => removeEmbedder(idx)}
                 onIngestComplete={() => {

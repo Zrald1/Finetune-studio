@@ -166,6 +166,130 @@ pub fn read_file_text(path: &Path) -> Result<String> {
                 AppError::pipeline(format!("docx extract {} failed: {}", path.display(), e))
             })
         }
+        "pptx" | "ppt" => {
+            let python_script = r#"
+import sys
+import os
+import tempfile
+
+def parse_pptx_file(pptx_path):
+    from pptx import Presentation
+    prs = Presentation(pptx_path)
+    text_runs = []
+    for i, slide in enumerate(prs.slides):
+        slide_text = []
+        for shape in slide.shapes:
+            if hasattr(shape, "text") and shape.text.strip():
+                slide_text.append(shape.text.strip())
+            elif shape.has_table:
+                for row in shape.table.rows:
+                    row_text = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                    if row_text:
+                        slide_text.append(" | ".join(row_text))
+        try:
+            if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
+                notes = slide.notes_slide.notes_text_frame.text.strip()
+                if notes:
+                    slide_text.append(f"Notes: {notes}")
+        except Exception:
+            pass
+        if slide_text:
+            text_runs.append(f"--- Slide {i+1} ---\n" + "\n".join(slide_text))
+    return "\n\n".join(text_runs)
+
+try:
+    file_path = sys.argv[1]
+    ext = os.path.splitext(file_path)[1].lower()
+    temp_pptx = None
+    
+    if ext == ".ppt":
+        try:
+            import win32com.client
+        except ImportError:
+            win32com = None
+
+        if win32com is not None:
+            powerpoint = win32com.client.Dispatch("PowerPoint.Application")
+            try:
+                abs_ppt = os.path.abspath(file_path)
+                fd, temp_pptx = tempfile.mkstemp(suffix=".pptx")
+                os.close(fd)
+                
+                presentation = powerpoint.Presentations.Open(abs_ppt, WithWindow=False)
+                presentation.SaveAs(temp_pptx, 24) # 24 = ppSaveAsOpenXMLPresentation
+                presentation.Close()
+                parse_target = temp_pptx
+            finally:
+                powerpoint.Quit()
+        else:
+            import subprocess
+            fd, temp_pptx = tempfile.mkstemp(suffix=".pptx")
+            os.close(fd)
+            try:
+                temp_dir = tempfile.gettempdir()
+                os.remove(temp_pptx)
+                result = subprocess.run([
+                    "soffice", "--headless", "--convert-to", "pptx",
+                    "--outdir", temp_dir, file_path
+                ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                
+                basename = os.path.basename(file_path)
+                stem = os.path.splitext(basename)[0]
+                expected_pptx = os.path.join(temp_dir, stem + ".pptx")
+                
+                if result.returncode == 0 and os.path.exists(expected_pptx):
+                    temp_pptx = expected_pptx
+                    parse_target = temp_pptx
+                else:
+                    raise RuntimeError("soffice conversion failed")
+            except Exception as e:
+                raise RuntimeError(
+                    f"Legacy .ppt file support requires win32com on Windows or LibreOffice 'soffice' on Mac/Linux: {e}"
+                )
+    else:
+        parse_target = file_path
+        
+    text = parse_pptx_file(parse_target)
+    
+    if temp_pptx and os.path.exists(temp_pptx):
+        try:
+            os.remove(temp_pptx)
+        except Exception:
+            pass
+            
+    sys.stdout.buffer.write(text.encode('utf-8'))
+except Exception as e:
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
+"#;
+            let output = std::process::Command::new("python")
+                .args(&[
+                    "-c",
+                    python_script,
+                    path.to_str().unwrap_or_default(),
+                ])
+                .output();
+
+            match output {
+                Ok(out) => {
+                    if out.status.success() {
+                        let text = String::from_utf8_lossy(&out.stdout).to_string();
+                        Ok(text)
+                    } else {
+                        let err_msg = String::from_utf8_lossy(&out.stderr).to_string();
+                        Err(AppError::pipeline(format!("pptx/ppt extract {} failed: {}", path.display(), err_msg)))
+                    }
+                }
+                Err(e) => {
+                    Err(AppError::pipeline(format!(
+                        "pptx/ppt extract {} failed: python runner failed to start (is python installed and on PATH?): {}",
+                        path.display(),
+                        e
+                    )))
+                }
+            }
+        }
         other => Err(AppError::pipeline(format!(
             "unsupported file extension '{}' for {}", other, path.display()
         ))),
