@@ -4,6 +4,14 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
 const API_BASE: &str = "https://api.digitalocean.com/v2";
+// AMD Instinct MI-series GPU droplets are NOT served by the standard control
+// plane. They live on the AMD Developer Cloud endpoint and use size slugs with
+// a `-devcloud` suffix (e.g. `gpu-mi300x1-192gb-devcloud`). On the standard host
+// these sizes appear in `/sizes` with an empty `regions` array and every create
+// returns `422 "Size is not available in this region."`. Routing GPU `/sizes`
+// and droplet creation to this host (with the devcloud slug) is what actually
+// lets the create succeed. Verified end-to-end against a live AMD-team token.
+const AMD_API_BASE: &str = "https://api-amd.digitalocean.com/v2";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -341,9 +349,9 @@ fn is_amd_gpu_size(size: &DoSize) -> bool {
     ))
 }
 
-pub async fn list_gpu_sizes(cfg: &DigitalOceanConfig) -> Result<Vec<DoSize>> {
+async fn fetch_all_sizes(cfg: &DigitalOceanConfig, base: &str) -> Result<Vec<DoSize>> {
     let mut sizes = Vec::new();
-    let mut url = format!("{API_BASE}/sizes?per_page=200");
+    let mut url = format!("{base}/sizes?per_page=200");
     loop {
         let page = get_url::<SizesResponse>(cfg, &url, "list sizes").await?;
         sizes.extend(page.sizes);
@@ -352,6 +360,23 @@ pub async fn list_gpu_sizes(cfg: &DigitalOceanConfig) -> Result<Vec<DoSize>> {
             None => break,
         }
     }
+    Ok(sizes)
+}
+
+pub async fn list_gpu_sizes(cfg: &DigitalOceanConfig) -> Result<Vec<DoSize>> {
+    let mut sizes = fetch_all_sizes(cfg, API_BASE).await?;
+
+    // AMD MI-series GPU sizes only appear (with real regions and the creatable
+    // `-devcloud` slug) on the AMD Developer Cloud endpoint. Merge them in;
+    // tolerate failure so a standard-host-only token still lists CPU/NVIDIA GPUs.
+    if let Ok(amd_sizes) = fetch_all_sizes(cfg, AMD_API_BASE).await {
+        for size in amd_sizes {
+            if !sizes.iter().any(|existing| existing.slug == size.slug) {
+                sizes.push(size);
+            }
+        }
+    }
+
     sizes.retain(is_amd_gpu_size);
 
     let hardcoded_sizes = vec![
@@ -615,12 +640,17 @@ async fn assign_project(cfg: &DigitalOceanConfig, droplet: &DoDroplet) -> Result
 }
 
 async fn create_once(cfg: &DigitalOceanConfig, req: &CreateDropletRequest) -> std::result::Result<DoDroplet, CreateAttemptError> {
+    // Route to the host that can serve the size being requested. The size field
+    // here already carries the `-devcloud` suffix for AMD candidates, so this
+    // picks the AMD Developer Cloud endpoint for them and the standard control
+    // plane for everything else.
+    let base = size_api_base(&req.size);
     let res = client()
         .map_err(|e| CreateAttemptError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             body: e.to_string(),
         })?
-        .post(format!("{API_BASE}/droplets"))
+        .post(format!("{base}/droplets"))
         .bearer_auth(token(cfg).map_err(|e| CreateAttemptError {
             status: StatusCode::UNAUTHORIZED,
             body: e.to_string(),
@@ -670,13 +700,22 @@ async fn matching_size_regions(cfg: &DigitalOceanConfig) -> Vec<String> {
     if raw.is_empty() {
         return Vec::new();
     }
-    let mut url = format!("{API_BASE}/sizes?per_page=200");
+    // For AMD slugs the authoritative regions live on the AMD host under the
+    // `-devcloud` slug, so match both the raw and devcloud names there. Non-AMD
+    // sizes are queried on the standard host as before.
+    let base = size_api_base(raw);
+    let devcloud = devcloud_amd_gpu_slug(raw);
+    let mut url = format!("{base}/sizes?per_page=200");
     loop {
         let page = match get_url::<SizesResponse>(cfg, &url, "list sizes").await {
             Ok(page) => page,
             Err(_) => return Vec::new(),
         };
-        if let Some(size) = page.sizes.iter().find(|s| s.slug == raw) {
+        if let Some(size) = page
+            .sizes
+            .iter()
+            .find(|s| s.slug == raw || devcloud.as_deref() == Some(s.slug.as_str()))
+        {
             return size.regions.clone();
         }
         match next_link(&page.links) {
@@ -706,6 +745,17 @@ fn is_amd_gpu_slug(slug: &str) -> bool {
     lower.starts_with("gpu-mi") && lower[6..].chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
 }
 
+/// The API host that can actually serve the configured size. AMD MI-series GPU
+/// droplets are only creatable through the AMD Developer Cloud endpoint; every
+/// other resource (and every non-AMD size) uses the standard control plane.
+fn size_api_base(size: &str) -> &'static str {
+    if is_amd_gpu_slug(size) {
+        AMD_API_BASE
+    } else {
+        API_BASE
+    }
+}
+
 fn contracted_amd_gpu_slug(slug: &str) -> Option<String> {
     let clean = slug.trim();
     if !is_amd_gpu_slug(clean) || clean.ends_with("-contracted") || clean.contains("-fabric-") {
@@ -714,8 +764,29 @@ fn contracted_amd_gpu_slug(slug: &str) -> Option<String> {
     Some(format!("{clean}-contracted"))
 }
 
+/// AMD MI-series sizes must be requested with the `-devcloud` slug on the AMD
+/// endpoint. Returns `None` for non-AMD slugs or ones already carrying the
+/// suffix so we never double-append it.
+fn devcloud_amd_gpu_slug(slug: &str) -> Option<String> {
+    let clean = slug.trim();
+    if !is_amd_gpu_slug(clean) || clean.ends_with("-devcloud") {
+        return None;
+    }
+    // Strip a stale `-contracted` suffix first so we don't produce
+    // `...-contracted-devcloud`, which is not a real slug.
+    let core = strip_contracted_suffix(clean);
+    Some(format!("{core}-devcloud"))
+}
+
 fn size_create_candidates(size: &str) -> Vec<String> {
-    let mut candidates = vec![size.trim().to_string()];
+    // Order matters: the `-devcloud` slug on the AMD endpoint is the one that
+    // actually provisions AMD GPUs, so try it first. The bare and `-contracted`
+    // slugs stay as fallbacks for any account/region where DO accepts them.
+    let mut candidates = Vec::new();
+    if let Some(devcloud) = devcloud_amd_gpu_slug(size) {
+        push_unique(&mut candidates, devcloud);
+    }
+    push_unique(&mut candidates, size.trim().to_string());
     if let Some(contracted) = contracted_amd_gpu_slug(size) {
         push_unique(&mut candidates, contracted);
     }
@@ -949,14 +1020,16 @@ pub async fn create_droplet(cfg: &DigitalOceanConfig) -> Result<DoDroplet> {
 
     if is_amd_gpu_slug(&cfg.size) && size_regions.is_empty() && all_size_unavailable(&attempts) {
         return Err(AppError::other(format!(
-            "DigitalOcean rejected AMD GPU Droplet creation for this team through the public API. \
-             DigitalOcean documents this GPU family in [{documented_regions}], but the API reports no creatable regions for '{size}' \
-             and rejected every documented-region create attempt for both the self-serve and contracted slugs. \
-             This is an account/capacity/API enablement refusal for the GPU size, not a Tauri request-format problem. \
-             Create the GPU Droplet manually in the DigitalOcean control panel, then click Sync Account and Use IP in this app. \
-             If the dashboard also fails, ask DigitalOcean support to enable API creation/capacity for size '{size}' on team '{team}'. \
+            "DigitalOcean rejected AMD GPU Droplet creation for '{size}' on the AMD Developer Cloud endpoint ({amd_base}). \
+             AMD MI-series GPUs are served there under the '-devcloud' slug in [{documented_regions}], and this app already \
+             retried that endpoint, slug, and region set — every attempt came back 'size unavailable', which means there is no \
+             AMD GPU capacity available for this team right now (or the team is not entitled to this size). \
+             This is a capacity/entitlement issue, not a request-format problem. \
+             Try a different AMD GPU size or region, or create the Droplet from the DigitalOcean control panel and click Sync Account + Use IP. \
+             If the dashboard also reports no capacity, ask DigitalOcean support about AMD GPU availability for size '{size}' on team '{team}'. \
              Size slugs tried: [{size_candidates}]. First attempts: {attempts}",
             size = cfg.size.trim(),
+            amd_base = AMD_API_BASE,
             team = create_context(cfg).await,
             documented_regions = documented_amd_gpu_regions(&cfg.size).join(", "),
             size_candidates = size_candidates.join(", "),
