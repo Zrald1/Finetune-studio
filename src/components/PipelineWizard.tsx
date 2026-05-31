@@ -1410,7 +1410,8 @@ setSetupAllLoading(true); setSetupAllError(null); setSetupAllLog([]);
     onConfigChange({ embedders: updated });
   };
 
-  const removeEmbedder = (idx: number) => {
+const removeEmbedder = (idx: number) => {
+    if (idx === 0) return;
     onConfigChange({ embedders: embedders.filter((_, i) => i !== idx) });
   };
 
@@ -1880,11 +1881,10 @@ function TeacherStep({
               ) : (
                 <button
                   type="button"
-                  disabled={checkingTeacher || teacherDeployed}
                   onClick={onDeploy}
-                  className="px-6 py-2 theme-accent-bg text-black rounded-xl text-[10px] font-black uppercase tracking-widest transition-all hover:brightness-125 disabled:opacity-20 shadow-xl shadow-theme-accent/20 premium-button"
+                  className="px-6 py-2 theme-accent-bg text-black rounded-xl text-[10px] font-black uppercase tracking-widest transition-all hover:brightness-125 shadow-xl shadow-theme-accent/20 premium-button"
                 >
-                  Deploy Context
+                  Deploy Teacher
                 </button>
               )}
             </div>

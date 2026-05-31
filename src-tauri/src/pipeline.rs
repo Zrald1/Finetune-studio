@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::config::{AppConfig, DockerConfig, TeacherConfig, ServingEngine};
 use crate::error::{AppError, Result};
 use crate::generator::{self, GeneratedPair, GeneratorConfig};
@@ -593,6 +595,11 @@ async fn run_pipeline(
         }
     }
     let mut container_name = docker_cfg.container_name.clone();
+
+    // Hoisted flag: set during GPU cleanup, consumed by teacher boot (Phase 2)
+    // to prevent killing the embedder vLLM process when it is still serving.
+    let mut embedder_1_alive = false;
+
     if docker_cfg.enabled && needs_ssh {
         // ── Pre-probe: is the teacher already serving? ─────────────────────
         // The teacher model runs INSIDE rocm-vllm. If we unconditionally stop
@@ -638,18 +645,46 @@ async fn run_pipeline(
                     "docker stop paddleocr-vl 2>/dev/null; docker rm paddleocr-vl 2>/dev/null; true"
                 ).await;
             }
-        } else {
-            // Teacher is not running — safe to reclaim the full rocm-vllm container
+} else {
+            // Teacher is not running — stop PaddleOCR. For rocm-vllm: stop it
+            // only if embedder_1 (port 8101) is NOT already serving; when it IS
+            // serving we keep it alive so dataset generation can still retrieve
+            // via vector search while the teacher boots on the remaining VRAM.
             emit_log(
                 app,
                 &run.id,
-                "[GPU CLEANUP] stopping PaddleOCR (paddleocr-vl) and embedding vLLM (rocm-vllm) containers to free VRAM for teacher model...\n",
+                "[GPU CLEANUP] stopping PaddleOCR (paddleocr-vl); checking embedder_1 (port 8101)...\n",
                 "stage",
             );
             if let Some(ref session) = session_opt {
-                let _ = session.exec_blocking(
-                    "docker stop paddleocr-vl 2>/dev/null; docker rm paddleocr-vl 2>/dev/null; docker stop rocm-vllm 2>/dev/null; docker rm rocm-vllm 2>/dev/null; true"
-                ).await;
+                embedder_1_alive = {
+                    let probe = "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8101/v1/models 2>/dev/null || echo 000";
+                    session.exec_blocking(&probe).await
+                        .map(|r| r.stdout.trim() == "200")
+                        .unwrap_or(false)
+                };
+
+                if embedder_1_alive {
+                    emit_log(
+                        app,
+                        &run.id,
+                        "[GPU CLEANUP] embedder_1 still running on port 8101 — preserving it, stopping only PaddleOCR...\n",
+                        "stage",
+                    );
+                    let _ = session.exec_blocking(
+                        "docker stop paddleocr-vl 2>/dev/null; docker rm paddleocr-vl 2>/dev/null; true"
+                    ).await;
+                } else {
+                    emit_log(
+                        app,
+                        &run.id,
+                        "[GPU CLEANUP] stopping PaddleOCR (paddleocr-vl) and embedding vLLM (rocm-vllm) containers to free VRAM for teacher model...\n",
+                        "stage",
+                    );
+                    let _ = session.exec_blocking(
+                        "docker stop paddleocr-vl 2>/dev/null; docker rm paddleocr-vl 2>/dev/null; docker stop rocm-vllm 2>/dev/null; docker rm rocm-vllm 2>/dev/null; true"
+                    ).await;
+                }
             }
         }
 
@@ -917,13 +952,39 @@ else: print('NOT_FOUND')\
                 // Ensure PaddleOCR and embedding containers are stopped (already
                 // done at pipeline start, but force again here in case they were
                 // restarted externally or docker was disabled during that first pass).
+                // When embedder_1 is alive, preserve the rocm-vllm container so the
+                // pipeline can still retrieve via vector search during generation.
                 if docker_cfg.enabled {
-                    let _ = session.exec_blocking("docker stop paddleocr-vl 2>/dev/null; docker rm paddleocr-vl 2>/dev/null; docker stop rocm-vllm 2>/dev/null; docker rm rocm-vllm 2>/dev/null; true").await;
+                    if embedder_1_alive {
+                        let _ = session.exec_blocking("docker stop paddleocr-vl 2>/dev/null; docker rm paddleocr-vl 2>/dev/null; true").await;
+                    } else {
+                        let _ = session.exec_blocking("docker stop paddleocr-vl 2>/dev/null; docker rm paddleocr-vl 2>/dev/null; docker stop rocm-vllm 2>/dev/null; docker rm rocm-vllm 2>/dev/null; true").await;
+                    }
                     container_name = ensure_container(session, &docker_cfg).await?;
                 }
+                // When embedder_1 is alive, use a port-targeted cleanup instead of
+                // the blanket vLLM pkill (which would kill the embedder process too).
+                let effective_pkill = if embedder_1_alive {
+                    format!(
+                        "(command -v fuser >/dev/null 2>&1 && fuser -k {port}/tcp 2>/dev/null) || true; \
+                         (command -v ss >/dev/null 2>&1 && ss -ltnp 2>/dev/null | awk '/:{port} /{{print $0}}' | grep -oE 'pid=[0-9]+' | cut -d= -f2 | xargs -r kill -9 2>/dev/null) || true; \
+                         for i in 1 2 3 4 5 6 7 8 9 10; do \
+                             if command -v ss >/dev/null 2>&1; then \
+                                 ss -ltn 2>/dev/null | awk '{{print $4}}' | grep -qE ':{port}$' || break; \
+                             else \
+                                 (netstat -ltn 2>/dev/null || true) | awk '{{print $4}}' | grep -qE ':{port}$' || break; \
+                             fi; \
+                             sleep 1; \
+                         done; \
+                         true",
+                        port = port_to_check_inner,
+                    )
+                } else {
+                    pkill_body
+                };
                 // First sweep on the host — covers any vLLM started outside docker
                 // and any process holding the port directly on the bare metal.
-                let _ = session.exec_blocking(&pkill_body).await;
+                let _ = session.exec_blocking(&effective_pkill).await;
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
                 // Then sweep across EVERY running container. ROCm/vLLM containers
@@ -942,7 +1003,7 @@ else: print('NOT_FOUND')\
                             .filter(|s| !s.is_empty())
                             .collect();
                         for cname in &names {
-                            let inner = wrap_docker_cmd(&pkill_body, cname);
+                            let inner = wrap_docker_cmd(&effective_pkill, cname);
                             let _ = session.exec_blocking(&inner).await;
                         }
                     }
@@ -950,9 +1011,9 @@ else: print('NOT_FOUND')\
 
                 // Final targeted sweep in the container we'll actually use.
                 let pkill_cmd = if docker_cfg.enabled {
-                    wrap_docker_cmd(&pkill_body, &container_name)
+                    wrap_docker_cmd(&effective_pkill, &container_name)
                 } else {
-                    pkill_body.clone()
+                    effective_pkill
                 };
                 let _ = session.exec_blocking(&pkill_cmd).await;
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1550,12 +1611,13 @@ else: print('NOT_FOUND')\
         let seen_chunk_ids: Arc<parking_lot::Mutex<std::collections::HashSet<String>>> =
             Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
 
-        let qd_cfg = cfg.qdrant.clone();
+        let mut qd_cfg = cfg.qdrant.clone();
         let max_chunks = run_cfg.max_chunks;
 
-        // Build a per-embedder EmbeddingConfig so run_pipeline can embed topics.
-        // Fall back to the first embedder in the list (legacy behaviour for
-        // runs created before the multi-embedder feature was added).
+// Build a per-embedder EmbeddingConfig so run_pipeline can embed topics.
+        // When no explicit embedder_index is set on any topic (i.e., we fall back
+        // to the first/default embedder), the pipeline uses embedder_1 (port 8101)
+        // which should search ALL collections so no reviewer knowledge is missed.
         let embed_cfg = if let Some(emb) = run_cfg
             .topics
             .iter()
@@ -1580,6 +1642,13 @@ else: print('NOT_FOUND')\
             return Err(AppError::pipeline("no embedding embedders configured"));
         };
 
+        // When no explicit embedder_index is set on any topic (default path),
+        // override the Qdrant collection to "all" so the pipeline searches
+        // across ALL collections, not just a single one. This ensures the
+        // teacher can retrieve chunks from any ingested domain.
+        if run_cfg.topics.iter().all(|t| t.embedder_index.is_none()) {
+            qd_cfg.collection = "all".to_string();
+        }
         let local_jsonl_path = std::path::Path::new(&run.local_dir).join("qa_dataset.jsonl");
         let _ = fs::write(&local_jsonl_path, b"").await;
 
@@ -1896,6 +1965,24 @@ else: print('NOT_FOUND')\
                                     ),
                                     "stage",
                                 );
+                                let fallback = if fallback.is_empty() && topic_tag.is_some() {
+                                    emit_log(
+                                        app,
+                                        &run.id,
+                                        "[retrieve] tag-filtered fallback returned 0 chunks — retrying without tag filter\n",
+                                        "warn",
+                                    );
+                                    lexical_topic_candidates(
+                                        &qd_cfg,
+                                        &topic_label,
+                                        k as usize,
+                                        scan_limit,
+                                        None,
+                                    )
+                                    .await?
+                                } else {
+                                    fallback
+                                };
                                 if fallback.is_empty() {
                                     return Err(AppError::pipeline(format!(
                                         "topic embedding failed for '{}' and fallback retrieval found no chunks: {}",

@@ -140,6 +140,7 @@ export default function CredentialsPanel({
   };
 
   const removeEmbedder = (idx: number) => {
+    if (idx === 0) return;
     onChange({ embedders: embedders.filter((_, i) => i !== idx) });
   };
 

@@ -672,15 +672,6 @@ async fn serve_setup_all_embedders(
     Ok(results)
 }
 
-#[tauri::command]
-async fn serve_create_collection(
-    cfg: QdrantConfig,
-    collection: String,
-    vector_dim: usize,
-) -> Result<()> {
-    qdrant::create_collection(&cfg, &collection, vector_dim).await
-}
-
 // ── knowledge-base ingestion ───────────────────────────────────────────────
 
 /// Ingest one or more local files into Qdrant. Reads each file (PDF/TXT/MD),

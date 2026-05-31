@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::config::QdrantConfig;
 use crate::error::{AppError, Result};
 use reqwest::Client;

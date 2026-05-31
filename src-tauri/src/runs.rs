@@ -149,6 +149,7 @@ fn default_every_n() -> u32 {
 }
 
 impl LoraConfig {
+    #[cfg(test)]
     pub fn defaults() -> Self {
         Self {
             method: default_training_method(),

@@ -384,10 +384,11 @@ pub struct AppConfig {
     pub digital_ocean: DigitalOceanConfig,
     pub qdrant: QdrantConfig,
     pub hf_token: Option<String>,
-    /// Deprecated: Featherless cloud embedding/teacher was removed in favour of
+/// Deprecated: Featherless cloud embedding/teacher was removed in favour of
     /// self-hosted vLLM embedders on the GPU server. Kept here only so existing
     /// config.json files (which still carry this key) continue to parse. Never
     /// read, never written.
+    #[allow(dead_code)]
     #[serde(default, skip_serializing)]
     pub featherless_api_key: Option<String>,
     /// Self-hosted embedding models served on the GPU server. Each owns a Qdrant

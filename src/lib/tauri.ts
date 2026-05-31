@@ -118,9 +118,6 @@ export const api = {
     invoke<{ name: string; model_id: string; port: number; status: string }[]>("serve_setup_all_embedders", { ssh, docker, embedders, hfToken, paddleOcr }),
   serveBootPaddleocr: (ssh: SSHConfig, docker: AppConfig["docker"], paddleOcr: PaddleOcrConfig) =>
     invoke<string>("serve_boot_paddleocr", { ssh, docker, paddleOcr }),
-  serveCreateCollection: (cfg: QdrantConfig, collection: string, vectorDim: number) =>
-    invoke<void>("serve_create_collection", { cfg, collection, vectorDim }),
-
   // knowledge-base ingestion. Returns a streamId the caller correlates with
   // ingest://progress + ingest://done events. `tag` is optional — when set,
   // every point gets payload.tag = <tag> so later searches can filter to it.

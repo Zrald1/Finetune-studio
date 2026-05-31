@@ -105,9 +105,18 @@ pub async fn boot_embedder(
     cfg: &DockerConfig,
     embedder: &EmbedderConfig,
     hf_token: Option<&str>,
-    gpu_memory_utilization: f32,
+    _gpu_memory_utilization: f32,
     on_log: Option<&(dyn Fn(String) + Send + Sync)>,
 ) -> Result<String> {
+    // Qwen3-Embedding-8B in fp16 needs ~16 GB for weights; shared 0.084
+    // (~24 GB on a 287.7 GB MI350X) leaves 8 GB for KV cache + activations,
+    // which is ample for an embedding model that never generates tokens.
+    // Using a fixed value instead of the old `0.45 / count` formula gives
+    // every embedder a stable allocation regardless of how many others are
+    // added or removed.
+    let effective_gpu_mem = 0.084;
+    let max_num_seqs = " --max-num-seqs 100";
+
     let port = embedder.port;
 
     let pkill_body = format!(
@@ -163,7 +172,7 @@ pub async fn boot_embedder(
          --dtype half \
          --download-dir /root/hf-cache \
          --tensor-parallel-size 1 \
-         --gpu-memory-utilization {gpu_mem:.2} \
+         --gpu-memory-utilization {gpu_mem:.3}{max_seqs} \
          > /app/embedder_{port}.log 2>&1 || \
          (cd /app && {env}vllm serve {model} \
          --task embed \
@@ -173,12 +182,13 @@ pub async fn boot_embedder(
          --dtype half \
          --download-dir /root/hf-cache \
          --tensor-parallel-size 1 \
-         --gpu-memory-utilization {gpu_mem:.2} \
+         --gpu-memory-utilization {gpu_mem:.3}{max_seqs} \
          > /app/embedder_{port}.log 2>&1)",
         env = env,
         model = embedder.model_id,
         port = port,
-        gpu_mem = gpu_memory_utilization,
+        gpu_mem = effective_gpu_mem,
+        max_seqs = max_num_seqs,
     );
 
     let boot_cmd = if cfg.enabled {
