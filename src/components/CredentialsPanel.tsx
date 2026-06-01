@@ -1065,6 +1065,33 @@ export default function CredentialsPanel({
                               className="flex-1 px-3 py-2 rounded-lg bg-black/30 border border-white/5 text-xs font-mono text-white focus:outline-none focus:border-theme-accent/30"
                             />
                           </div>
+                          {idx === 0 && (
+                            <div className="flex items-center gap-3 pt-1">
+                              <label className="text-[9px] uppercase tracking-widest theme-muted font-black whitespace-nowrap">VRAM Util</label>
+                              <input
+                                type="range"
+                                min={0.01}
+                                max={0.45}
+                                step={0.01}
+                                value={emb.gpuMemoryUtilization ?? 0.084}
+                                onChange={(e) => updateEmbedder(idx, { gpuMemoryUtilization: parseFloat(e.target.value) })}
+                                className="flex-1 h-1.5 rounded-full appearance-none bg-white/10 cursor-pointer accent-theme-accent"
+                              />
+                              <span className="text-[10px] font-mono theme-muted w-10 text-right">
+                                {Math.round((emb.gpuMemoryUtilization ?? 0.084) * 100)}%
+                              </span>
+                              {emb.gpuMemoryUtilization !== undefined && (
+                                <button
+                                  type="button"
+                                  onClick={() => updateEmbedder(idx, { gpuMemoryUtilization: undefined })}
+                                  className="p-1 rounded border border-white/5 theme-surface-soft text-red-400 hover:text-red-300 hover:bg-red-500/10 transition-all"
+                                  title="Auto (equal split)"
+                                >
+                                  <X className="w-3 h-3" />
+                                </button>
+                              )}
+                            </div>
+                          )}
                         </div>
                         {status !== "idle" && (
                           <div className="mt-2 text-[9px] font-mono theme-muted">

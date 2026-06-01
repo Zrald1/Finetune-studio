@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type {
   AppConfig,
   DigitalOceanAccount,
@@ -10,7 +10,7 @@ import type {
 } from "../types";
 import { DEFAULT_DIGITAL_OCEAN } from "../types";
 import { api } from "../lib/tauri";
-import { CheckCircle2, Cloud, Cpu, Loader2, RefreshCw, Server, Trash2, Zap } from "lucide-react";
+import { CheckCircle2, Cloud, Cpu, Loader2, Radar, RefreshCw, Server, Trash2, Zap } from "lucide-react";
 
 interface ImageOption {
   value: string;
@@ -34,6 +34,12 @@ const QUICK_START_IMAGES: ImageOption[] = [
 
 function publicIp(droplet: DigitalOceanDroplet) {
   return droplet.networks?.v4?.find((addr) => addr.type === "public")?.ipAddress || "";
+}
+
+// A GPU server is "detected and running" once DigitalOcean reports it active
+// with a public IP assigned — at that point it is reachable over SSH.
+function dropletReady(droplet: DigitalOceanDroplet) {
+  return droplet.status === "active" && !!publicIp(droplet);
 }
 
 function imageValue(image: DigitalOceanImage) {
@@ -89,6 +95,14 @@ export default function GpuServerManager({ config, onConfigChange }: Props) {
   const [loading, setLoading] = useState(false);
   const [creating, setCreating] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  // Name of the droplet currently being polled for ("detected and running"),
+  // or null when no detection loop is active. The loop runs constantly until
+  // the server is detected, then stops on its own.
+  const [detecting, setDetecting] = useState<string | null>(null);
+  // Transient success toast shown when the user presses USE.
+  const [toast, setToast] = useState<string | null>(null);
+  const detectTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const visibleImages = useMemo(() => {
     const seen = new Set<string>();
@@ -184,6 +198,53 @@ export default function GpuServerManager({ config, onConfigChange }: Props) {
     }
   }, [digitalOcean.apiKey]);
 
+  const stopDetecting = () => {
+    if (detectTimer.current) {
+      clearInterval(detectTimer.current);
+      detectTimer.current = null;
+    }
+    setDetecting(null);
+  };
+
+  // Constantly poll DigitalOcean for the named droplet until it is detected as
+  // active with a public IP, then stop. This guarantees a freshly created GPU
+  // server is picked up the moment it comes online, without the user having to
+  // hit Sync repeatedly.
+  const startDetecting = (name: string) => {
+    stopDetecting();
+    setDetecting(name);
+    const poll = async () => {
+      try {
+        const next = await api.doListGpuDroplets(digitalOcean);
+        setDroplets(next);
+        const found = next.find((d) => d.name === name);
+        if (found && dropletReady(found)) {
+          stopDetecting();
+          setMessage(`GPU server "${name}" is detected and running at ${publicIp(found)}.`);
+        }
+      } catch {
+        // Transient API/network errors are ignored; the loop keeps polling.
+      }
+    };
+    // Poll immediately, then every 6s.
+    void poll();
+    detectTimer.current = setInterval(() => void poll(), 6000);
+  };
+
+  const showToast = (text: string) => {
+    setToast(text);
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(null), 3200);
+  };
+
+  // Tear down timers when the component unmounts.
+  useEffect(() => {
+    return () => {
+      if (detectTimer.current) clearInterval(detectTimer.current);
+      if (toastTimer.current) clearTimeout(toastTimer.current);
+    };
+  }, []);
+
   const toggleSshKey = (id: string) => {
     const current = new Set(selectedSshKeys);
     if (current.has(id)) current.delete(id);
@@ -196,8 +257,10 @@ export default function GpuServerManager({ config, onConfigChange }: Props) {
     setMessage(null);
     try {
       const droplet = await api.doCreateGpuDroplet(digitalOcean);
-      setMessage(`Created ${droplet.name}. It can take a few minutes before the public IP is assigned.`);
+      setMessage(`Created ${droplet.name}. Detecting the GPU server — this runs until it is online.`);
       await sync();
+      // Kick off the constant detection loop; it stops once the server is up.
+      startDetecting(droplet.name);
     } catch (e: any) {
       setMessage(String(e));
     } finally {
@@ -206,18 +269,28 @@ export default function GpuServerManager({ config, onConfigChange }: Props) {
   };
 
   const destroy = async (droplet: DigitalOceanDroplet) => {
-    if (!window.confirm(`Destroy "${droplet.name}" (#${droplet.id})? This is permanent.`)) return;
+    if (!window.confirm(`Delete "${droplet.name}" (#${droplet.id})? This is permanent.`)) return;
     setLoading(true);
     setMessage(null);
     try {
       await api.doDestroyDroplet(digitalOcean, droplet.id);
-      setMessage(`Destroy requested for ${droplet.name}.`);
+      // If we were detecting this droplet, stop the loop.
+      if (detecting === droplet.name) stopDetecting();
+      setMessage(`Delete requested for ${droplet.name}.`);
       await sync();
     } catch (e: any) {
       setMessage(String(e));
     } finally {
       setLoading(false);
     }
+  };
+
+  const useDroplet = (droplet: DigitalOceanDroplet) => {
+    const ip = publicIp(droplet);
+    if (!ip) return;
+    onConfigChange({ ssh: { ...config.ssh, host: ip, username: config.ssh.username || "root" } });
+    setMessage(`Now using "${droplet.name}" (${ip}) as the active GPU server.`);
+    showToast(`✓ Now using ${droplet.name} — ${ip}`);
   };
 
   const canCreate = !!digitalOcean.apiKey && !!digitalOcean.dropletName && !!digitalOcean.size && !!digitalOcean.image && selectedSshKeys.length > 0;
@@ -373,21 +446,55 @@ export default function GpuServerManager({ config, onConfigChange }: Props) {
             <div className="flex items-center gap-3 pb-3 border-b border-white/5">
               <Server className="w-5 h-5 theme-accent" />
               <h3 className="text-base-fluid text-white font-black">Active Droplets</h3>
+              {detecting && (
+                <span className="ml-auto inline-flex items-center gap-2 rounded-full border border-theme-accent/30 theme-accent-soft theme-accent px-3 py-1.5 text-[9px] uppercase tracking-widest font-black">
+                  <Radar className="w-3.5 h-3.5 animate-spin" />
+                  Detecting {detecting}…
+                </span>
+              )}
             </div>
             <div className="rounded-2xl border border-white/5 overflow-hidden bg-black/10">
               {gpuDroplets.length === 0 ? (
                 <div className="p-10 text-center theme-muted font-serif italic">No AMD GPU droplets loaded.</div>
               ) : gpuDroplets.map((droplet) => {
                 const ip = publicIp(droplet);
+                const ready = dropletReady(droplet);
                 return (
                   <div key={droplet.id} className="p-4 border-b border-white/5 last:border-b-0 flex flex-col sm:flex-row gap-4 sm:items-center justify-between">
                     <div>
-                      <div className="text-white font-black">{droplet.name}</div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-white font-black">{droplet.name}</span>
+                        {ready ? (
+                          <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 px-2 py-0.5 text-[8px] uppercase tracking-widest font-black">
+                            <CheckCircle2 className="w-3 h-3" /> Running
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1 rounded-full bg-amber-500/10 border border-amber-500/30 text-amber-300 px-2 py-0.5 text-[8px] uppercase tracking-widest font-black">
+                            <Loader2 className="w-3 h-3 animate-spin" /> {droplet.status}
+                          </span>
+                        )}
+                      </div>
                       <div className="text-[10px] theme-muted font-mono uppercase mt-1">#{droplet.id} | {droplet.status} | {droplet.sizeSlug || "unknown"} | {ip || "IP pending"}</div>
                     </div>
                     <div className="flex gap-2">
-                      <button type="button" disabled={!ip} onClick={() => onConfigChange({ ssh: { ...config.ssh, host: ip, username: config.ssh.username || "root" } })} className="px-3 py-2 rounded-lg border border-white/10 theme-surface-soft theme-text text-[9px] uppercase tracking-widest font-black disabled:opacity-30">Use IP</button>
-                      <button type="button" onClick={() => destroy(droplet)} disabled={loading} className="px-3 py-2 rounded-lg border border-red-500/20 bg-red-500/10 text-red-400 text-[9px] uppercase tracking-widest font-black disabled:opacity-30 flex items-center gap-2"><Trash2 className="w-3.5 h-3.5" />Destroy</button>
+                      <button
+                        type="button"
+                        disabled={!ip}
+                        onClick={() => useDroplet(droplet)}
+                        className="premium-button px-4 py-2 rounded-lg border border-theme-accent/40 theme-accent-soft theme-accent text-[9px] uppercase tracking-widest font-black disabled:opacity-30 flex items-center gap-2"
+                      >
+                        <Zap className="w-3.5 h-3.5" />
+                        Use
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => destroy(droplet)}
+                        disabled={loading}
+                        className="premium-button px-4 py-2 rounded-lg border border-red-500/20 bg-red-500/10 text-red-400 text-[9px] uppercase tracking-widest font-black disabled:opacity-30 flex items-center gap-2"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                        Delete
+                      </button>
                     </div>
                   </div>
                 );
@@ -402,6 +509,15 @@ export default function GpuServerManager({ config, onConfigChange }: Props) {
           </div>
         )}
       </div>
+
+      {toast && (
+        <div className="app-toast">
+          <div className="flex items-center gap-3 rounded-2xl border border-emerald-500/40 bg-emerald-500/15 backdrop-blur-md px-5 py-3.5 shadow-2xl">
+            <CheckCircle2 className="w-5 h-5 text-emerald-300" />
+            <span className="text-sm-fluid font-black text-emerald-100">{toast}</span>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

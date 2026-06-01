@@ -479,13 +479,22 @@ async fn serve_boot_embedder(
 ) -> Result<String> {
     let app_cfg = config::load().await.unwrap_or_default();
     let count = app_cfg.embedders.len().max(1);
-    let gpu_memory_utilization = 0.45 / (count as f32);
+    let gpu_memory_utilization = if count > 1 && embedder.gpu_memory_utilization.is_some() {
+        embedder.gpu_memory_utilization.unwrap()
+    } else {
+        0.45 / (count as f32)
+    };
 
-    let session = SshSession::connect(&ssh).await?;
+let session = SshSession::connect(&ssh).await?;
+    let embedder_cfg = if embedder.persistent {
+        DockerConfig { enabled: false, ..docker.clone() }
+    } else {
+        docker.clone()
+    };
     let app_c = app.clone();
     let host = serve::boot_embedder(
         &session,
-        &docker,
+        &embedder_cfg,
         &embedder,
         hf_token.as_deref(),
         gpu_memory_utilization,
@@ -609,11 +618,29 @@ async fn serve_setup_all_embedders(
     }
 
     let count = embedders.len().max(1);
-    let gpu_memory_utilization = 0.45 / (count as f32);
+    let first_util = embedders.first()
+        .and_then(|e| e.gpu_memory_utilization)
+        .unwrap_or(0.0);
+    let (each_subsequent, use_custom_first) = if first_util > 0.0 && count > 1 {
+        let remaining = (0.45 - first_util).max(0.0);
+        (Some(remaining / ((count - 1) as f32)), Some(first_util))
+    } else {
+        (None, None)
+    };
 
     let mut results = vec![];
-    for embedder in &embedders {
-        let _ = app.emit("setup://log", serde_json::json!({"line": format!("[stage] checking embedder '{}' on port {}\n", embedder.name, embedder.port)}));
+    for (i, embedder) in embedders.iter().enumerate() {
+        let per_embedder_util = match (i, use_custom_first, each_subsequent) {
+            (0, Some(v), _) => v,
+            (_, _, Some(each)) => each,
+            _ => 0.45 / (count as f32),
+        };
+        let embedder_cfg = if embedder.persistent {
+            DockerConfig { enabled: false, ..resolved_docker.clone() }
+        } else {
+            resolved_docker.clone()
+        };
+        let _ = app.emit("setup://log", serde_json::json!({"line": format!("[stage] checking embedder '{}' on port {} (persistent: {})\n", embedder.name, embedder.port, embedder.persistent)}));
         let collection_name = embedder.effective_collection();
         let qdrant_cfg = QdrantConfig {
             endpoint: format!("http://{}:6333", ssh.host),
@@ -630,7 +657,7 @@ async fn serve_setup_all_embedders(
             let _ = app.emit("setup://log", serde_json::json!({"line": format!("[ok] embeddings already exist ({} points) in collection '{}' for '{}'. Skipping deployment of embedder model.\n", c, collection_name, embedder.name)}));
             "existing_embeddings".to_string()
         } else {
-            match serve::health_check_embedder(&session, &resolved_docker, "127.0.0.1", embedder.port).await {
+            match serve::health_check_embedder(&session, &embedder_cfg, "127.0.0.1", embedder.port).await {
                 Ok(Some(_)) => {
                     let _ = app.emit("setup://log", serde_json::json!({"line": format!("[ok] '{}' already running\n", embedder.name)}));
                     "already_running".to_string()
@@ -638,12 +665,12 @@ async fn serve_setup_all_embedders(
                 _ => {
                     let _ = app.emit("setup://log", serde_json::json!({"line": format!("[stage] booting '{}' with {}\n", embedder.name, embedder.model_id)}));
                     let app_c = app.clone();
-                    match serve::boot_embedder(
+match serve::boot_embedder(
                         &session,
-                        &resolved_docker,
+                        &embedder_cfg,
                         embedder,
                         hf_token.as_deref(),
-                        gpu_memory_utilization,
+                        per_embedder_util,
                         Some(&move |line| {
                             let _ = app_c.emit("setup://log", serde_json::json!({ "line": line }));
                         }),
@@ -1153,20 +1180,19 @@ async fn run_deploy_teacher_task(
     hf_token: Option<&str>,
     cancel: &Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<u16> {
-    let session = SshSession::connect(ssh).await?;
+    let mut session = SshSession::connect(ssh).await?;
 
     // --- GPU VRAM Cleanup ---
-    // Always stop BOTH paddleocr-vl AND rocm-vllm containers before deploying
-    // the teacher model, regardless of serving engine. During the Knowledge Base
-    // ingestion phase, the embedding model runs inside rocm-vllm and PaddleOCR
-    // runs in paddleocr-vl. Both must be fully removed to free VRAM before the
-    // teacher model can load successfully.
+    // Stop paddleocr-vl container to free VRAM. Do NOT stop rocm-vllm — instead
+    // kill non-persistent embedder processes inside it via pkill (see below).
+    // This keeps the container warm so the teacher can reuse it without a full
+    // re-pull/launch. Embedder_1 (persistent) runs on the host and is skipped.
     let _ = app.emit("deploy://log", serde_json::json!({
         "streamId": id,
         "kind": "info",
-        "line": "[GPU CLEANUP] stopping PaddleOCR (paddleocr-vl) and embedding vLLM (rocm-vllm) containers to free VRAM for teacher model...\n"
+        "line": "[GPU CLEANUP] stopping PaddleOCR (paddleocr-vl); preserving rocm-vllm container, will kill non-persistent embedders inside...\n"
     }));
-    let cleanup_cmd = "docker stop paddleocr-vl 2>/dev/null; docker rm paddleocr-vl 2>/dev/null; docker stop rocm-vllm 2>/dev/null; docker rm rocm-vllm 2>/dev/null; true";
+    let cleanup_cmd = "docker stop paddleocr-vl 2>/dev/null; docker rm paddleocr-vl 2>/dev/null; true";
     let ocr_cleanup = session.exec_blocking(cleanup_cmd).await;
     if let Err(e) = ocr_cleanup {
         let _ = app.emit("deploy://log", serde_json::json!({
@@ -1176,42 +1202,34 @@ async fn run_deploy_teacher_task(
         }));
     }
 
-    let app_cfg = config::load().await.unwrap_or_default();
+let app_cfg = config::load().await.unwrap_or_default();
     if !app_cfg.embedders.is_empty() {
-        let names: Vec<String> = app_cfg.embedders.iter().map(|e| e.name.clone()).collect();
+        let killable: Vec<_> = app_cfg.embedders.iter().filter(|e| !e.persistent).collect();
+        let persistent: Vec<_> = app_cfg.embedders.iter().filter(|e| e.persistent).collect();
+        let killable_names: Vec<String> = killable.iter().map(|e| e.name.clone()).collect();
+        let persistent_names: Vec<String> = persistent.iter().map(|e| e.name.clone()).collect();
         let _ = app.emit("deploy://log", serde_json::json!({
             "streamId": id,
             "kind": "info",
-            "line": format!("[GPU CLEANUP] automatically stopping and killing all embedders ({}) to free up VRAM...\n", names.join(", "))
+            "line": format!(
+                "[GPU CLEANUP] stopping {} embedder(s) ({}) and preserving persistent embedder(s) ({})\n",
+                killable_names.len(),
+                killable_names.join(", "),
+                if persistent_names.is_empty() { "none".to_string() } else { persistent_names.join(", ") }
+            )
         }));
 
-        // Actually kill embedder vLLM processes and free their ports
-        let embedder_ports: Vec<String> = app_cfg.embedders.iter().map(|e| e.port.to_string()).collect();
-        let port_kill: String = embedder_ports.iter().map(|p| {
-            format!("(command -v fuser >/dev/null 2>&1 && fuser -k {}/tcp 2>/dev/null) || true; ", p)
-        }).collect();
-        let embedder_kill = format!(
-            "pkill -f 'embed.*vllm' 2>/dev/null; \
-             pkill -f 'vllm.*embed' 2>/dev/null; \
-             pkill -f 'vllm.*pooling' 2>/dev/null; \
-             pkill -f 'vllm.*task' 2>/dev/null; \
-             pkill -f 'sglang.*is-embedding' 2>/dev/null; \
-             sleep 1; \
-             pkill -9 -f 'embed.*vllm' 2>/dev/null; \
-             pkill -9 -f 'vllm.*embed' 2>/dev/null; \
-             pkill -9 -f 'vllm.*pooling' 2>/dev/null; \
-             pkill -9 -f 'vllm.*task' 2>/dev/null; \
-             pkill -9 -f 'sglang.*is-embedding' 2>/dev/null; \
-             {} \
-             true",
-            port_kill
-        );
-        // Sweep host first
-        let _ = session.exec_blocking(&embedder_kill).await;
-        // Then sweep inside all running containers
+        let killable_ports: Vec<u16> = killable.iter().map(|e| e.port).collect();
+        // Host: port-targeted only — the broad embed-vLLM pattern sweep would
+        // also match a persistent embedder running on the host, so never run it
+        // here. Inside containers (where only non-persistent embedders live) the
+        // broad sweep is safe.
+        let host_kill = pipeline::build_embedder_port_kill_cmd(&killable_ports);
+        let _ = session.exec_blocking(&host_kill).await;
+        let inner_kill = pipeline::build_embedder_kill_cmd(&killable_ports);
         if let Ok(ps_r) = session.exec_blocking("docker ps --format '{{.Names}}' 2>/dev/null || true").await {
             for cname in ps_r.stdout.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
-                let inner = pipeline::wrap_docker_cmd(&embedder_kill, &cname);
+                let inner = pipeline::wrap_docker_cmd(&inner_kill, &cname);
                 let _ = session.exec_blocking(&inner).await;
             }
         }
@@ -1285,9 +1303,11 @@ async fn run_deploy_teacher_task(
         teacher.vllm_port
     };
 
-    let mut ports_to_free = vec![port_to_free];
+let mut ports_to_free = vec![port_to_free];
     for emb in &app_cfg.embedders {
-        ports_to_free.push(emb.port);
+        if !emb.persistent {
+            ports_to_free.push(emb.port);
+        }
     }
     ports_to_free.sort();
     ports_to_free.dedup();
@@ -1761,7 +1781,25 @@ async fn run_deploy_teacher_task(
         // Wrap in bash -c so pipes and semicolons are interpreted by a shell
         let combo_cmd = format!("bash -c {}" , pipeline::sh_quote(&inner_combo));
 
-        let r = session.exec_blocking(&combo_cmd).await?;
+        let r = loop {
+            match session.exec_blocking(&combo_cmd).await {
+                Ok(result) => break result,
+                Err(e) => {
+                    let _ = app.emit("deploy://log", serde_json::json!({
+                        "streamId": id,
+                        "kind": "warn",
+                        "line": format!("[ssh-warn] session disconnected ({}), reconnecting...\n", e)
+                    }));
+                    let new_session = SshSession::connect(ssh).await?;
+                    session = new_session;
+                    let _ = app.emit("deploy://log", serde_json::json!({
+                        "streamId": id,
+                        "kind": "info",
+                        "line": "[ssh] session reconnected, retrying probe...\n"
+                    }));
+                }
+            }
+        };
 
         let parts: Vec<&str> = r.stdout.split("---PROBE---").collect();
         if parts.len() >= 2 {

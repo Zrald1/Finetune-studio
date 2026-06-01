@@ -100,21 +100,20 @@ pub async fn health_check_embedder(
     }
 }
 
-pub async fn boot_embedder(
+/// Fire the embedder's vLLM process in the background (detached) and return as
+/// soon as the launch command is accepted — WITHOUT waiting for the model to
+/// finish loading. Use this when you must not block the caller (e.g. the
+/// pipeline, where the teacher is already serving and the embedder only needs to
+/// be ready by the time the first topic is embedded). Pair with
+/// `wait_for_embedder` if you later need to confirm readiness.
+pub async fn launch_embedder(
     session: &SshSession,
     cfg: &DockerConfig,
     embedder: &EmbedderConfig,
     hf_token: Option<&str>,
-    _gpu_memory_utilization: f32,
-    on_log: Option<&(dyn Fn(String) + Send + Sync)>,
-) -> Result<String> {
-    // Qwen3-Embedding-8B in fp16 needs ~16 GB for weights; shared 0.084
-    // (~24 GB on a 287.7 GB MI350X) leaves 8 GB for KV cache + activations,
-    // which is ample for an embedding model that never generates tokens.
-    // Using a fixed value instead of the old `0.45 / count` formula gives
-    // every embedder a stable allocation regardless of how many others are
-    // added or removed.
-    let effective_gpu_mem = 0.084;
+    gpu_memory_utilization: Option<f64>,
+) -> Result<()> {
+    let effective_gpu_mem = gpu_memory_utilization.unwrap_or(0.084);
     let max_num_seqs = " --max-num-seqs 100";
 
     let port = embedder.port;
@@ -164,7 +163,7 @@ pub async fn boot_embedder(
     };
 
     let serve_cmd = format!(
-        "cd /app && {env}vllm serve {model} \
+        "cd /root && {env}vllm serve {model} \
          --runner pooling \
          --port {port} \
          --host 0.0.0.0 \
@@ -173,8 +172,8 @@ pub async fn boot_embedder(
          --download-dir /root/hf-cache \
          --tensor-parallel-size 1 \
          --gpu-memory-utilization {gpu_mem:.3}{max_seqs} \
-         > /app/embedder_{port}.log 2>&1 || \
-         (cd /app && {env}vllm serve {model} \
+         > /root/embedder_{port}.log 2>&1 || \
+         (cd /root && {env}vllm serve {model} \
          --task embed \
          --port {port} \
          --host 0.0.0.0 \
@@ -183,7 +182,7 @@ pub async fn boot_embedder(
          --download-dir /root/hf-cache \
          --tensor-parallel-size 1 \
          --gpu-memory-utilization {gpu_mem:.3}{max_seqs} \
-         > /app/embedder_{port}.log 2>&1)",
+         > /root/embedder_{port}.log 2>&1)",
         env = env,
         model = embedder.model_id,
         port = port,
@@ -193,18 +192,18 @@ pub async fn boot_embedder(
 
     let boot_cmd = if cfg.enabled {
         let inner = format!(
-            "mkdir -p /root/hf-cache; \
-             truncate -s 0 /app/embedder_{port}.log 2>/dev/null || rm -f /app/embedder_{port}.log; \
-             {cmd} > /app/embedder_{port}.log 2>&1",
+            "mkdir -p /root/hf-cache /root; \
+             truncate -s 0 /root/embedder_{port}.log 2>/dev/null || rm -f /root/embedder_{port}.log; \
+             {cmd} > /root/embedder_{port}.log 2>&1",
             port = port,
             cmd = serve_cmd,
         );
         wrap_docker_cmd_detached(&inner, &cfg.container_name)
     } else {
         format!(
-            "mkdir -p /root/hf-cache; \
-             truncate -s 0 /app/embedder_{port}.log 2>/dev/null || rm -f /app/embedder_{port}.log; \
-             nohup bash -lc '{cmd} > /app/embedder_{port}.log 2>&1' < /dev/null & \
+            "mkdir -p /root/hf-cache /root; \
+             truncate -s 0 /root/embedder_{port}.log 2>/dev/null || rm -f /root/embedder_{port}.log; \
+             nohup bash -lc '{cmd} > /root/embedder_{port}.log 2>&1' < /dev/null & \
              echo EMBEDDER_LAUNCHED",
             port = port,
             cmd = serve_cmd,
@@ -218,24 +217,38 @@ pub async fn boot_embedder(
             r.exit_code, r.stderr
         )));
     }
+    Ok(())
+}
 
+/// Poll an already-launched embedder until it serves `/v1/models` (200) or the
+/// timeout elapses, streaming new log lines to `on_log`. `timeout_secs` bounds
+/// the wait; the pipeline uses a short bound so a slow embedder load never
+/// blocks dataset generation (the retrieve phase falls back to keyword scroll).
+pub async fn wait_for_embedder(
+    session: &SshSession,
+    cfg: &DockerConfig,
+    embedder: &EmbedderConfig,
+    timeout_secs: u64,
+    on_log: Option<&(dyn Fn(String) + Send + Sync)>,
+) -> Result<String> {
+    let port = embedder.port;
     let started = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(20 * 60);
+    let timeout = std::time::Duration::from_secs(timeout_secs);
     let mut printed_lines = 0;
 
     loop {
         if started.elapsed() > timeout {
             return Err(AppError::pipeline(format!(
-                "embedder '{}' boot timeout (20 min) on port {}",
-                embedder.model_id, port
+                "embedder '{}' not ready within {}s on port {}",
+                embedder.model_id, timeout_secs, port
             )));
         }
 
         // Stream new log lines of the embedder process to the UI callback
         let count_cmd = if cfg.enabled {
-            wrap_docker_cmd(&format!("wc -l /app/embedder_{}.log 2>/dev/null", port), &cfg.container_name)
+            wrap_docker_cmd(&format!("wc -l /root/embedder_{}.log 2>/dev/null", port), &cfg.container_name)
         } else {
-            format!("wc -l /app/embedder_{}.log 2>/dev/null", port)
+            format!("wc -l /root/embedder_{}.log 2>/dev/null", port)
         };
 
         if let Ok(count_res) = session.exec_blocking(&count_cmd).await {
@@ -243,9 +256,9 @@ pub async fn boot_embedder(
             if let Ok(total_lines) = first_token.parse::<usize>() {
                 if total_lines > printed_lines {
                     let read_cmd = if cfg.enabled {
-                        wrap_docker_cmd(&format!("tail -n +{} /app/embedder_{}.log", printed_lines + 1, port), &cfg.container_name)
+                        wrap_docker_cmd(&format!("tail -n +{} /root/embedder_{}.log", printed_lines + 1, port), &cfg.container_name)
                     } else {
-                        format!("tail -n +{} /app/embedder_{}.log", printed_lines + 1, port)
+                        format!("tail -n +{} /root/embedder_{}.log", printed_lines + 1, port)
                     };
 
                     if let Ok(read_res) = session.exec_blocking(&read_cmd).await {
@@ -280,6 +293,22 @@ pub async fn boot_embedder(
         }
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
+}
+
+/// Launch the embedder and block until it is ready (200 on `/v1/models`) or
+/// the 20-minute timeout elapses. This is the original blocking behaviour,
+/// now expressed as `launch_embedder` + `wait_for_embedder` so callers that
+/// must not block (the pipeline) can use the two pieces independently.
+pub async fn boot_embedder(
+    session: &SshSession,
+    cfg: &DockerConfig,
+    embedder: &EmbedderConfig,
+    hf_token: Option<&str>,
+    _gpu_memory_utilization: f32,
+    on_log: Option<&(dyn Fn(String) + Send + Sync)>,
+) -> Result<String> {
+    launch_embedder(session, cfg, embedder, hf_token, Some(_gpu_memory_utilization as f64)).await?;
+    wait_for_embedder(session, cfg, embedder, 20 * 60, on_log).await
 }
 
 pub async fn embed_text(api_url: &str, model_id: &str, text: &str) -> crate::error::Result<Vec<f32>> {

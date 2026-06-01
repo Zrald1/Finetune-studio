@@ -156,6 +156,7 @@ export interface EmbedderConfig {
   concurrency: number;
   vectorDim?: number;
   enabled: boolean;
+  gpuMemoryUtilization?: number;
 }
 
 export interface PaddleOcrConfig {

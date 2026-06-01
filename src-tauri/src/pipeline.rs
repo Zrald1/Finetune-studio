@@ -596,8 +596,10 @@ async fn run_pipeline(
     }
     let mut container_name = docker_cfg.container_name.clone();
 
-    // Hoisted flag: set during GPU cleanup, consumed by teacher boot (Phase 2)
-    // to prevent killing the embedder vLLM process when it is still serving.
+    // Hoisted flag: set during GPU cleanup, consumed by teacher boot (Phase 2).
+    // True when there is a persistent embedder to preserve, so the teacher-boot
+    // port cleanup stays port-targeted (never a blanket vLLM pkill that would
+    // kill the persistent embedder serving semantic search).
     let mut embedder_1_alive = false;
 
     if docker_cfg.enabled && needs_ssh {
@@ -629,61 +631,82 @@ async fn run_pipeline(
             false
         };
 
-        if teacher_already_up {
-            // Teacher is alive in rocm-vllm — only evict the OCR container
-            emit_log(
-                app,
-                &run.id,
-                &format!(
-                    "[GPU CLEANUP] teacher already serving on port {} — stopping only PaddleOCR (paddleocr-vl)...\n",
-                    teacher_port
-                ),
-                "stage",
-            );
+        // ── GPU CLEANUP ─────────────────────────────────────────────────────
+        // Rule: NEVER stop the embedding container (rocm-vllm) — keep it warm.
+        // Only the PaddleOCR container is evicted, and only the *non-persistent*
+        // embedder vLLM processes inside the container(s) are killed. Persistent
+        // embedders (the "first embedder" doing semantic search) are preserved so
+        // dataset generation can still retrieve via vector search while the
+        // teacher boots on the remaining VRAM.
+        {
+            // Split configured embedders into preserve (persistent) vs stop.
+            let non_persistent_ports: Vec<u16> =
+                cfg.embedders.iter().filter(|e| !e.persistent).map(|e| e.port).collect();
+            let persistent_names: Vec<String> =
+                cfg.embedders.iter().filter(|e| e.persistent).map(|e| e.name.clone()).collect();
+            let non_persistent_names: Vec<String> =
+                cfg.embedders.iter().filter(|e| !e.persistent).map(|e| e.name.clone()).collect();
+            // Phase-2 boot keeps a port-targeted (non-blanket) pkill whenever a
+            // persistent embedder must survive.
+            embedder_1_alive = !persistent_names.is_empty();
+
+            if teacher_already_up {
+                emit_log(
+                    app,
+                    &run.id,
+                    &format!(
+                        "[GPU CLEANUP] teacher already serving on port {} — stopping only PaddleOCR (paddleocr-vl), preserving rocm-vllm container...\n",
+                        teacher_port
+                    ),
+                    "stage",
+                );
+            } else {
+                emit_log(
+                    app,
+                    &run.id,
+                    &format!(
+                        "[GPU CLEANUP] stopping PaddleOCR (paddleocr-vl); preserving rocm-vllm container; stopping {} non-persistent embedder(s) ({}), preserving persistent embedder(s) ({})\n",
+                        non_persistent_names.len(),
+                        if non_persistent_names.is_empty() { "none".to_string() } else { non_persistent_names.join(", ") },
+                        if persistent_names.is_empty() { "none".to_string() } else { persistent_names.join(", ") },
+                    ),
+                    "stage",
+                );
+            }
+
             if let Some(ref session) = session_opt {
+                // Always evict only the OCR container — never rocm-vllm.
                 let _ = session.exec_blocking(
                     "docker stop paddleocr-vl 2>/dev/null; docker rm paddleocr-vl 2>/dev/null; true"
                 ).await;
-            }
-} else {
-            // Teacher is not running — stop PaddleOCR. For rocm-vllm: stop it
-            // only if embedder_1 (port 8101) is NOT already serving; when it IS
-            // serving we keep it alive so dataset generation can still retrieve
-            // via vector search while the teacher boots on the remaining VRAM.
-            emit_log(
-                app,
-                &run.id,
-                "[GPU CLEANUP] stopping PaddleOCR (paddleocr-vl); checking embedder_1 (port 8101)...\n",
-                "stage",
-            );
-            if let Some(ref session) = session_opt {
-                embedder_1_alive = {
-                    let probe = "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8101/v1/models 2>/dev/null || echo 000";
-                    session.exec_blocking(&probe).await
-                        .map(|r| r.stdout.trim() == "200")
-                        .unwrap_or(false)
-                };
 
-                if embedder_1_alive {
-                    emit_log(
-                        app,
-                        &run.id,
-                        "[GPU CLEANUP] embedder_1 still running on port 8101 — preserving it, stopping only PaddleOCR...\n",
-                        "stage",
-                    );
-                    let _ = session.exec_blocking(
-                        "docker stop paddleocr-vl 2>/dev/null; docker rm paddleocr-vl 2>/dev/null; true"
-                    ).await;
-                } else {
-                    emit_log(
-                        app,
-                        &run.id,
-                        "[GPU CLEANUP] stopping PaddleOCR (paddleocr-vl) and embedding vLLM (rocm-vllm) containers to free VRAM for teacher model...\n",
-                        "stage",
-                    );
-                    let _ = session.exec_blocking(
-                        "docker stop paddleocr-vl 2>/dev/null; docker rm paddleocr-vl 2>/dev/null; docker stop rocm-vllm 2>/dev/null; docker rm rocm-vllm 2>/dev/null; true"
-                    ).await;
+                // Stop non-persistent embedder processes (only when the teacher is
+                // not already up — if it is, the embedders inside are already in
+                // their steady state and the teacher needs no extra VRAM freed).
+                if !teacher_already_up && !non_persistent_ports.is_empty() {
+                    // Host: port-targeted only (a persistent embedder runs on the
+                    // host on a different port and must not be pattern-matched).
+                    let host_kill = build_embedder_port_kill_cmd(&non_persistent_ports);
+                    let _ = session.exec_blocking(&host_kill).await;
+
+                    // Inside every running container: broad embed-vLLM sweep +
+                    // port kill (only non-persistent embedders live in containers).
+                    let inner_kill = build_embedder_kill_cmd(&non_persistent_ports);
+                    if let Ok(ps_r) = session
+                        .exec_blocking("docker ps --format '{{.Names}}' 2>/dev/null || true")
+                        .await
+                    {
+                        for cname in ps_r
+                            .stdout
+                            .lines()
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                        {
+                            let inner = wrap_docker_cmd(&inner_kill, &cname);
+                            let _ = session.exec_blocking(&inner).await;
+                        }
+                    }
+                    emit_log(app, &run.id, "[GPU CLEANUP] non-persistent embedders stopped\n", "stage");
                 }
             }
         }
@@ -704,6 +727,196 @@ async fn run_pipeline(
             &format!("[ok] container '{}' is running\n", container_name),
             "stage",
         );
+
+        // ── Re-deploy ONE embedder for semantic search ─────────────────────
+        // The cleanup above stopped PaddleOCR and the embedder vLLM to free VRAM
+        // for the teacher. Dataset generation still needs to embed topic queries
+        // for vector search against Qdrant, so we bring a single embedder back up
+        // on the remaining VRAM (the embedder is sized at ~0.084 GPU util, which
+        // co-exists fine with the teacher).
+        //
+        // GATE: only deploy the embedder when the GPU server actually HAS a Qdrant
+        // running (live probe on :6333). With no Qdrant there is nothing to search,
+        // so deploying an embedder would just waste VRAM — skip it entirely.
+        // Also skipped in train_only / resumed-dataset modes (no generation).
+        let needs_embedder = !run_cfg.hub_dataset.train_only
+            && !(resume && run.dataset_ready);
+        if needs_embedder {
+            let session = session_opt.as_ref().unwrap();
+
+            // Live Qdrant probe on the GPU server.
+            let qdrant_up = {
+                let probe = "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:6333/collections 2>/dev/null || echo 000";
+                session.exec_blocking(probe).await
+                    .map(|r| r.stdout.trim() == "200")
+                    .unwrap_or(false)
+            };
+
+            if !qdrant_up {
+                emit_log(
+                    app,
+                    &run.id,
+                    "[embedder] GPU server has no Qdrant on :6333 — skipping embedder deployment (no vector store to search)\n",
+                    "stage",
+                );
+            } else if let Some(embedder) = cfg
+                .embedders
+                .iter()
+                .find(|e| e.persistent)
+                .or_else(|| cfg.embedders.first())
+            {
+                // Prefer the first PERSISTENT embedder — that is the one GPU
+                // cleanup preserved for semantic search; reviving the same one
+                // avoids a needless re-load. Fall back to the first configured
+                // embedder when none is marked persistent.
+                // Persistent embedders run outside Docker on the host, survive
+                // GPU cleanup, and get 24 GB VRAM (0.125 on a 192 GB card).
+                // Non-persistent embedders follow the existing docker-based path
+                // with minimal VRAM (0.084).
+                let is_persistent = embedder.persistent;
+                let embedder_cfg = if is_persistent {
+                    // Host-mode: probe + launch directly on the droplet, not
+                    // inside any container.
+                    DockerConfig {
+                        enabled: false,
+                        ..docker_cfg.clone()
+                    }
+                } else {
+                    docker_cfg.clone()
+                };
+
+                // Already serving?
+                let already_up = crate::serve::health_check_embedder(
+                    session,
+                    &embedder_cfg,
+                    "127.0.0.1",
+                    embedder.port,
+                )
+                .await
+                .map(|o| o.is_some())
+                .unwrap_or(false);
+
+                if already_up {
+                    emit_log(
+                        app,
+                        &run.id,
+                        &format!(
+                            "[embedder] '{}' already serving on port {} — reusing for semantic search\n",
+                            embedder.name, embedder.port
+                        ),
+                        "stage",
+                    );
+                } else {
+                    let mode = if is_persistent { "host" } else { "docker" };
+                    let gpu_mem = if is_persistent { 0.125 } else { 0.084 };
+                    emit_log(
+                        app,
+                        &run.id,
+                        &format!(
+                            "[embedder] Qdrant present — deploying 1 embedder '{}' ({}) on port {} via {} ({} GPU util)\n",
+                            embedder.name, embedder.model_id, embedder.port, mode, gpu_mem
+                        ),
+                        "stage",
+                    );
+                    let hf_token = cfg.hf_token.as_deref().filter(|s| !s.is_empty());
+                    match crate::serve::launch_embedder(
+                        session,
+                        &embedder_cfg,
+                        embedder,
+                        hf_token,
+                        Some(gpu_mem),
+                    )
+                    .await
+                    {
+                        Ok(_) => emit_log(
+                            app,
+                            &run.id,
+                            &format!(
+                                "[embedder] '{}' launching in background on port {} — continuing; semantic search activates once it is ready (keyword scroll used until then)\n",
+                                embedder.name, embedder.port
+                            ),
+                            "stage",
+                        ),
+                        Err(e) => emit_log(
+                            app,
+                            &run.id,
+                            &format!(
+                                "[embedder] launch failed (non-fatal, will fall back to keyword scroll): {}\n",
+                                e
+                            ),
+                            "warn",
+                        ),
+                    }
+                }
+
+                // Block waiting for the embedder to serve /v1/models (up to
+                // 600s = 10 min). An 8B model takes 3–5 min to load into VRAM.
+                // If it becomes ready, semantic search works immediately.
+                // Otherwise fall through to keyword-ranked Qdrant scroll.
+                emit_log(
+                    app,
+                    &run.id,
+                    &format!(
+                        "[embedder] waiting up to 600s for '{}' on 127.0.0.1:{} to become ready...\n",
+                        embedder.name, embedder.port
+                    ),
+                    "stage",
+                );
+                let embedder_ready = tokio::time::timeout(
+                    std::time::Duration::from_secs(600),
+                    crate::serve::wait_for_embedder(
+                        session,
+                        &embedder_cfg,
+                        embedder,
+                        600,
+                        None,
+                    ),
+                )
+                .await;
+                match embedder_ready {
+                    Ok(Ok(ip)) => {
+                        emit_log(
+                            app,
+                            &run.id,
+                            &format!(
+                                "[embedder] '{}' ready at {}:{} — semantic search active\n",
+                                embedder.name, ip, embedder.port
+                            ),
+                            "stage",
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        emit_log(
+                            app,
+                            &run.id,
+                            &format!(
+                                "[embedder] '{}' not ready within 600s (non-fatal, falling back to keyword scroll): {}\n",
+                                embedder.name, e
+                            ),
+                            "warn",
+                        );
+                    }
+                    Err(_) => {
+                        emit_log(
+                            app,
+                            &run.id,
+                            &format!(
+                                "[embedder] '{}' wait timed out after 600s (non-fatal, falling back to keyword scroll)\n",
+                                embedder.name
+                            ),
+                            "warn",
+                        );
+                    }
+                }
+            } else {
+                emit_log(
+                    app,
+                    &run.id,
+                    "[embedder] Qdrant present but no embedders configured — skipping embedder deployment\n",
+                    "warn",
+                );
+            }
+        }
     }
 
     // Prep remote directories
@@ -949,17 +1162,13 @@ else: print('NOT_FOUND')\
              true",
             port = port_to_check_inner,
         );
-                // Ensure PaddleOCR and embedding containers are stopped (already
-                // done at pipeline start, but force again here in case they were
-                // restarted externally or docker was disabled during that first pass).
-                // When embedder_1 is alive, preserve the rocm-vllm container so the
-                // pipeline can still retrieve via vector search during generation.
+                // Ensure the PaddleOCR container is stopped (already done at
+                // pipeline start, but force again here in case it was restarted
+                // externally). NEVER stop rocm-vllm — the embedding container is
+                // kept warm; only embedder *processes* are managed, and the
+                // persistent embedder serving semantic search must survive.
                 if docker_cfg.enabled {
-                    if embedder_1_alive {
-                        let _ = session.exec_blocking("docker stop paddleocr-vl 2>/dev/null; docker rm paddleocr-vl 2>/dev/null; true").await;
-                    } else {
-                        let _ = session.exec_blocking("docker stop paddleocr-vl 2>/dev/null; docker rm paddleocr-vl 2>/dev/null; docker stop rocm-vllm 2>/dev/null; docker rm rocm-vllm 2>/dev/null; true").await;
-                    }
+                    let _ = session.exec_blocking("docker stop paddleocr-vl 2>/dev/null; docker rm paddleocr-vl 2>/dev/null; true").await;
                     container_name = ensure_container(session, &docker_cfg).await?;
                 }
                 // When embedder_1 is alive, use a port-targeted cleanup instead of
@@ -4155,6 +4364,54 @@ pub fn wrap_docker_cmd_detached(cmd: &str, container_name: &str) -> String {
         container_name,
         sh_quote(cmd)
     )
+}
+
+/// Per-port kill body: frees each given TCP port by `fuser`/`ss`. Safe to run on
+/// the HOST because it touches only the listed ports — pass ONLY non-persistent
+/// embedder ports so a persistent (first) embedder on its own port is untouched.
+fn embedder_port_kill(non_persistent_ports: &[u16]) -> String {
+    non_persistent_ports
+        .iter()
+        .map(|p| {
+            format!(
+                "(command -v fuser >/dev/null 2>&1 && fuser -k {p}/tcp 2>/dev/null) || true; \
+                 (command -v ss >/dev/null 2>&1 && ss -ltnp 2>/dev/null | awk '/:{p} /{{print $0}}' | grep -oE 'pid=[0-9]+' | cut -d= -f2 | xargs -r kill -9 2>/dev/null) || true; ",
+                p = p,
+            )
+        })
+        .collect()
+}
+
+/// Build a shell command that stops only the embedder vLLM *processes* — never a
+/// Docker container. It kills the generic embed-vLLM process patterns and force-
+/// frees each given port. The broad pattern sweep (`vllm.*pooling`, etc.) would
+/// also match a persistent embedder, so this is meant to run INSIDE CONTAINERS,
+/// where only non-persistent embedders live; persistent embedders run on the host
+/// (docker disabled) and are never reached. Pass only non-persistent ports.
+/// Mirrors the cleanup in `main.rs::run_deploy_teacher_task`.
+pub fn build_embedder_kill_cmd(non_persistent_ports: &[u16]) -> String {
+    format!(
+        "pkill -f 'embed.*vllm' 2>/dev/null; \
+         pkill -f 'vllm.*embed' 2>/dev/null; \
+         pkill -f 'vllm.*pooling' 2>/dev/null; \
+         pkill -f 'vllm.*task' 2>/dev/null; \
+         pkill -f 'sglang.*is-embedding' 2>/dev/null; \
+         sleep 1; \
+         pkill -9 -f 'embed.*vllm' 2>/dev/null; \
+         pkill -9 -f 'vllm.*embed' 2>/dev/null; \
+         pkill -9 -f 'vllm.*pooling' 2>/dev/null; \
+         pkill -9 -f 'vllm.*task' 2>/dev/null; \
+         pkill -9 -f 'sglang.*is-embedding' 2>/dev/null; \
+         {port_kill}\
+         true",
+        port_kill = embedder_port_kill(non_persistent_ports),
+    )
+}
+
+/// Host-safe embedder stop: ONLY frees the given non-persistent ports (no broad
+/// pattern sweep that could hit a persistent embedder running on the host).
+pub fn build_embedder_port_kill_cmd(non_persistent_ports: &[u16]) -> String {
+    format!("{}true", embedder_port_kill(non_persistent_ports))
 }
 
 fn build_custom_train_cmd(run: &Run, lora: &LoraConfig, hf_export: &str) -> Result<String> {

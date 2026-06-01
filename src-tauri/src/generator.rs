@@ -197,10 +197,11 @@ impl ParseReject {
 /// when the response can't be parsed so the caller can log *why*.
 ///
 /// Handles both:
-///   - the requested format (QUESTION → <think>…</think> → ANSWER), and
-///   - reasoning models like DeepSeek-R1 that emit `<think>…</think>` at the
+///   - the requested format (QUESTION →  thinking… response → ANSWER), and
+///   - the older Q1/A1 format (Q1: … A1: …) used by some fine-tuned teachers,
+///   - reasoning models like DeepSeek-R1 that emit ` thinking… response` at the
 ///     start before the QUESTION/ANSWER block.
-/// `<think>` is now optional — if the model omits it we still keep the pair
+/// ` thinking` is now optional — if the model omits it we still keep the pair
 /// (think defaults to empty); historically requiring it was the main reason
 /// every chunk got rejected.
 pub fn parse_pair(raw: &str, chunk: &Chunk) -> std::result::Result<GeneratedPair, ParseReject> {
@@ -211,34 +212,65 @@ pub fn parse_pair(raw: &str, chunk: &Chunk) -> std::result::Result<GeneratedPair
     // Some models emit "SKIP: off-topic" anywhere in the response.
     if trimmed.to_ascii_uppercase().contains("SKIP: OFF-TOPIC")
         && !trimmed.to_ascii_uppercase().contains("QUESTION:")
+        && !trimmed.contains("Q1:")
     {
         return Err(ParseReject::Skip);
     }
 
-    // QUESTION block: from "QUESTION:" up to (but not including) the next
-    // <think>, ANSWER:, or end of string. Use lookahead-friendly non-greedy
-    // match without lookahead support by stopping at the earliest of those.
-    let q_re = Regex::new(r"(?is)QUESTION\s*:\s*(.*?)(?:\n\s*<think>|\nANSWER\s*:|\z)").unwrap();
-    let t_re = Regex::new(r"(?is)<think>\s*(.*?)\s*</think>").unwrap();
+    // Try the canonical QUESTION:/ANSWER: format first.
+    let q_re = Regex::new(r"(?is)QUESTION\s*:\s*(.*?)(?:\n\s* thinking|\nANSWER\s*:|\z)").unwrap();
+    let t_re = Regex::new(r"(?is) thinking\s*(.*?)\s* response").unwrap();
     let a_re = Regex::new(r"(?is)ANSWER\s*:\s*(.*)\z").unwrap();
 
-    let q = match q_re.captures(raw) {
-        Some(c) => c.get(1).map(|m| m.as_str().trim().to_string()).unwrap_or_default(),
-        None => return Err(ParseReject::NoQuestion),
-    };
-    if q.is_empty() {
-        return Err(ParseReject::NoQuestion);
-    }
+    // Fallback: some fine-tuned teachers emit Q1:/A1: format instead.
+    let q1_re = Regex::new(r"(?is)Q1\s*:\s*(.*?)(?:\n|A1\s*:|\z)").unwrap();
+    let a1_re = Regex::new(r"(?is)A1\s*:\s*(.*)\z").unwrap();
 
-    let a = match a_re.captures(raw) {
-        Some(c) => c.get(1).map(|m| m.as_str().trim().to_string()).unwrap_or_default(),
-        None => return Err(ParseReject::NoAnswer),
+    let has_question_fmt = trimmed.contains("QUESTION:");
+    let has_q1_fmt = trimmed.contains("Q1:");
+
+    let (q, a) = if has_question_fmt || !has_q1_fmt {
+        // Use canonical QUESTION: format
+        let question = match q_re.captures(raw) {
+            Some(c) => c.get(1).map(|m| m.as_str().trim().to_string()).unwrap_or_default(),
+            None => return Err(ParseReject::NoQuestion),
+        };
+        if question.is_empty() {
+            return Err(ParseReject::NoQuestion);
+        }
+        let answer = match a_re.captures(raw) {
+            Some(c) => c.get(1).map(|m| m.as_str().trim().to_string()).unwrap_or_default(),
+            None => return Err(ParseReject::NoAnswer),
+        };
+        (question, answer)
+    } else {
+        // Use Q1: / A1: fallback format
+        let question = match q1_re.captures(raw) {
+            Some(c) => c.get(1).map(|m| m.as_str().trim().to_string()).unwrap_or_default(),
+            None => return Err(ParseReject::NoQuestion),
+        };
+        if question.is_empty() {
+            return Err(ParseReject::NoQuestion);
+        }
+        let answer = match a1_re.captures(raw) {
+            Some(c) => c.get(1).map(|m| m.as_str().trim().to_string()).unwrap_or_default(),
+            None => {
+                // If A1: not found, try everything after the last Q1: block as the answer
+                raw.splitn(2, |c: char| c == '\n')
+                    .nth(1)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            }
+        };
+        (question, answer)
     };
+
     if a.len() < 20 {
         return Err(ParseReject::AnswerTooShort(a.len()));
     }
 
-    // `<think>` is optional. R1-style reasoning models emit it at the top of
+    // ` thinking` is optional. R1-style reasoning models emit it at the top of
     // the message; the formatted spec puts it between QUESTION and ANSWER.
     // Either way, grab the first match if present.
     let t = t_re
@@ -248,7 +280,7 @@ pub fn parse_pair(raw: &str, chunk: &Chunk) -> std::result::Result<GeneratedPair
 
     let messages = vec![
         serde_json::json!({ "role": "user", "content": q }),
-        serde_json::json!({ "role": "assistant", "content": format!("<think>\n{}\n</think>\n{}", t, a) }),
+        serde_json::json!({ "role": "assistant", "content": format!(" thinking\n{}\n response\n{}", t, a) }),
     ];
 
     Ok(GeneratedPair {
@@ -263,7 +295,7 @@ pub fn parse_pair(raw: &str, chunk: &Chunk) -> std::result::Result<GeneratedPair
         },
         topic: String::new(),
         messages: Some(messages),
-    })
+})
 }
 
 /// Build the prompt for a chunk by substituting `{chunk_text}`.

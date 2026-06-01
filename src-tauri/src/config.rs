@@ -60,6 +60,17 @@ pub struct EmbedderConfig {
     pub vector_dim: Option<usize>,
     /// Whether this embedder participates in "Setup all embedding models".
     pub enabled: bool,
+    /// If true, this embedder runs outside Docker on the host and is NOT
+    /// stopped by GPU cleanup during teacher deploy. Persistent embedders
+    /// survive across teacher deployments so the pipeline can reuse them
+    /// without the 3–5 minute VRAM load time on every dataset generation run.
+    #[serde(default)]
+    pub persistent: bool,
+    /// Optional user-specified GPU memory utilization (0.0–1.0).
+    /// Only meaningful on the first embedder (embedder_1). When set, embedder_1
+    /// uses this value and remaining embedders split (0.45 − this) evenly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_memory_utilization: Option<f32>,
 }
 
 impl Default for EmbedderConfig {
@@ -72,6 +83,8 @@ impl Default for EmbedderConfig {
             concurrency: 2,
             vector_dim: None,
             enabled: true,
+            persistent: false,
+            gpu_memory_utilization: None,
         }
     }
 }
