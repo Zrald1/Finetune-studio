@@ -4933,7 +4933,7 @@ async fn push_jsonl_to_hf_dataset(
     }
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_secs(10 * 60))
         .user_agent("fine-tune-tauri/0.1")
         .build()
         .map_err(|e| AppError::pipeline(format!("build http client: {e}")))?;
@@ -5007,105 +5007,221 @@ async fn push_jsonl_to_hf_dataset(
         }
     }
 
-    // 2. Upload via Git LFS to bypass the 413 Payload Too Large error.
-    use sha2::{Sha256, Digest};
+    // 2. Ask the Hub how this file should be uploaded. This mirrors
+    // huggingface_hub's preupload step and prevents us from forcing small JSONL
+    // checkpoints through LFS unnecessarily.
+    use sha2::{Digest, Sha256};
     let content_bytes = jsonl.as_bytes();
     let size = content_bytes.len();
-    
+
     let mut hasher = Sha256::new();
     hasher.update(content_bytes);
     let hash = format!("{:x}", hasher.finalize());
-    
-    let batch_url = format!("https://huggingface.co/api/datasets/{}.git/info/lfs/objects/batch", repo);
-    let batch_body = serde_json::json!({
-        "operation": "upload",
-        "transfers": ["basic"],
-        "ref": { "name": "refs/heads/main" },
-        "objects": [
+
+    let sample_len = content_bytes.len().min(512);
+    let sample = base64::engine::general_purpose::STANDARD.encode(&content_bytes[..sample_len]);
+    let preupload_url = format!(
+        "https://huggingface.co/api/datasets/{}/preupload/main",
+        repo
+    );
+    let preupload_body = serde_json::json!({
+        "files": [
             {
-                "oid": hash,
-                "size": size
+                "path": "qa_dataset.jsonl",
+                "sample": sample,
+                "size": size,
             }
         ]
     });
-    
-    let lfs_res = client
-        .post(&batch_url)
-        .header("Accept", "application/vnd.git-lfs+json")
-        .header("Content-Type", "application/vnd.git-lfs+json")
+    let preupload_res = client
+        .post(&preupload_url)
         .bearer_auth(tok)
-        .json(&batch_body)
+        .json(&preupload_body)
         .send()
         .await
-        .map_err(|e| AppError::pipeline(format!("HF LFS batch network error: {e}")))?;
-        
-    let lfs_status = lfs_res.status();
-    if !lfs_status.is_success() {
-        let body = lfs_res.text().await.unwrap_or_default();
+        .map_err(|e| AppError::pipeline(format!("HF preupload network error: {e}")))?;
+    let preupload_status = preupload_res.status();
+    if !preupload_status.is_success() {
+        let body = preupload_res.text().await.unwrap_or_default();
         let safe = body.replace(tok, "***");
-        return Err(AppError::pipeline(format!("HF LFS batch {lfs_status}: {safe}")));
+        return Err(AppError::pipeline(format!(
+            "HF preupload {preupload_status}: {safe}"
+        )));
     }
-    
-    let res_json: serde_json::Value = lfs_res
+    let preupload_json: serde_json::Value = preupload_res
         .json()
         .await
-        .map_err(|e| AppError::pipeline(format!("HF LFS batch response not JSON: {e}")))?;
-        
-    if let Some(objects) = res_json.get("objects").and_then(|o| o.as_array()) {
-        if let Some(obj) = objects.first() {
-            if let Some(err_obj) = obj.get("error") {
-                let err_msg = err_obj.get("message").and_then(|m| m.as_str()).unwrap_or("unknown LFS batch error");
-                return Err(AppError::pipeline(format!("HF LFS batch object error: {err_msg}")));
-            }
-            if let Some(actions) = obj.get("actions") {
-                if let Some(upload) = actions.get("upload") {
-                    let href = upload.get("href").and_then(|h| h.as_str()).ok_or_else(|| {
-                        AppError::pipeline("HF LFS response missing upload href")
-                    })?;
-                    let headers = upload.get("header").and_then(|h| h.as_object());
-                    
-                    let mut req = client.put(href).body(content_bytes.to_vec());
-                    if let Some(headers_map) = headers {
-                        for (k, v) in headers_map {
-                            if let Some(v_str) = v.as_str() {
-                                req = req.header(k, v_str);
-                            }
+        .map_err(|e| AppError::pipeline(format!("HF preupload response not JSON: {e}")))?;
+
+    let file_info = preupload_json
+        .get("files")
+        .and_then(|f| f.as_array())
+        .and_then(|files| files.first())
+        .ok_or_else(|| AppError::pipeline("HF preupload response missing files[0]"))?;
+    if file_info
+        .get("shouldIgnore")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return Err(AppError::pipeline(
+            "HF preupload says qa_dataset.jsonl is ignored by repo .gitignore",
+        ));
+    }
+    let upload_mode = file_info
+        .get("uploadMode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("regular");
+
+    if upload_mode == "lfs" {
+        // 3. Pre-upload the blob via Git LFS. The correct dataset LFS route is
+        // /datasets/<repo>.git/info/lfs/objects/batch, not /api/datasets/<repo>.git.
+        let batch_url = format!(
+            "https://huggingface.co/datasets/{}.git/info/lfs/objects/batch",
+            repo
+        );
+        let batch_body = serde_json::json!({
+            "operation": "upload",
+            "transfers": ["basic"],
+            "ref": { "name": "main" },
+            "objects": [
+                {
+                    "oid": hash,
+                    "size": size,
+                }
+            ],
+            "hash_algo": "sha256",
+        });
+
+        let lfs_res = client
+            .post(&batch_url)
+            .header("Accept", "application/vnd.git-lfs+json")
+            .header("Content-Type", "application/vnd.git-lfs+json")
+            .bearer_auth(tok)
+            .json(&batch_body)
+            .send()
+            .await
+            .map_err(|e| AppError::pipeline(format!("HF LFS batch network error: {e}")))?;
+
+        let lfs_status = lfs_res.status();
+        if !lfs_status.is_success() {
+            let body = lfs_res.text().await.unwrap_or_default();
+            let safe = body.replace(tok, "***");
+            return Err(AppError::pipeline(format!(
+                "HF LFS batch {lfs_status}: {safe}"
+            )));
+        }
+
+        let res_json: serde_json::Value = lfs_res
+            .json()
+            .await
+            .map_err(|e| AppError::pipeline(format!("HF LFS batch response not JSON: {e}")))?;
+
+        let obj = res_json
+            .get("objects")
+            .and_then(|o| o.as_array())
+            .and_then(|objects| objects.first())
+            .ok_or_else(|| AppError::pipeline("HF LFS batch response missing objects[0]"))?;
+        if let Some(err_obj) = obj.get("error") {
+            let err_msg = err_obj
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown LFS batch error");
+            return Err(AppError::pipeline(format!(
+                "HF LFS batch object error: {err_msg}"
+            )));
+        }
+        if let Some(actions) = obj.get("actions") {
+            if let Some(upload) = actions.get("upload") {
+                let href = upload
+                    .get("href")
+                    .and_then(|h| h.as_str())
+                    .ok_or_else(|| AppError::pipeline("HF LFS response missing upload href"))?;
+                let headers = upload.get("header").and_then(|h| h.as_object());
+
+                let mut req = client.put(href).body(content_bytes.to_vec());
+                if let Some(headers_map) = headers {
+                    for (k, v) in headers_map {
+                        if let Some(v_str) = v.as_str() {
+                            req = req.header(k, v_str);
                         }
                     }
-                    
-                    let upload_res = req.send().await.map_err(|e| {
-                        AppError::pipeline(format!("HF LFS upload PUT request network error: {e}"))
-                    })?;
-                    
-                    let upload_status = upload_res.status();
-                    if !upload_status.is_success() {
-                        let body = upload_res.text().await.unwrap_or_default();
-                        return Err(AppError::pipeline(format!("HF LFS S3 upload PUT returned {upload_status}: {body}")));
-                    }
+                }
+
+                let upload_res = req.send().await.map_err(|e| {
+                    AppError::pipeline(format!("HF LFS upload PUT request network error: {e}"))
+                })?;
+
+                let upload_status = upload_res.status();
+                if !upload_status.is_success() {
+                    let body = upload_res.text().await.unwrap_or_default();
+                    return Err(AppError::pipeline(format!(
+                        "HF LFS upload PUT returned {upload_status}: {body}"
+                    )));
+                }
+            }
+
+            if let Some(verify) = actions.get("verify") {
+                let href = verify
+                    .get("href")
+                    .and_then(|h| h.as_str())
+                    .ok_or_else(|| AppError::pipeline("HF LFS response missing verify href"))?;
+                let verify_res = client
+                    .post(href)
+                    .header("Accept", "application/vnd.git-lfs+json")
+                    .header("Content-Type", "application/vnd.git-lfs+json")
+                    .bearer_auth(tok)
+                    .json(&serde_json::json!({
+                        "oid": hash,
+                        "size": size,
+                    }))
+                    .send()
+                    .await
+                    .map_err(|e| AppError::pipeline(format!("HF LFS verify network error: {e}")))?;
+                let verify_status = verify_res.status();
+                if !verify_status.is_success() {
+                    let body = verify_res.text().await.unwrap_or_default();
+                    let safe = body.replace(tok, "***");
+                    return Err(AppError::pipeline(format!(
+                        "HF LFS verify {verify_status}: {safe}"
+                    )));
                 }
             }
         }
+    } else if upload_mode != "regular" {
+        return Err(AppError::pipeline(format!(
+            "HF preupload returned unsupported uploadMode '{upload_mode}'"
+        )));
     }
-    
-    // Commit the LFS pointer file
-    let pointer_content = format!(
-        "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize {}\n",
-        hash, size
-    );
-    let summary = format!("auto LFS: {kept} pairs");
-    let encoded = base64::engine::general_purpose::STANDARD.encode(pointer_content.as_bytes());
-    
+
+    // 4. Commit. For LFS uploads, the Hub commit API expects an `lfsFile`
+    // operation with oid/size metadata; for regular uploads it expects the file
+    // content as base64.
+    let summary = format!("auto dataset: {kept} pairs");
+    let file_line = if upload_mode == "lfs" {
+        serde_json::json!({
+            "key": "lfsFile",
+            "value": {
+                "path": "qa_dataset.jsonl",
+                "algo": "sha256",
+                "oid": hash,
+                "size": size,
+            }
+        })
+    } else {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(content_bytes);
+        serde_json::json!({
+            "key": "file",
+            "value": {
+                "path": "qa_dataset.jsonl",
+                "content": encoded,
+                "encoding": "base64",
+            }
+        })
+    };
+
     let header_line = serde_json::json!({
         "key": "header",
         "value": { "summary": summary }
-    });
-    let file_line = serde_json::json!({
-        "key": "file",
-        "value": {
-            "path": "qa_dataset.jsonl",
-            "content": encoded,
-            "encoding": "base64",
-        }
     });
     let ndjson = format!("{}\n{}\n", header_line, file_line);
 
@@ -5118,12 +5234,12 @@ async fn push_jsonl_to_hf_dataset(
         .send()
         .await
         .map_err(|e| AppError::pipeline(format!("HF commit network error: {e}")))?;
-        
+
     let status = commit_res.status();
     if !status.is_success() {
         let body = commit_res.text().await.unwrap_or_default();
         let safe = body.replace(tok, "***");
-        return Err(AppError::pipeline(format!("HF commit pointer {status}: {safe}")));
+        return Err(AppError::pipeline(format!("HF commit {status}: {safe}")));
     }
     Ok(())
 }
