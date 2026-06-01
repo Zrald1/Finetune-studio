@@ -48,6 +48,8 @@ pub struct GeneratedPair {
     pub answer: String,
     pub source_chunk_id: String,
     pub source_file: String,
+    #[serde(default)]
+    pub source_text: String,
     /// The focus topic this pair was generated under. Empty = no topic filter.
     #[serde(default)]
     pub topic: String,
@@ -293,6 +295,7 @@ pub fn parse_pair(raw: &str, chunk: &Chunk) -> std::result::Result<GeneratedPair
         } else {
             chunk.file_path.clone()
         },
+        source_text: chunk.text.clone(),
         topic: String::new(),
         messages: Some(messages),
 })

@@ -37,6 +37,20 @@ pub struct LoraConfig {
     pub custom_commands: Vec<String>,
     #[serde(default = "default_unsloth_backend")]
     pub unsloth_backend: String,
+    #[serde(default)]
+    pub zrald_reward_endpoint: String,
+    #[serde(default)]
+    pub zrald_reward_model: String,
+    #[serde(default = "default_zrald_train_questions")]
+    pub zrald_train_questions: u32,
+    #[serde(default = "default_zrald_benchmark_questions")]
+    pub zrald_benchmark_questions: u32,
+    #[serde(default = "default_zrald_num_generations")]
+    pub zrald_num_generations: u32,
+    #[serde(default)]
+    pub zrald_reward_temperature: f32,
+    #[serde(default = "default_zrald_max_completion_tokens")]
+    pub zrald_max_completion_tokens: u32,
     pub r: u32,
     pub alpha: u32,
     pub dropout: f32,
@@ -59,6 +73,22 @@ fn default_training_method() -> String {
 
 fn default_unsloth_backend() -> String {
     "cuda".to_string()
+}
+
+fn default_zrald_train_questions() -> u32 {
+    1000
+}
+
+fn default_zrald_benchmark_questions() -> u32 {
+    100
+}
+
+fn default_zrald_num_generations() -> u32 {
+    4
+}
+
+fn default_zrald_max_completion_tokens() -> u32 {
+    768
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -156,6 +186,13 @@ impl LoraConfig {
             custom_method_name: String::new(),
             custom_commands: Vec::new(),
             unsloth_backend: default_unsloth_backend(),
+            zrald_reward_endpoint: String::new(),
+            zrald_reward_model: String::new(),
+            zrald_train_questions: default_zrald_train_questions(),
+            zrald_benchmark_questions: default_zrald_benchmark_questions(),
+            zrald_num_generations: default_zrald_num_generations(),
+            zrald_reward_temperature: 0.0,
+            zrald_max_completion_tokens: default_zrald_max_completion_tokens(),
             r: 16,
             alpha: 32,
             dropout: 0.05,

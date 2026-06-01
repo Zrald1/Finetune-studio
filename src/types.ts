@@ -293,13 +293,21 @@ export interface LoraConfig {
     | "freeze"
     | "dora"
     | "loraplus"
-    | "pissa"
-| "galore"
+      | "pissa"
+      | "galore"
       | "badam"
       | "grpo"
+      | "zrald"
       | "custom";
   customMethodName?: string;
   customCommands?: string[];
+  zraldRewardEndpoint?: string;
+  zraldRewardModel?: string;
+  zraldTrainQuestions?: number;
+  zraldBenchmarkQuestions?: number;
+  zraldNumGenerations?: number;
+  zraldRewardTemperature?: number;
+  zraldMaxCompletionTokens?: number;
   r: number;
   alpha: number;
   dropout: number;
@@ -605,6 +613,13 @@ export const DEFAULT_LORA: LoraConfig = {
   gradientAccumulation: 4,
   cutoffLen: 4096,
   saveSteps: 100,
+  zraldRewardEndpoint: "",
+  zraldRewardModel: "",
+  zraldTrainQuestions: 1000,
+  zraldBenchmarkQuestions: 100,
+  zraldNumGenerations: 4,
+  zraldRewardTemperature: 0,
+  zraldMaxCompletionTokens: 768,
 };
 
 export const DEFAULT_HUB: HubConfig = {
@@ -614,6 +629,9 @@ export const DEFAULT_HUB: HubConfig = {
   strategy: "every_save",
   autoMerge: false,
   mergedModelId: "",
+  autoConvertGguf: false,
+  ggufQuantization: "Q4_K_M",
+  ggufRepoId: "",
 };
 
 export const DEFAULT_HUB_DATASET: HubDatasetConfig = {

@@ -1698,6 +1698,10 @@ else: print('NOT_FOUND')\
             }
 
             port_to_check = port_to_check_inner;
+            run.teacher_cfg.vllm_port = port_to_check;
+            if !served_model_id.trim().is_empty() {
+                run.teacher_cfg.repo_id = served_model_id.clone();
+            }
             teacher_endpoint = format!("http://{}:{}", cfg.ssh.host, port_to_check);
         }
 
@@ -2787,7 +2791,20 @@ else: print('NOT_FOUND')\
         }
 
         // ── 3. Teacher unload — free VRAM for Student ───────────────────────
-        if let Some(session) = session_opt.as_ref() {
+        let zrald_keeps_local_reward_teacher = run
+            .lora
+            .method
+            .trim()
+            .eq_ignore_ascii_case("zrald")
+            && run.lora.zrald_reward_endpoint.trim().is_empty();
+        if zrald_keeps_local_reward_teacher {
+            emit_log(
+                app,
+                &run.id,
+                "[zrald] preserving the local teacher as the reward model; use an external reward endpoint to free this VRAM before training\n",
+                "warn",
+            );
+        } else if let Some(session) = session_opt.as_ref() {
             emit_log(
                 app,
                 &run.id,
@@ -2909,6 +2926,16 @@ else: print('NOT_FOUND')\
                 &info,
             )
             .await?;
+            if let Ok(qa_jsonl) = fs::read_to_string(&local_jsonl_path).await {
+                write_file_auto(
+                    session,
+                    cfg.docker.enabled,
+                    &container_name,
+                    &format!("{}/qa_dataset.jsonl", remote_data),
+                    &qa_jsonl,
+                )
+                .await?;
+            }
         } else {
             emit_log(app, &run.id, "[stage] wrote dataset artifacts locally; remote training files skipped in generate_only mode\n", "stage");
         }
@@ -3078,8 +3105,11 @@ else: print('NOT_FOUND')\
     let method = run.lora.method.trim().to_lowercase();
     let custom_method = method == "custom";
     let grpo_method = method == "grpo";
+    let zrald_method = method == "zrald";
     let mut train_cmd = if custom_method {
         build_custom_train_cmd(run, &run.lora, &hf_export)?
+    } else if zrald_method {
+        build_zrald_train_cmd(run, &run.lora, &hf_export)?
     } else if grpo_method {
         build_grpo_train_cmd(run, &run.lora, &hf_export)?
     } else {
@@ -3536,7 +3566,7 @@ emit_log(app, &run.id, "[stage] training started\n", "stage");
                 ),
                 "stage",
             );
-            upload_adapter(
+            match upload_adapter(
                 &session,
                 cfg.docker.enabled,
                 &container_name,
@@ -3545,8 +3575,19 @@ emit_log(app, &run.id, "[stage] training started\n", "stage");
                 run_cfg.hub.model_id.trim(),
                 run_cfg.hub.private,
             )
-            .await?;
-            adapter_uploaded = true;
+            .await
+            {
+                Ok(()) => adapter_uploaded = true,
+                Err(e) => emit_log(
+                    app,
+                    &run.id,
+                    &format!(
+                        "[warn] adapter upload failed, but training output is saved locally at {}/lora: {}\n",
+                        run.remote_dir, e
+                    ),
+                    "warn",
+                ),
+            }
         } else {
             emit_log(
                 app,
@@ -3590,6 +3631,16 @@ emit_log(app, &run.id, "[stage] training started\n", "stage");
             } else {
                 format!("{}-merged", run_cfg.hub.model_id.trim())
             };
+            let gguf_repo = if !run_cfg.hub.gguf_repo_id.trim().is_empty() {
+                run_cfg.hub.gguf_repo_id.trim().to_string()
+            } else {
+                format!("{}-gguf", run_cfg.hub.model_id.trim())
+            };
+            let gguf_quantization = if run_cfg.hub.gguf_quantization.trim().is_empty() {
+                "Q4_K_M".to_string()
+            } else {
+                run_cfg.hub.gguf_quantization.trim().to_string()
+            };
             emit_log(
                 app,
                 &run.id,
@@ -3621,7 +3672,51 @@ emit_log(app, &run.id, "[stage] training started\n", "stage");
                         &run.id,
                         &format!("[done] merged model uploaded → {}\n", url),
                         "stage",
-                    )
+                    );
+                    if run_cfg.hub.auto_convert_gguf {
+                        emit_log(
+                            app,
+                            &run.id,
+                            &format!(
+                                "[stage] auto-gguf: converting merged model to {} and uploading to {}\n",
+                                gguf_quantization, gguf_repo
+                            ),
+                            "stage",
+                        );
+                        match convert_and_upload_gguf(
+                            &session,
+                            cfg.docker.enabled,
+                            &container_name,
+                            run,
+                            token,
+                            &gguf_repo,
+                            &gguf_quantization,
+                            run_cfg.hub.private,
+                            app,
+                        )
+                        .await
+                        {
+                            Ok(url) => {
+                                run.hub.gguf_repo_id = gguf_repo.clone();
+                                run.hub.gguf_quantization = gguf_quantization.clone();
+                                emit_log(
+                                    app,
+                                    &run.id,
+                                    &format!("[done] GGUF uploaded → {}\n", url),
+                                    "stage",
+                                );
+                            }
+                            Err(e) => emit_log(
+                                app,
+                                &run.id,
+                                &format!(
+                                    "[warn] auto-GGUF failed (merged model is still uploaded): {}\n",
+                                    e
+                                ),
+                                "warn",
+                            ),
+                        }
+                    }
                 }
                 Err(e) => emit_log(
                     app,
@@ -3668,21 +3763,52 @@ export HUGGING_FACE_HUB_TOKEN={token}
 python3 - <<'PY'
 import json
 import os
+import shutil
 from pathlib import Path
 from huggingface_hub import HfApi, create_repo
 
 base_model = {base_model}
 adapter_path = Path({adapter_path})
+stage_path = adapter_path.parent / "adapter_hub_upload"
 repo_id = {repo}
 private = {private}
 token = os.environ.get("HF_TOKEN")
 
 adapter_config_path = adapter_path / "adapter_config.json"
-if adapter_config_path.exists():
-    data = json.loads(adapter_config_path.read_text())
-    if not data.get("base_model_name_or_path"):
-        data["base_model_name_or_path"] = base_model
-    adapter_config_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+if not adapter_path.exists():
+    raise SystemExit(f"adapter directory not found: {{adapter_path}}")
+if not adapter_config_path.exists():
+    raise SystemExit(f"adapter_config.json not found in {{adapter_path}}")
+if not ((adapter_path / "adapter_model.safetensors").exists() or (adapter_path / "adapter_model.bin").exists()):
+    raise SystemExit(f"adapter weights not found in {{adapter_path}}")
+
+if stage_path.exists():
+    shutil.rmtree(stage_path)
+stage_path.mkdir(parents=True, exist_ok=True)
+
+skip_files = {{
+    "README.md",
+    "adapter_config.json",
+    "all_results.json",
+    "eval_results.json",
+    "optimizer.pt",
+    "rng_state.pth",
+    "scaler.pt",
+    "scheduler.pt",
+    "trainer_state.json",
+    "training_args.bin",
+    "train_results.json",
+}}
+skip_suffixes = (".pt", ".pth")
+
+for item in adapter_path.iterdir():
+    if item.is_file() and item.name not in skip_files and not item.name.endswith(skip_suffixes):
+        shutil.copy2(item, stage_path / item.name)
+
+data = json.loads(adapter_config_path.read_text())
+if not data.get("base_model_name_or_path"):
+    data["base_model_name_or_path"] = base_model
+(stage_path / "adapter_config.json").write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
 
 readme = adapter_path / "README.md"
 body = ""
@@ -3701,14 +3827,28 @@ tags:
 - adapter
 ---
 """
-readme.write_text(metadata + "\n" + body)
+(stage_path / "README.md").write_text(metadata + "\n" + body)
+
+staged_files = [p for p in stage_path.rglob("*") if p.is_file()]
+staged_bytes = sum(p.stat().st_size for p in staged_files)
+print(f"[hub] staging {{len(staged_files)}} adapter file(s), {{staged_bytes / 1024 / 1024:.1f}} MiB; checkpoints excluded", flush=True)
 
 create_repo(repo_id=repo_id, repo_type="model", private=private, token=token, exist_ok=True)
 HfApi(token=token).upload_folder(
     repo_id=repo_id,
     repo_type="model",
-    folder_path=str(adapter_path),
+    folder_path=str(stage_path),
     commit_message="Upload LoRA adapter",
+    ignore_patterns=[
+        "checkpoint-*",
+        "checkpoint-*/*",
+        "**/optimizer.pt",
+        "**/rng_state.pth",
+        "**/scaler.pt",
+        "**/scheduler.pt",
+        "**/trainer_state.json",
+        "**/training_args.bin",
+    ],
 )
 print(f"https://huggingface.co/{{repo_id}}")
 PY"#,
@@ -3729,10 +3869,28 @@ PY"#,
     };
     let result = session.exec_blocking(&cmd).await?;
     if result.exit_code != 0 {
-        return Err(AppError::pipeline(format!(
-            "adapter upload failed: {}{}",
+        let combined = format!(
+            "{}{}",
             result.stderr.replace(hf_token, "***"),
             result.stdout.replace(hf_token, "***")
+        )
+        .replace('\r', "\n");
+        let mut lines = combined
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .rev()
+            .take(40)
+            .collect::<Vec<_>>();
+        lines.reverse();
+        let output = if lines.is_empty() {
+            "(no upload output captured)".to_string()
+        } else {
+            lines.join("\n")
+        };
+        return Err(AppError::pipeline(format!(
+            "adapter upload failed with exit code {}:\n{}",
+            result.exit_code, output
         )));
     }
     Ok(())
@@ -3893,28 +4051,118 @@ cd {run_dir}
 export HF_TOKEN={token}
 export HUGGING_FACE_HUB_TOKEN={token}
 python3 - <<'PY'
-import json
 import os
-import urllib.request
+import shutil
+import subprocess
+import sys
+from pathlib import Path
 
-merged_dir = {merged_dir}
-gguf_dir = {gguf_dir}
+merged_dir = Path({merged_dir})
+gguf_dir = Path({gguf_dir})
 gguf_repo = {gguf_repo}
-quantization = {quantization}
+quantization = ({quantization} or "Q4_K_M").strip()
 private = {private}
 token = os.environ.get("HF_TOKEN")
 
-os.makedirs(gguf_dir, exist_ok=True)
+def run(cmd, cwd=None):
+    cmd = [str(part) for part in cmd]
+    print("[gguf] $ " + " ".join(cmd), flush=True)
+    subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=True)
 
-print("[gguf] downloading llama.cpp conversion script", flush=True)
-script_path = gguf_dir + "/convert_hf_to_gguf.py"
-urllib.request.urlretrieve(
-    "https://raw.githubusercontent.com/ggml-org/llama.cpp/master/convert_hf_to_gguf.py",
-    script_path
-)
+if not merged_dir.is_dir():
+    raise SystemExit("merged model directory not found: " + str(merged_dir))
 
-print("[gguf] converting " + merged_dir + " to GGUF (type=" + quantization + ")", flush=True)
-os.system("python3 " + script_path + " " + merged_dir + " --outfile " + gguf_dir + "/model.gguf --outtype " + quantization)
+gguf_dir.mkdir(parents=True, exist_ok=True)
+llama_dir = gguf_dir / "llama.cpp"
+build_dir = llama_dir / "build"
+raw_gguf = gguf_dir / "model-f16.gguf"
+final_gguf = gguf_dir / "model.gguf"
+
+if not llama_dir.exists():
+    print("[gguf] cloning llama.cpp", flush=True)
+    run(["git", "clone", "--depth", "1", "https://github.com/ggml-org/llama.cpp.git", llama_dir])
+else:
+    print("[gguf] updating llama.cpp", flush=True)
+    try:
+        run(["git", "-C", llama_dir, "pull", "--ff-only"])
+    except subprocess.CalledProcessError:
+        print("[gguf] warning: llama.cpp update failed; using existing checkout", flush=True)
+
+req_candidates = [
+    llama_dir / "requirements" / "requirements-convert_hf_to_gguf.txt",
+    llama_dir / "requirements.txt",
+]
+for req in req_candidates:
+    if req.exists():
+        run([sys.executable, "-m", "pip", "install", "-r", req])
+        break
+
+converter = llama_dir / "convert_hf_to_gguf.py"
+if not converter.exists():
+    raise SystemExit("convert_hf_to_gguf.py not found in " + str(llama_dir))
+
+quant_key = quantization.lower()
+converter_outtypes = {{"f16": "f16", "bf16": "bf16", "q8": "q8_0", "q8_0": "q8_0"}}
+if quant_key in converter_outtypes:
+    out_gguf = final_gguf
+    convert_outtype = converter_outtypes[quant_key]
+else:
+    out_gguf = raw_gguf
+    convert_outtype = "f16"
+
+if out_gguf.exists():
+    out_gguf.unlink()
+if final_gguf.exists() and final_gguf != out_gguf:
+    final_gguf.unlink()
+
+print("[gguf] converting " + str(merged_dir) + " to " + convert_outtype, flush=True)
+run([sys.executable, converter, merged_dir, "--outfile", out_gguf, "--outtype", convert_outtype])
+
+if out_gguf != final_gguf:
+    quantize = None
+    for candidate in [
+        build_dir / "bin" / "llama-quantize",
+        build_dir / "bin" / "quantize",
+        llama_dir / "llama-quantize",
+        llama_dir / "quantize",
+    ]:
+        if candidate.exists():
+            quantize = candidate
+            break
+    if quantize is None:
+        print("[gguf] building llama-quantize for " + quantization, flush=True)
+        if shutil.which("cmake") is None:
+            raise SystemExit("cmake is required to build llama-quantize for " + quantization)
+        run(["cmake", "-S", llama_dir, "-B", build_dir, "-DLLAMA_CURL=OFF"])
+        run([
+            "cmake",
+            "--build",
+            build_dir,
+            "--config",
+            "Release",
+            "-j",
+            str(os.cpu_count() or 2),
+            "--target",
+            "llama-quantize",
+        ])
+        for candidate in [
+            build_dir / "bin" / "llama-quantize",
+            build_dir / "bin" / "quantize",
+            llama_dir / "llama-quantize",
+            llama_dir / "quantize",
+        ]:
+            if candidate.exists():
+                quantize = candidate
+                break
+    if quantize is None:
+        raise SystemExit("llama-quantize was not produced by the llama.cpp build")
+    if final_gguf.exists():
+        final_gguf.unlink()
+    print("[gguf] quantizing to " + quantization.upper(), flush=True)
+    run([quantize, out_gguf, final_gguf, quantization.upper()])
+
+if not final_gguf.exists() or final_gguf.stat().st_size == 0:
+    raise SystemExit("GGUF file was not created: " + str(final_gguf))
 
 print("[gguf] uploading to " + gguf_repo, flush=True)
 from huggingface_hub import HfApi, create_repo
@@ -3924,7 +4172,7 @@ api.upload_file(
     repo_id=gguf_repo,
     repo_type="model",
     path_in_repo="model.gguf",
-    folder_path=gguf_dir + "/model.gguf",
+    path_or_fileobj=str(final_gguf),
     commit_message="Upload GGUF model for Ollama/llama.cpp",
 )
 print("https://huggingface.co/" + gguf_repo)
@@ -4511,6 +4759,494 @@ fn build_custom_train_cmd(run: &Run, lora: &LoraConfig, hf_export: &str) -> Resu
         alpha = sh_quote(&lora.alpha.to_string()),
         dropout = sh_quote(&lora.dropout.to_string()),
         body = body,
+    ))
+}
+
+fn build_zrald_train_cmd(run: &Run, lora: &LoraConfig, hf_export: &str) -> Result<String> {
+    let base_model = llamafactory::resolve_trainable_repo(&run.student_model);
+    let lower = base_model.to_lowercase();
+    let load_in_4bit = !(lower.contains("gpt-oss") || lower.contains("gpt_oss"));
+    let data_dir = format!("{}/data", run.remote_dir);
+    let output_dir = format!("{}/lora", run.remote_dir);
+    let script_path = format!("{}/zrald_train.py", run.remote_dir);
+    let reward_endpoint = if lora.zrald_reward_endpoint.trim().is_empty() {
+        format!("http://127.0.0.1:{}", run.teacher_cfg.vllm_port)
+    } else {
+        lora.zrald_reward_endpoint.trim().to_string()
+    };
+    let reward_model = if lora.zrald_reward_model.trim().is_empty() {
+        run.teacher_cfg.repo_id.clone()
+    } else {
+        lora.zrald_reward_model.trim().to_string()
+    };
+    let train_questions = lora.zrald_train_questions.max(1);
+    let benchmark_questions = lora.zrald_benchmark_questions.min(train_questions).max(1);
+    let num_generations = lora.zrald_num_generations.clamp(2, 8);
+    let max_completion_tokens = lora.zrald_max_completion_tokens.clamp(64, lora.cutoff_len.max(64));
+
+    let mut py = r#"import hashlib
+import inspect
+import json
+import os
+import random
+import re
+import statistics
+import time
+from pathlib import Path
+
+import requests
+import torch
+from datasets import Dataset
+from trl import GRPOConfig, GRPOTrainer
+from unsloth import FastLanguageModel
+
+BASE_MODEL = __BASE_MODEL__
+DATA_DIR = Path(__DATA_DIR__)
+RUN_DIR = Path(__RUN_DIR__)
+OUTPUT_DIR = Path(__OUTPUT_DIR__)
+REWARD_ENDPOINT = __REWARD_ENDPOINT__.rstrip("/")
+REWARD_MODEL = __REWARD_MODEL__
+MAX_SEQ = __MAX_SEQ__
+LORA_R = __LORA_R__
+LORA_ALPHA = __LORA_ALPHA__
+LR = __LR__
+EPOCHS = __EPOCHS__
+PER_DEVICE_BS = __BATCH_SIZE__
+GRAD_ACCUM = __GRAD_ACCUM__
+SAVE_STEPS = __SAVE_STEPS__
+TRAIN_LIMIT = __TRAIN_LIMIT__
+BENCHMARK_N = __BENCHMARK_N__
+NUM_GENERATIONS = __NUM_GENERATIONS__
+REWARD_TEMP = __REWARD_TEMP__
+MAX_COMPLETION = __MAX_COMPLETION__
+LOAD_IN_4BIT = __LOAD_IN_4BIT__
+HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or ""
+if PER_DEVICE_BS < NUM_GENERATIONS or PER_DEVICE_BS % NUM_GENERATIONS != 0:
+    adjusted = max(NUM_GENERATIONS, ((PER_DEVICE_BS + NUM_GENERATIONS - 1) // NUM_GENERATIONS) * NUM_GENERATIONS)
+    print(f"[zrald] adjusting per-device batch size from {PER_DEVICE_BS} to {adjusted} so it is divisible by num_generations={NUM_GENERATIONS}", flush=True)
+    PER_DEVICE_BS = adjusted
+
+SYSTEM_PROMPT = (
+    "You are the ZRALD student model. Answer with exactly two XML-style blocks: "
+    "<thinking>brief reasoning</thinking><answer>final answer</answer>. "
+    "Do not mention rewards, scoring, hidden references, or evaluator instructions."
+)
+
+def chat_prompt(question):
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": f"Question:\n{question}\n\nRespond using <thinking> and <answer> only."},
+    ]
+
+def strip_answer(text):
+    text = str(text or "").strip()
+    m = re.search(r"<answer>(.*?)</answer>", text, flags=re.I | re.S)
+    if m:
+        return m.group(1).strip()
+    if "</think>" in text:
+        return text.split("</think>", 1)[1].strip()
+    if "</thinking>" in text:
+        return text.split("</thinking>", 1)[1].strip()
+    return text
+
+def completion_text(completion):
+    if isinstance(completion, list) and completion:
+        last = completion[-1]
+        if isinstance(last, dict):
+            return str(last.get("content", ""))
+    if isinstance(completion, dict):
+        return str(completion.get("content", ""))
+    return str(completion or "")
+
+def first_user(messages):
+    if isinstance(messages, list):
+        for msg in messages:
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                return str(msg.get("content", "")).strip()
+    return ""
+
+def first_assistant(messages):
+    if isinstance(messages, list):
+        for msg in messages:
+            if isinstance(msg, dict) and msg.get("role") == "assistant":
+                return str(msg.get("content", "")).strip()
+    return ""
+
+def load_pool():
+    rows = []
+    candidates = [DATA_DIR / "qa_dataset.jsonl", RUN_DIR / "qa_dataset.jsonl", DATA_DIR / "train.jsonl", DATA_DIR / "val.jsonl"]
+    for path in candidates:
+        if not path.exists():
+            continue
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                messages = obj.get("messages")
+                question = str(obj.get("question") or first_user(messages) or obj.get("instruction") or obj.get("prompt") or "").strip()
+                reference = str(obj.get("answer") or strip_answer(first_assistant(messages)) or obj.get("output") or "").strip()
+                if not question or not reference:
+                    continue
+                rag_context = str(obj.get("source_text") or obj.get("context") or obj.get("input") or "").strip()
+                source = str(obj.get("source_chunk_id") or obj.get("source_file") or path.name)
+                rubric = (
+                    "Score from -1.0 to 1.0. 1.0 means the final answer is precise, complete, and supported. "
+                    "0.0 means partially useful but needs correction. -1.0 means incorrect, contradictory, hallucinated, or empty. "
+                    "Correctness and RAG faithfulness dominate style."
+                )
+                rows.append({
+                    "prompt": chat_prompt(question),
+                    "question": question,
+                    "reference_answer": reference,
+                    "rag_context": rag_context,
+                    "rubric": rubric,
+                    "source": source,
+                })
+        if rows:
+            break
+    dedup = {}
+    for row in rows:
+        key = hashlib.sha256((row["question"] + "\n" + row["reference_answer"]).encode("utf-8")).hexdigest()
+        dedup.setdefault(key, row)
+    rows = list(dedup.values())
+    random.Random(3407).shuffle(rows)
+    if not rows:
+        raise SystemExit("[zrald] no usable RAG question rows found in qa_dataset/train/val JSONL")
+    return rows
+
+def dump_jsonl(path, rows):
+    with Path(path).open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+def reward_url():
+    if REWARD_ENDPOINT.endswith("/v1"):
+        return REWARD_ENDPOINT + "/chat/completions"
+    return REWARD_ENDPOINT + "/v1/chat/completions"
+
+reward_cache = {}
+reward_log = RUN_DIR / "zrald_rewards_train.jsonl"
+
+def clamp_score(value):
+    try:
+        return max(-1.0, min(1.0, float(value)))
+    except Exception:
+        return -0.25
+
+def parse_jsonish(text):
+    text = str(text or "").strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    m = re.search(r"\{.*\}", text, flags=re.S)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            return {}
+    return {}
+
+def heuristic_adjustment(completion):
+    text = completion.strip()
+    penalty = 0.0
+    if not text:
+        return -1.0
+    if not re.search(r"<thinking>.*?</thinking>", text, flags=re.I | re.S):
+        penalty -= 0.15
+    if not re.search(r"<answer>.*?</answer>", text, flags=re.I | re.S):
+        penalty -= 0.20
+    if len(strip_answer(text)) < 8:
+        penalty -= 0.25
+    return penalty
+
+def judge_score(question, reference_answer, rag_context, rubric, completion, phase="train"):
+    key = hashlib.sha256(json.dumps([question, reference_answer, rag_context, completion], ensure_ascii=False).encode("utf-8")).hexdigest()
+    if key in reward_cache:
+        return reward_cache[key]
+    prompt = {
+        "question": question,
+        "rag_context": rag_context,
+        "reference_answer": reference_answer,
+        "student_completion": completion,
+        "rubric": rubric,
+        "required_output": {"score": "number from -1.0 to 1.0", "verdict": "short label", "reason": "short private note"},
+    }
+    headers = {"Content-Type": "application/json"}
+    if HF_TOKEN:
+        headers["Authorization"] = f"Bearer {HF_TOKEN}"
+    body = {
+        "model": REWARD_MODEL,
+        "temperature": REWARD_TEMP,
+        "max_tokens": 256,
+        "messages": [
+            {"role": "system", "content": "You are the ZRALD reward teacher. Return strict JSON only. Grade factual correctness against the reference and RAG context. Never reward unsupported claims."},
+            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+        ],
+    }
+    score = -0.25
+    verdict = "judge_error"
+    reason = ""
+    for attempt in range(2):
+        try:
+            res = requests.post(reward_url(), headers=headers, json=body, timeout=120)
+            if res.status_code >= 400:
+                reason = f"http {res.status_code}: {res.text[:400]}"
+                time.sleep(1.0)
+                continue
+            payload = res.json()
+            content = payload["choices"][0]["message"]["content"]
+            judged = parse_jsonish(content)
+            score = clamp_score(judged.get("score", -0.25))
+            verdict = str(judged.get("verdict", "scored"))
+            reason = str(judged.get("reason", ""))[:500]
+            break
+        except Exception as exc:
+            reason = repr(exc)
+            time.sleep(1.0)
+    score = clamp_score(score + heuristic_adjustment(completion))
+    reward_cache[key] = score
+    with reward_log.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "phase": phase,
+            "question": question,
+            "score": score,
+            "verdict": verdict,
+            "reason": reason,
+            "completion": completion,
+        }, ensure_ascii=False) + "\n")
+    return score
+
+def pick(values, idx, default=""):
+    if isinstance(values, list) and values:
+        return values[idx % len(values)]
+    return default
+
+def zrald_reward(completions, **kwargs):
+    scores = []
+    for i, completion in enumerate(completions):
+        q = pick(kwargs.get("question"), i)
+        ref = pick(kwargs.get("reference_answer"), i)
+        rag = pick(kwargs.get("rag_context"), i)
+        rubric = pick(kwargs.get("rubric"), i)
+        scores.append(judge_score(q, ref, rag, rubric, completion_text(completion), "train"))
+    return scores
+
+def prompt_to_text(messages, tokenizer):
+    if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
+        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    return "\n".join(f"{m.get('role', 'user').upper()}: {m.get('content', '')}" for m in messages) + "\nASSISTANT:"
+
+def generate_one(model, tokenizer, row):
+    model.eval()
+    prompt = prompt_to_text(row["prompt"], tokenizer)
+    encoded = tokenizer(prompt, return_tensors="pt")
+    device = next(model.parameters()).device
+    encoded = {k: v.to(device) for k, v in encoded.items()}
+    with torch.no_grad():
+        out = model.generate(
+            **encoded,
+            max_new_tokens=MAX_COMPLETION,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+    new_tokens = out[0][encoded["input_ids"].shape[-1]:]
+    return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+
+def summarize(scores):
+    if not scores:
+        return {"count": 0, "mean": 0.0, "median": 0.0, "passRate": 0.0, "failRate": 0.0}
+    return {
+        "count": len(scores),
+        "mean": statistics.fmean(scores),
+        "median": statistics.median(scores),
+        "passRate": sum(1 for s in scores if s >= 0.8) / len(scores),
+        "failRate": sum(1 for s in scores if s < 0.0) / len(scores),
+    }
+
+def run_benchmark(model, tokenizer, rows, phase):
+    path = RUN_DIR / f"zrald_benchmark_{phase}.jsonl"
+    scores = []
+    with path.open("w", encoding="utf-8") as f:
+        for idx, row in enumerate(rows, 1):
+            completion = generate_one(model, tokenizer, row)
+            score = judge_score(row["question"], row["reference_answer"], row["rag_context"], row["rubric"], completion, f"benchmark_{phase}")
+            scores.append(score)
+            f.write(json.dumps({
+                "idx": idx,
+                "question": row["question"],
+                "score": score,
+                "completion": completion,
+                "reference_answer": row["reference_answer"],
+                "source": row.get("source", ""),
+            }, ensure_ascii=False) + "\n")
+            if idx % 10 == 0 or idx == len(rows):
+                print(f"[zrald] benchmark {phase}: {idx}/{len(rows)} mean={statistics.fmean(scores):.3f}", flush=True)
+    return scores
+
+rows = load_pool()
+train_rows = rows[:min(TRAIN_LIMIT, len(rows))]
+benchmark_rows = rows[:min(BENCHMARK_N, len(rows))]
+dump_jsonl(RUN_DIR / "zrald_train_prompts.jsonl", train_rows)
+dump_jsonl(RUN_DIR / "zrald_benchmark_prompts.jsonl", benchmark_rows)
+print(f"[zrald] question pool: train={len(train_rows)} benchmark={len(benchmark_rows)} reward_model={REWARD_MODEL} endpoint={REWARD_ENDPOINT}", flush=True)
+print(f"[zrald] loading student: {BASE_MODEL} (4bit={LOAD_IN_4BIT})", flush=True)
+
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name=BASE_MODEL,
+    max_seq_length=MAX_SEQ,
+    load_in_4bit=LOAD_IN_4BIT,
+)
+if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+model = FastLanguageModel.get_peft_model(
+    model,
+    r=LORA_R,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    lora_alpha=LORA_ALPHA,
+    use_gradient_checkpointing="unsloth",
+    random_state=3407,
+)
+
+before_scores = run_benchmark(model, tokenizer, benchmark_rows, "before")
+model.train()
+dataset = Dataset.from_list(train_rows)
+
+grpo_kwargs = {
+    "temperature": 0.9,
+    "learning_rate": LR,
+    "weight_decay": 0.001,
+    "warmup_ratio": 0.1,
+    "lr_scheduler_type": "linear",
+    "optim": "adamw_torch",
+    "logging_steps": 1,
+    "per_device_train_batch_size": PER_DEVICE_BS,
+    "gradient_accumulation_steps": GRAD_ACCUM,
+    "num_train_epochs": EPOCHS,
+    "max_grad_norm": 0.3,
+    "output_dir": str(OUTPUT_DIR),
+    "save_steps": SAVE_STEPS,
+    "report_to": "none",
+    "num_generations": NUM_GENERATIONS,
+    "max_completion_length": MAX_COMPLETION,
+    "max_prompt_length": max(128, MAX_SEQ - MAX_COMPLETION),
+}
+accepted_args = inspect.signature(GRPOConfig).parameters
+args = GRPOConfig(**{k: v for k, v in grpo_kwargs.items() if k in accepted_args})
+
+trainer_kwargs = {
+    "model": model,
+    "reward_funcs": [zrald_reward],
+    "args": args,
+    "train_dataset": dataset,
+}
+trainer_sig = inspect.signature(GRPOTrainer.__init__).parameters
+if "processing_class" in trainer_sig:
+    trainer_kwargs["processing_class"] = tokenizer
+elif "tokenizer" in trainer_sig:
+    trainer_kwargs["tokenizer"] = tokenizer
+
+print(f"[zrald] starting GRPO: generations={NUM_GENERATIONS} train_prompts={len(train_rows)}", flush=True)
+trainer = GRPOTrainer(**trainer_kwargs)
+trainer.train()
+model.save_pretrained(str(OUTPUT_DIR))
+tokenizer.save_pretrained(str(OUTPUT_DIR))
+print("[zrald] training complete; running after benchmark", flush=True)
+
+after_scores = run_benchmark(model, tokenizer, benchmark_rows, "after")
+report = {
+    "method": "ZRALD",
+    "meaning": "Zero-shot Retrieval-Augmented Learning with Dynamic rewards",
+    "rewardModel": REWARD_MODEL,
+    "rewardEndpoint": REWARD_ENDPOINT,
+    "numGenerations": NUM_GENERATIONS,
+    "trainQuestions": len(train_rows),
+    "benchmarkQuestions": len(benchmark_rows),
+    "before": summarize(before_scores),
+    "after": summarize(after_scores),
+}
+report["deltaMean"] = report["after"]["mean"] - report["before"]["mean"]
+paired = [a - b for a, b in zip(after_scores, before_scores)]
+report["paired"] = {
+    "meanDelta": statistics.fmean(paired) if paired else 0.0,
+    "wins": sum(1 for d in paired if d > 0.05),
+    "losses": sum(1 for d in paired if d < -0.05),
+    "ties": sum(1 for d in paired if -0.05 <= d <= 0.05),
+}
+(RUN_DIR / "zrald_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+print("[zrald] report", json.dumps(report, ensure_ascii=False), flush=True)
+print("[zrald] LoRA saved to", OUTPUT_DIR, flush=True)
+"#.to_string();
+
+    let replacements = [
+        ("__BASE_MODEL__", serde_json::to_string(&base_model).unwrap_or_else(|_| "\"\"".to_string())),
+        ("__DATA_DIR__", serde_json::to_string(&data_dir).unwrap_or_else(|_| "\"\"".to_string())),
+        ("__RUN_DIR__", serde_json::to_string(&run.remote_dir).unwrap_or_else(|_| "\"\"".to_string())),
+        ("__OUTPUT_DIR__", serde_json::to_string(&output_dir).unwrap_or_else(|_| "\"\"".to_string())),
+        ("__REWARD_ENDPOINT__", serde_json::to_string(&reward_endpoint).unwrap_or_else(|_| "\"\"".to_string())),
+        ("__REWARD_MODEL__", serde_json::to_string(&reward_model).unwrap_or_else(|_| "\"\"".to_string())),
+        ("__MAX_SEQ__", lora.cutoff_len.to_string()),
+        ("__LORA_R__", lora.r.to_string()),
+        ("__LORA_ALPHA__", lora.alpha.to_string()),
+        ("__LR__", lora.learning_rate.to_string()),
+        ("__EPOCHS__", lora.epochs.to_string()),
+        ("__BATCH_SIZE__", lora.batch_size.max(1).to_string()),
+        ("__GRAD_ACCUM__", lora.gradient_accumulation.max(1).to_string()),
+        ("__SAVE_STEPS__", lora.save_steps.max(1).to_string()),
+        ("__TRAIN_LIMIT__", train_questions.to_string()),
+        ("__BENCHMARK_N__", benchmark_questions.to_string()),
+        ("__NUM_GENERATIONS__", num_generations.to_string()),
+        ("__REWARD_TEMP__", lora.zrald_reward_temperature.to_string()),
+        ("__MAX_COMPLETION__", max_completion_tokens.to_string()),
+        ("__LOAD_IN_4BIT__", if load_in_4bit { "True".to_string() } else { "False".to_string() }),
+    ];
+    for (needle, value) in replacements {
+        py = py.replace(needle, &value);
+    }
+
+    let heredoc = format!(
+        "cat > {script} <<'PYEOF'\n{py}\nPYEOF",
+        script = sh_quote(&script_path),
+        py = py
+    );
+    let bnb_amd_wheel = "https://github.com/bitsandbytes-foundation/bitsandbytes/releases/download/continuous-release_main/bitsandbytes-1.33.7.preview-py3-none-manylinux_2_24_x86_64.whl";
+    let zrald_probe = "python3 -c 'import requests, datasets, unsloth; from trl import GRPOConfig, GRPOTrainer' >/dev/null 2>&1";
+    let torch_hip_probe = "python3 -c 'import torch,sys; sys.exit(0 if getattr(torch.version,\"hip\",None) else 1)' >/dev/null 2>&1";
+
+    Ok(format!(
+        "set -o pipefail; \
+         {hf_export} cd {dir} && \
+         export UNSLOTH_IS_ROCM=1 PYTORCH_ROCM_ARCH=${{PYTORCH_ROCM_ARCH:-gfx1100}} && \
+         ({torch_probe} || pip install --no-cache-dir --upgrade --force-reinstall \
+             --index-url https://download.pytorch.org/whl/rocm7.0 \
+             'torch>=2.4,<2.11.0' 'torchvision<0.26.0' 'torchaudio<2.11.0') && \
+         ({probe} || \
+             (pip install --no-cache-dir 'unsloth[amd]' 'unsloth_zoo' 'trl>=0.19.0' \
+                 'datasets>=2.16.0' 'requests>=2.31.0' 'peft>=0.19,<0.20' \
+                 'accelerate>=0.34.0' 'sentencepiece>=0.2.0' 'protobuf' 'hf_transfer' 'psutil' && \
+              (pip install --force-reinstall --no-cache-dir --no-deps '{bnb_wheel}' || \
+               pip install --force-reinstall --no-cache-dir --no-deps 'bitsandbytes>=0.49.1'))) && \
+         mkdir -p {output_dir} && \
+         : > {dir}/log.txt && : > {dir}/errorlog.txt && : > {dir}/train.log && \
+         {heredoc} && \
+         {{ echo {start_msg} && python3 {script}; }} \
+           > >(tee -a {dir}/log.txt {dir}/train.log) \
+           2> >(tee -a {dir}/errorlog.txt {dir}/train.log >&2)",
+        hf_export = hf_export,
+        dir = sh_quote(&run.remote_dir),
+        torch_probe = torch_hip_probe,
+        probe = zrald_probe,
+        bnb_wheel = bnb_amd_wheel,
+        output_dir = sh_quote(&output_dir),
+        heredoc = heredoc,
+        start_msg = sh_quote("[zrald] starting ZRALD RAG reward GRPO trainer"),
+        script = sh_quote(&script_path),
     ))
 }
 

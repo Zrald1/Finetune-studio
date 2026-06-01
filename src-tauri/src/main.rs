@@ -2478,9 +2478,11 @@ cd {run_dir}
 export HF_TOKEN={token}
 export HUGGING_FACE_HUB_TOKEN={token}
 python3 - <<'PY'
-import json
 import os
-import urllib.request
+import shutil
+import subprocess
+import sys
+from pathlib import Path
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 from peft import PeftModel
@@ -2488,13 +2490,18 @@ from huggingface_hub import HfApi, create_repo
 
 base_model = {base_model}
 adapter_path = {adapter_path}
-merged_dir = {merged_dir}
-gguf_dir = {gguf_dir}
+merged_dir = Path({merged_dir})
+gguf_dir = Path({gguf_dir})
 merged_repo = {merged_repo}
 gguf_repo = {gguf_repo}
-quantization = {quantization}
+quantization = ({quantization} or "Q4_K_M").strip()
 private = {private}
 token = os.environ.get("HF_TOKEN")
+
+def run(cmd, cwd=None):
+    cmd = [str(part) for part in cmd]
+    print("[gguf] $ " + " ".join(cmd), flush=True)
+    subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=True)
 
 os.makedirs(merged_dir, exist_ok=True)
 os.makedirs(gguf_dir, exist_ok=True)
@@ -2533,19 +2540,106 @@ except Exception:
 print("[merge] uploading to " + merged_repo, flush=True)
 create_repo(repo_id=merged_repo, repo_type="model", private=private, token=token, exist_ok=True)
 api = HfApi(token=token)
-api.upload_folder(repo_id=merged_repo, repo_type="model", folder_path=merged_dir, commit_message="Upload merged model")
+api.upload_folder(repo_id=merged_repo, repo_type="model", folder_path=str(merged_dir), commit_message="Upload merged model")
 print("[merge] done: https://huggingface.co/" + merged_repo)
 
-print("[gguf] downloading llama.cpp script", flush=True)
-script_path = gguf_dir + "/convert_hf_to_gguf.py"
-urllib.request.urlretrieve("https://raw.githubusercontent.com/ggml-org/llama.cpp/master/convert_hf_to_gguf.py", script_path)
+if not merged_dir.is_dir():
+    raise SystemExit("merged model directory not found: " + str(merged_dir))
 
-print("[gguf] converting to " + quantization, flush=True)
-os.system("python3 " + script_path + " " + merged_dir + " --outfile " + gguf_dir + "/model.gguf --outtype " + quantization)
+llama_dir = gguf_dir / "llama.cpp"
+build_dir = llama_dir / "build"
+raw_gguf = gguf_dir / "model-f16.gguf"
+final_gguf = gguf_dir / "model.gguf"
+
+if not llama_dir.exists():
+    print("[gguf] cloning llama.cpp", flush=True)
+    run(["git", "clone", "--depth", "1", "https://github.com/ggml-org/llama.cpp.git", llama_dir])
+else:
+    print("[gguf] updating llama.cpp", flush=True)
+    try:
+        run(["git", "-C", llama_dir, "pull", "--ff-only"])
+    except subprocess.CalledProcessError:
+        print("[gguf] warning: llama.cpp update failed; using existing checkout", flush=True)
+
+req_candidates = [
+    llama_dir / "requirements" / "requirements-convert_hf_to_gguf.txt",
+    llama_dir / "requirements.txt",
+]
+for req in req_candidates:
+    if req.exists():
+        run([sys.executable, "-m", "pip", "install", "-r", req])
+        break
+
+converter = llama_dir / "convert_hf_to_gguf.py"
+if not converter.exists():
+    raise SystemExit("convert_hf_to_gguf.py not found in " + str(llama_dir))
+
+quant_key = quantization.lower()
+converter_outtypes = {{"f16": "f16", "bf16": "bf16", "q8": "q8_0", "q8_0": "q8_0"}}
+if quant_key in converter_outtypes:
+    out_gguf = final_gguf
+    convert_outtype = converter_outtypes[quant_key]
+else:
+    out_gguf = raw_gguf
+    convert_outtype = "f16"
+
+if out_gguf.exists():
+    out_gguf.unlink()
+if final_gguf.exists() and final_gguf != out_gguf:
+    final_gguf.unlink()
+
+print("[gguf] converting " + str(merged_dir) + " to " + convert_outtype, flush=True)
+run([sys.executable, converter, merged_dir, "--outfile", out_gguf, "--outtype", convert_outtype])
+
+if out_gguf != final_gguf:
+    quantize = None
+    for candidate in [
+        build_dir / "bin" / "llama-quantize",
+        build_dir / "bin" / "quantize",
+        llama_dir / "llama-quantize",
+        llama_dir / "quantize",
+    ]:
+        if candidate.exists():
+            quantize = candidate
+            break
+    if quantize is None:
+        print("[gguf] building llama-quantize for " + quantization, flush=True)
+        if shutil.which("cmake") is None:
+            raise SystemExit("cmake is required to build llama-quantize for " + quantization)
+        run(["cmake", "-S", llama_dir, "-B", build_dir, "-DLLAMA_CURL=OFF"])
+        run([
+            "cmake",
+            "--build",
+            build_dir,
+            "--config",
+            "Release",
+            "-j",
+            str(os.cpu_count() or 2),
+            "--target",
+            "llama-quantize",
+        ])
+        for candidate in [
+            build_dir / "bin" / "llama-quantize",
+            build_dir / "bin" / "quantize",
+            llama_dir / "llama-quantize",
+            llama_dir / "quantize",
+        ]:
+            if candidate.exists():
+                quantize = candidate
+                break
+    if quantize is None:
+        raise SystemExit("llama-quantize was not produced by the llama.cpp build")
+    if final_gguf.exists():
+        final_gguf.unlink()
+    print("[gguf] quantizing to " + quantization.upper(), flush=True)
+    run([quantize, out_gguf, final_gguf, quantization.upper()])
+
+if not final_gguf.exists() or final_gguf.stat().st_size == 0:
+    raise SystemExit("GGUF file was not created: " + str(final_gguf))
 
 print("[gguf] uploading to " + gguf_repo, flush=True)
 create_repo(repo_id=gguf_repo, repo_type="model", private=private, token=token, exist_ok=True)
-api.upload_file(repo_id=gguf_repo, repo_type="model", path_in_repo="model.gguf", folder_path=gguf_dir + "/model.gguf", commit_message="Upload GGUF for Ollama/llama.cpp")
+api.upload_file(repo_id=gguf_repo, repo_type="model", path_in_repo="model.gguf", path_or_fileobj=str(final_gguf), commit_message="Upload GGUF for Ollama/llama.cpp")
 print("[gguf] done: https://huggingface.co/" + gguf_repo)
 PY"#,
         run_dir = pipeline::sh_quote(&run.remote_dir),
@@ -2577,6 +2671,8 @@ PY"#,
     }
 
     run.hub.merged_model_id = merged_repo.clone();
+    run.hub.gguf_repo_id = gguf_repo.clone();
+    run.hub.gguf_quantization = quantization.clone();
     runs::save(&run).await?;
 
     Ok(serde_json::json!({

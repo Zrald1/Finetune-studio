@@ -33,7 +33,7 @@ export default function TrainingConfigForm({
   const set = <K extends keyof LoraConfig>(k: K, v: LoraConfig[K]) =>
     onChange({ ...value, [k]: v });
   const method = value.method || "lora";
-  const methodCopy: Record<"lora" | "qlora" | "unsloth" | "full" | "freeze" | "dora" | "loraplus" | "pissa" | "galore" | "badam" | "grpo" | "custom", {
+  const methodCopy: Record<"lora" | "qlora" | "unsloth" | "full" | "freeze" | "dora" | "loraplus" | "pissa" | "galore" | "badam" | "grpo" | "zrald" | "custom", {
     title: string;
     detail: string;
     rankLabel: string;
@@ -189,6 +189,19 @@ export default function TrainingConfigForm({
       saveLabel: "GRPO Save Steps",
       note: "GRPO via unsloth's GRPOTrainer. Uses reward functions for code/game-strategy tasks. ROCm-supported on MI300X.",
     },
+    zrald: {
+      title: "ZRALD RAG reward learning",
+      detail: "Zero-shot Retrieval-Augmented Learning with Dynamic rewards. The RAG teacher builds questions, the student samples four answers, and a reward teacher scores them for GRPO.",
+      rankLabel: "ZRALD LoRA Rank (r)",
+      alphaLabel: "ZRALD LoRA Alpha",
+      dropoutLabel: "ZRALD Dropout",
+      learningLabel: "ZRALD Learning Rate",
+      batchLabel: "ZRALD Prompt Batch",
+      accumLabel: "ZRALD Grad Accum",
+      cutoffLabel: "ZRALD Max Seq Length",
+      saveLabel: "ZRALD Save Steps",
+      note: "Uses the generated RAG question pool, fixed before/after benchmarks, four sampled completions per prompt, and reward-teacher scores clamped from -1 to 1.",
+    },
     custom: {
       title: value.customMethodName?.trim() || "Custom command method",
       detail: "Runs your saved shell commands in sequence on the remote training node.",
@@ -258,7 +271,7 @@ export default function TrainingConfigForm({
       <input
         type="number"
         step={step ?? 1}
-        value={value[k] as number}
+        value={(value[k] ?? "") as number | ""}
         onChange={(e) => set(k, Number(e.target.value) as any)}
         className="w-full px-4 py-2.5 premium-input rounded-xl text-sm-fluid font-mono text-white focus:outline-none shadow-inner"
       />
@@ -363,6 +376,7 @@ export default function TrainingConfigForm({
             ["galore", "GaLore", "Memory efficient"],
             ["badam", "BAdam", "Block-wise Adam"],
             ["grpo", "GRPO", "Reinforcement RL"],
+            ["zrald", "ZRALD", "RAG reward RL"],
             ["custom", "Add +", "Command chain"],
           ].map(([key, label, desc]) => {
             const active = method === key;
@@ -452,6 +466,44 @@ export default function TrainingConfigForm({
               <p className="text-[10px] theme-faint font-mono uppercase tracking-tight opacity-70 leading-relaxed">
                 Available variables: $RUN_DIR, $TRAIN_YAML, $DATA_DIR, $OUTPUT_DIR, $STUDENT_MODEL, $BASE_MODEL, $HF_TOKEN, $FT_LEARNING_RATE, $FT_EPOCHS, $FT_BATCH_SIZE.
               </p>
+            </div>
+          </div>
+        )}
+
+        {method === "zrald" && (
+          <div className="rounded-2xl border border-white/5 theme-surface-soft p-5 glass-panel space-y-5">
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <div className="space-y-2">
+                <label className="text-[10px] uppercase tracking-widest theme-muted font-black ml-1">
+                  Reward Teacher Endpoint
+                </label>
+                <input
+                  type="text"
+                  value={value.zraldRewardEndpoint || ""}
+                  onChange={(e) => set("zraldRewardEndpoint", e.target.value)}
+                  placeholder="http://127.0.0.1:8000 or external OpenAI-compatible URL"
+                  className="w-full px-4 py-3 premium-input rounded-xl text-sm-fluid font-mono text-white focus:outline-none shadow-inner"
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-[10px] uppercase tracking-widest theme-muted font-black ml-1">
+                  Reward Teacher Model
+                </label>
+                <input
+                  type="text"
+                  value={value.zraldRewardModel || ""}
+                  onChange={(e) => set("zraldRewardModel", e.target.value)}
+                  placeholder="Hugging Face model id or served model name"
+                  className="w-full px-4 py-3 premium-input rounded-xl text-sm-fluid font-mono text-white focus:outline-none shadow-inner"
+                />
+              </div>
+            </div>
+            <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
+              <NumField k="zraldTrainQuestions" label="Train Questions" />
+              <NumField k="zraldBenchmarkQuestions" label="Benchmark Questions" />
+              <NumField k="zraldNumGenerations" label="Answers / Prompt" />
+              <NumField k="zraldMaxCompletionTokens" label="Answer Tokens" />
+              <NumField k="zraldRewardTemperature" label="Judge Temp" step={0.1} />
             </div>
           </div>
         )}
