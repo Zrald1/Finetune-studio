@@ -24,7 +24,7 @@ fn http() -> Client {
     static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
         Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(std::time::Duration::from_secs(30 * 60))
             .build()
             .unwrap()
     })
@@ -740,15 +740,28 @@ pub async fn restore_snapshot(
     collection: &str,
     snapshot_path: &str,
 ) -> Result<()> {
-    let url = format!(
-        "{}/collections/{}/snapshots/{}/restore?wait=true",
-        base(cfg)?,
-        collection,
-        snapshot_path
-    );
+    let base_url = base(cfg)?;
+    let url = format!("{}/collections/{}/snapshots/recover?wait=true", base_url, collection);
+    let location = if snapshot_path.starts_with("http://")
+        || snapshot_path.starts_with("https://")
+        || snapshot_path.starts_with("file://")
+    {
+        snapshot_path.to_string()
+    } else {
+        format!("{}/collections/{}/snapshots/{}", base_url, collection, snapshot_path)
+    };
+    let mut body = json!({
+        "location": location,
+        "priority": "snapshot",
+    });
+    let key = api_key(cfg);
+    if !key.trim().is_empty() {
+        body["api_key"] = json!(key);
+    }
     let res = http()
         .put(&url)
         .header("api-key", api_key(cfg))
+        .json(&body)
         .send()
         .await?;
     if !res.status().is_success() {
@@ -765,8 +778,9 @@ pub async fn upload_snapshot(
     snapshot_path: &std::path::Path,
 ) -> Result<()> {
     use reqwest::multipart;
+    use tokio_util::io::ReaderStream;
     let url = format!(
-        "{}/collections/{}/snapshots/upload?priority=snapshot",
+        "{}/collections/{}/snapshots/upload?wait=true&priority=snapshot",
         base(cfg)?,
         collection
     );
@@ -776,14 +790,24 @@ pub async fn upload_snapshot(
         .unwrap_or("snapshot.snapshot")
         .to_string();
 
-    let file_bytes = tokio::fs::read(snapshot_path).await.map_err(|e| {
-        AppError::qdrant(format!("failed to read snapshot file for upload: {e}"))
+    let file = tokio::fs::File::open(snapshot_path).await.map_err(|e| {
+        AppError::qdrant(format!("failed to open snapshot file for upload: {e}"))
     })?;
+    let file_size = file.metadata().await.map_err(|e| {
+        AppError::qdrant(format!("failed to stat snapshot file for upload: {e}"))
+    })?.len();
+    if file_size == 0 {
+        return Err(AppError::qdrant("snapshot file is empty"));
+    }
+    let stream = ReaderStream::new(file);
+    let body = reqwest::Body::wrap_stream(stream);
 
-    let part = multipart::Part::bytes(file_bytes)
+    let part = multipart::Part::stream_with_length(body, file_size)
         .file_name(file_name)
         .mime_str("application/octet-stream")
-        .unwrap();
+        .map_err(|e| {
+            AppError::qdrant(format!("failed to prepare snapshot upload: {e}"))
+        })?;
 
     let form = multipart::Form::new().part("snapshot", part);
 

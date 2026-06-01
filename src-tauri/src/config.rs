@@ -20,6 +20,12 @@ pub struct SshConfig {
 fn default_ssh_port() -> u16 {
     22
 }
+fn default_gpu_memory_utilization() -> f32 {
+    0.084
+}
+fn default_teacher_gpu_memory_utilization() -> f32 {
+    0.80
+}
 fn default_username() -> String {
     "root".to_string()
 }
@@ -66,11 +72,10 @@ pub struct EmbedderConfig {
     /// without the 3–5 minute VRAM load time on every dataset generation run.
     #[serde(default)]
     pub persistent: bool,
-    /// Optional user-specified GPU memory utilization (0.0–1.0).
-    /// Only meaningful on the first embedder (embedder_1). When set, embedder_1
-    /// uses this value and remaining embedders split (0.45 − this) evenly.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gpu_memory_utilization: Option<f32>,
+    /// GPU memory utilization (0.0–1.0) for this embedder's vLLM instance.
+    /// Each embedder uses its own value independently — no subdivision logic.
+    #[serde(default = "default_gpu_memory_utilization")]
+    pub gpu_memory_utilization: f32,
 }
 
 impl Default for EmbedderConfig {
@@ -84,7 +89,7 @@ impl Default for EmbedderConfig {
             vector_dim: None,
             enabled: true,
             persistent: false,
-            gpu_memory_utilization: None,
+            gpu_memory_utilization: 0.084,
         }
     }
 }
@@ -138,6 +143,7 @@ pub struct TeacherConfig {
     pub max_model_len: u32,
     pub dtype: String,
     pub tensor_parallel: u32,
+    #[serde(default = "default_teacher_gpu_memory_utilization")]
     pub gpu_memory_utilization: f32,
     pub auto_tune: bool,
     pub enable_chunked_prefill: bool,
@@ -158,7 +164,7 @@ impl Default for TeacherConfig {
             max_model_len: 32768,
             dtype: "bfloat16".to_string(),
             tensor_parallel: 1,
-            gpu_memory_utilization: 0.95,
+            gpu_memory_utilization: 0.80,
             auto_tune: true,
             enable_chunked_prefill: true,
             max_num_batched_tokens: Some(8192),
@@ -191,11 +197,7 @@ impl TeacherConfig {
         let is_gguf = repo.contains("gguf");
 
         resolved.dtype = "bfloat16".to_string();
-        resolved.gpu_memory_utilization = if resolved.serving_engine == ServingEngine::Sglang {
-            0.85
-        } else {
-            0.95
-        };
+        resolved.gpu_memory_utilization = 0.80;
         resolved.tensor_parallel = resolved.tensor_parallel.max(1);
         resolved.enable_chunked_prefill = true;
 

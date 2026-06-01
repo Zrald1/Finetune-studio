@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::config::{AppConfig, DockerConfig, TeacherConfig, ServingEngine};
+use crate::config::{AppConfig, DockerConfig, EmbedderConfig, TeacherConfig, ServingEngine};
 use crate::error::{AppError, Result};
 use crate::generator::{self, GeneratedPair, GeneratorConfig};
 use crate::llamafactory;
@@ -13,6 +13,22 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use tokio::fs;
 use tokio::sync::mpsc;
+
+pub const TEACHER_VRAM_WITH_SEMANTIC_EMBEDDER: f32 = 0.80;
+
+pub fn is_protected_semantic_embedder(index: usize, embedder: &EmbedderConfig) -> bool {
+    index == 0 || embedder.persistent
+}
+
+pub fn cap_teacher_vram_for_semantic_embedder(teacher: &mut TeacherConfig) -> Option<(f32, f32)> {
+    if teacher.gpu_memory_utilization > TEACHER_VRAM_WITH_SEMANTIC_EMBEDDER {
+        let previous = teacher.gpu_memory_utilization;
+        teacher.gpu_memory_utilization = TEACHER_VRAM_WITH_SEMANTIC_EMBEDDER;
+        Some((previous, teacher.gpu_memory_utilization))
+    } else {
+        None
+    }
+}
 
 pub(crate) fn parse_arg_value(cmd: &str, arg: &str) -> Option<String> {
     let parts: Vec<&str> = cmd.split_whitespace().collect();
@@ -640,12 +656,27 @@ async fn run_pipeline(
         // teacher boots on the remaining VRAM.
         {
             // Split configured embedders into preserve (persistent) vs stop.
-            let non_persistent_ports: Vec<u16> =
-                cfg.embedders.iter().filter(|e| !e.persistent).map(|e| e.port).collect();
-            let persistent_names: Vec<String> =
-                cfg.embedders.iter().filter(|e| e.persistent).map(|e| e.name.clone()).collect();
-            let non_persistent_names: Vec<String> =
-                cfg.embedders.iter().filter(|e| !e.persistent).map(|e| e.name.clone()).collect();
+            let non_persistent_ports: Vec<u16> = cfg
+                .embedders
+                .iter()
+                .enumerate()
+                .filter(|(idx, e)| !is_protected_semantic_embedder(*idx, e))
+                .map(|(_, e)| e.port)
+                .collect();
+            let persistent_names: Vec<String> = cfg
+                .embedders
+                .iter()
+                .enumerate()
+                .filter(|(idx, e)| is_protected_semantic_embedder(*idx, e))
+                .map(|(_, e)| e.name.clone())
+                .collect();
+            let non_persistent_names: Vec<String> = cfg
+                .embedders
+                .iter()
+                .enumerate()
+                .filter(|(idx, e)| !is_protected_semantic_embedder(*idx, e))
+                .map(|(_, e)| e.name.clone())
+                .collect();
             // Phase-2 boot keeps a port-targeted (non-blanket) pkill whenever a
             // persistent embedder must survive.
             embedder_1_alive = !persistent_names.is_empty();
@@ -689,9 +720,7 @@ async fn run_pipeline(
                     let host_kill = build_embedder_port_kill_cmd(&non_persistent_ports);
                     let _ = session.exec_blocking(&host_kill).await;
 
-                    // Inside every running container: broad embed-vLLM sweep +
-                    // port kill (only non-persistent embedders live in containers).
-                    let inner_kill = build_embedder_kill_cmd(&non_persistent_ports);
+                    let inner_kill = build_embedder_port_kill_cmd(&non_persistent_ports);
                     if let Ok(ps_r) = session
                         .exec_blocking("docker ps --format '{{.Names}}' 2>/dev/null || true")
                         .await
@@ -759,22 +788,16 @@ async fn run_pipeline(
                     "[embedder] GPU server has no Qdrant on :6333 — skipping embedder deployment (no vector store to search)\n",
                     "stage",
                 );
-            } else if let Some(embedder) = cfg
+            } else if let Some((embedder_index, embedder)) = cfg
                 .embedders
                 .iter()
-                .find(|e| e.persistent)
-                .or_else(|| cfg.embedders.first())
+                .enumerate()
+                .find(|(idx, e)| is_protected_semantic_embedder(*idx, e))
             {
-                // Prefer the first PERSISTENT embedder — that is the one GPU
-                // cleanup preserved for semantic search; reviving the same one
-                // avoids a needless re-load. Fall back to the first configured
-                // embedder when none is marked persistent.
-                // Persistent embedders run outside Docker on the host, survive
-                // GPU cleanup, and get 24 GB VRAM (0.125 on a 192 GB card).
-                // Non-persistent embedders follow the existing docker-based path
-                // with minimal VRAM (0.084).
-                let is_persistent = embedder.persistent;
-                let embedder_cfg = if is_persistent {
+                // Embedder index 0 is the semantic-search embedder and is
+                // protected even for older configs that predate `persistent`.
+                let is_protected = is_protected_semantic_embedder(embedder_index, embedder);
+                let embedder_cfg = if is_protected {
                     // Host-mode: probe + launch directly on the droplet, not
                     // inside any container.
                     DockerConfig {
@@ -807,8 +830,8 @@ async fn run_pipeline(
                         "stage",
                     );
                 } else {
-                    let mode = if is_persistent { "host" } else { "docker" };
-                    let gpu_mem = if is_persistent { 0.125 } else { 0.084 };
+                    let mode = if is_protected { "host" } else { "docker" };
+                    let gpu_mem = embedder.gpu_memory_utilization as f64;
                     emit_log(
                         app,
                         &run.id,
@@ -992,10 +1015,29 @@ async fn run_pipeline(
     }
 
     let gpu_memory_total_mb = gpu_state.as_ref().map(|gpu| gpu.memory_total);
-    let effective_teacher = run_cfg.teacher.resolved_for_gpu(gpu_memory_total_mb);
+    let mut effective_teacher = run_cfg.teacher.resolved_for_gpu(gpu_memory_total_mb);
+    let has_semantic_embedder = cfg
+        .embedders
+        .iter()
+        .enumerate()
+        .any(|(idx, e)| is_protected_semantic_embedder(idx, e));
+    if has_semantic_embedder {
+        if let Some((old, new)) = cap_teacher_vram_for_semantic_embedder(&mut effective_teacher) {
+            emit_log(
+                app,
+                &run.id,
+                &format!(
+                    "[vram] protected embedder_1 is reserved for semantic search; capping teacher VRAM util from {:.2} to {:.2}\n",
+                    old, new
+                ),
+                "stage",
+            );
+        }
+    }
     if run.teacher_cfg.repo_id != effective_teacher.repo_id
         || run.teacher_cfg.max_model_len != effective_teacher.max_model_len
         || run.teacher_cfg.dtype != effective_teacher.dtype
+        || (run.teacher_cfg.gpu_memory_utilization - effective_teacher.gpu_memory_utilization).abs() > f32::EPSILON
     {
         run.teacher_cfg = effective_teacher.clone();
         let _ = runs::save(run).await;
@@ -4390,22 +4432,7 @@ fn embedder_port_kill(non_persistent_ports: &[u16]) -> String {
 /// (docker disabled) and are never reached. Pass only non-persistent ports.
 /// Mirrors the cleanup in `main.rs::run_deploy_teacher_task`.
 pub fn build_embedder_kill_cmd(non_persistent_ports: &[u16]) -> String {
-    format!(
-        "pkill -f 'embed.*vllm' 2>/dev/null; \
-         pkill -f 'vllm.*embed' 2>/dev/null; \
-         pkill -f 'vllm.*pooling' 2>/dev/null; \
-         pkill -f 'vllm.*task' 2>/dev/null; \
-         pkill -f 'sglang.*is-embedding' 2>/dev/null; \
-         sleep 1; \
-         pkill -9 -f 'embed.*vllm' 2>/dev/null; \
-         pkill -9 -f 'vllm.*embed' 2>/dev/null; \
-         pkill -9 -f 'vllm.*pooling' 2>/dev/null; \
-         pkill -9 -f 'vllm.*task' 2>/dev/null; \
-         pkill -9 -f 'sglang.*is-embedding' 2>/dev/null; \
-         {port_kill}\
-         true",
-        port_kill = embedder_port_kill(non_persistent_ports),
-    )
+    build_embedder_port_kill_cmd(non_persistent_ports)
 }
 
 /// Host-safe embedder stop: ONLY frees the given non-persistent ports (no broad

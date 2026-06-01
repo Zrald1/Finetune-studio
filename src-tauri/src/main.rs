@@ -55,6 +55,26 @@ async fn read_local_file_text(path: String) -> Result<String> {
 }
 
 #[tauri::command]
+async fn save_ingest_state(state_json: String) -> Result<()> {
+    config::ensure_dirs().await?;
+    let path = config::app_dir()?.join("ingest_state.json");
+    tokio::fs::write(&path, state_json)
+        .await
+        .map_err(|e| AppError::config(format!("write ingest state `{}`: {}", path.display(), e)))?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn load_ingest_state() -> Result<String> {
+    let path = config::app_dir()?.join("ingest_state.json");
+    match tokio::fs::read_to_string(&path).await {
+        Ok(content) => Ok(content),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok("{}".to_string()),
+        Err(e) => Err(AppError::config(format!("read ingest state `{}`: {}", path.display(), e))),
+    }
+}
+
+#[tauri::command]
 async fn do_list_gpu_sizes(cfg: DigitalOceanConfig) -> Result<Vec<digitalocean::DoSize>> {
     digitalocean::list_gpu_sizes(&cfg).await
 }
@@ -311,59 +331,17 @@ async fn qdrant_sample(cfg: QdrantConfig, n: u32) -> Result<Vec<Chunk>> {
     qdrant::sample(&cfg, n).await
 }
 
-
-
 #[tauri::command]
 async fn qdrant_ensure_collection(cfg: QdrantConfig) -> Result<()> {
-    let app_cfg = config::load().await.unwrap_or_default();
-    
-    // Find the correct vector dimension:
-    // If there is a self-hosted embedder whose collection matches the one we are ensuring,
-    // use its vector_dim or probe it. If not, check if any embedder is active.
-    let mut dim = crate::ingest::TARGET_VECTOR_DIM; // 1536
-    
-    let matched_emb = app_cfg.embedders.iter().find(|e| {
-        let coll = e.collection.trim();
-        let name_slug = e.name.trim().to_lowercase().chars().map(|ch| if ch.is_alphanumeric() { ch } else { '_' }).collect::<String>();
-        let name_slug = name_slug.trim_matches('_');
-        let effective_coll = if !coll.is_empty() { coll.to_string() } else if name_slug.is_empty() { "kb_default".to_string() } else { format!("kb_{}", name_slug) };
-        effective_coll == cfg.collection
-    }).or_else(|| app_cfg.embedders.first());
-
-    if let Some(emb) = matched_emb {
-        if let Some(d) = emb.vector_dim {
-            dim = d;
-        } else {
-            // Build embed config to probe
-            let embed_cfg = crate::ingest::EmbeddingConfig {
-                provider: crate::ingest::EmbeddingProvider::Vllm,
-                api_url: emb.api_url(&app_cfg.ssh.host),
-                api_key: String::new(),
-                model_id: emb.model_id.clone(),
-                concurrency: Some(emb.concurrency as usize),
-            };
-            // Probe dimension
-            match crate::ingest::embed_chunk(&embed_cfg, "dimension probe").await {
-                Ok(v) => {
-                    dim = v.len();
-                }
-                Err(e) => {
-                    // Fallback to 4096 if model ID is Qwen3-Embedding-8B
-                    if emb.model_id.contains("Embedding-8B") || emb.model_id.contains("embedding-8b") {
-                        dim = 4096;
-                    } else {
-                        eprintln!("[qdrant] Probe dim failed, using default {}: {}", dim, e);
-                    }
-                }
-            }
-        }
-    }
-    
-    qdrant::create_collection(&cfg, &cfg.collection, dim).await
+    qdrant::ensure_collection(&cfg).await
 }
 
 #[tauri::command]
-async fn qdrant_sample_in_collection(cfg: QdrantConfig, collection: String, n: u32) -> Result<Vec<Chunk>> {
+async fn qdrant_sample_in_collection(
+    cfg: QdrantConfig,
+    collection: String,
+    n: u32,
+) -> Result<Vec<Chunk>> {
     qdrant::sample_in_collection(&cfg, &collection, n).await
 }
 
@@ -378,12 +356,16 @@ async fn qdrant_scroll_in_collection(
 }
 
 #[tauri::command]
-async fn qdrant_scroll_all(cfg: QdrantConfig, n: u32) -> Result<Vec<qdrant::Chunk>> {
+async fn qdrant_scroll_all(cfg: QdrantConfig, n: u32) -> Result<Vec<Chunk>> {
     qdrant::scroll_all(&cfg, n).await
 }
 
 #[tauri::command]
-async fn qdrant_scroll_all_in_collection(cfg: QdrantConfig, collection: String, n: u32) -> Result<Vec<qdrant::Chunk>> {
+async fn qdrant_scroll_all_in_collection(
+    cfg: QdrantConfig,
+    collection: String,
+    n: u32,
+) -> Result<Vec<Chunk>> {
     qdrant::scroll_all_in_collection(&cfg, &collection, n).await
 }
 
@@ -393,17 +375,27 @@ async fn list_qdrant_collections(cfg: QdrantConfig) -> Result<Vec<qdrant::Collec
 }
 
 #[tauri::command]
-async fn list_qdrant_snapshots(cfg: QdrantConfig, collection: String) -> Result<Vec<qdrant::SnapshotInfo>> {
+async fn list_qdrant_snapshots(
+    cfg: QdrantConfig,
+    collection: String,
+) -> Result<Vec<qdrant::SnapshotInfo>> {
     qdrant::list_snapshots(&cfg, &collection).await
 }
 
 #[tauri::command]
-async fn create_qdrant_snapshot(cfg: QdrantConfig, collection: String) -> Result<qdrant::SnapshotInfo> {
+async fn create_qdrant_snapshot(
+    cfg: QdrantConfig,
+    collection: String,
+) -> Result<qdrant::SnapshotInfo> {
     qdrant::create_snapshot(&cfg, &collection).await
 }
 
 #[tauri::command]
-async fn restore_qdrant_snapshot(cfg: QdrantConfig, collection: String, snapshot_path: String) -> Result<()> {
+async fn restore_qdrant_snapshot(
+    cfg: QdrantConfig,
+    collection: String,
+    snapshot_path: String,
+) -> Result<()> {
     qdrant::restore_snapshot(&cfg, &collection, &snapshot_path).await
 }
 
@@ -424,39 +416,23 @@ async fn qdrant_download_snapshot(
 }
 
 #[tauri::command]
-async fn create_all_qdrant_snapshots(cfg: QdrantConfig) -> Result<Vec<qdrant::CollectionSnapshotResult>> {
+async fn create_all_qdrant_snapshots(
+    cfg: QdrantConfig,
+) -> Result<Vec<qdrant::CollectionSnapshotResult>> {
     qdrant::create_all_snapshots(&cfg).await
 }
 
 #[tauri::command]
-async fn download_all_qdrant_snapshots(cfg: QdrantConfig, local_dir: String) -> Result<Vec<String>> {
+async fn download_all_qdrant_snapshots(
+    cfg: QdrantConfig,
+    local_dir: String,
+) -> Result<Vec<String>> {
     let paths = qdrant::download_all_snapshots(&cfg, std::path::Path::new(&local_dir)).await?;
-    Ok(paths.iter().map(|p| p.to_string_lossy().into_owned()).collect())
+    Ok(paths
+        .into_iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect())
 }
-
-#[tauri::command]
-async fn save_ingest_state(state_json: String) -> Result<()> {
-    let dir = config::app_dir()?;
-    tokio::fs::create_dir_all(&dir).await?;
-    tokio::fs::write(dir.join("ingest_state.json"), state_json).await
-        .map_err(|e| AppError::config(format!("save ingest state: {}", e)))?;
-    Ok(())
-}
-
-#[tauri::command]
-async fn load_ingest_state() -> Result<String> {
-    let path = config::app_dir()?.join("ingest_state.json");
-    if !path.exists() {
-        return Ok("{}".to_string());
-    }
-    let content = tokio::fs::read_to_string(path).await
-        .map_err(|e| AppError::config(format!("load ingest state: {}", e)))?;
-    Ok(content)
-}
-
-
-
-// ── serve commands ─────────────────────────────────────────────────────────
 
 #[tauri::command]
 async fn serve_ensure_qdrant(
@@ -466,7 +442,9 @@ async fn serve_ensure_qdrant(
     data_dir: String,
 ) -> Result<()> {
     let session = SshSession::connect(&ssh).await?;
-    serve::ensure_qdrant(&session, &docker, qdrant_port, &data_dir).await
+    let result = serve::ensure_qdrant(&session, &docker, qdrant_port, &data_dir).await;
+    session.disconnect().await;
+    result
 }
 
 #[tauri::command]
@@ -477,15 +455,7 @@ async fn serve_boot_embedder(
     embedder: EmbedderConfig,
     hf_token: Option<String>,
 ) -> Result<String> {
-    let app_cfg = config::load().await.unwrap_or_default();
-    let count = app_cfg.embedders.len().max(1);
-    let gpu_memory_utilization = if count > 1 && embedder.gpu_memory_utilization.is_some() {
-        embedder.gpu_memory_utilization.unwrap()
-    } else {
-        0.45 / (count as f32)
-    };
-
-let session = SshSession::connect(&ssh).await?;
+    let session = SshSession::connect(&ssh).await?;
     let embedder_cfg = if embedder.persistent {
         DockerConfig { enabled: false, ..docker.clone() }
     } else {
@@ -497,7 +467,7 @@ let session = SshSession::connect(&ssh).await?;
         &embedder_cfg,
         &embedder,
         hf_token.as_deref(),
-        gpu_memory_utilization,
+        embedder.gpu_memory_utilization,
         Some(&move |line| {
             let _ = app_c.emit("setup://log", serde_json::json!({ "line": line }));
         }),
@@ -617,24 +587,8 @@ async fn serve_setup_all_embedders(
         }
     }
 
-    let count = embedders.len().max(1);
-    let first_util = embedders.first()
-        .and_then(|e| e.gpu_memory_utilization)
-        .unwrap_or(0.0);
-    let (each_subsequent, use_custom_first) = if first_util > 0.0 && count > 1 {
-        let remaining = (0.45 - first_util).max(0.0);
-        (Some(remaining / ((count - 1) as f32)), Some(first_util))
-    } else {
-        (None, None)
-    };
-
     let mut results = vec![];
-    for (i, embedder) in embedders.iter().enumerate() {
-        let per_embedder_util = match (i, use_custom_first, each_subsequent) {
-            (0, Some(v), _) => v,
-            (_, _, Some(each)) => each,
-            _ => 0.45 / (count as f32),
-        };
+    for embedder in embedders.iter() {
         let embedder_cfg = if embedder.persistent {
             DockerConfig { enabled: false, ..resolved_docker.clone() }
         } else {
@@ -662,15 +616,15 @@ async fn serve_setup_all_embedders(
                     let _ = app.emit("setup://log", serde_json::json!({"line": format!("[ok] '{}' already running\n", embedder.name)}));
                     "already_running".to_string()
                 }
-                _ => {
+_ => {
                     let _ = app.emit("setup://log", serde_json::json!({"line": format!("[stage] booting '{}' with {}\n", embedder.name, embedder.model_id)}));
                     let app_c = app.clone();
-match serve::boot_embedder(
+                    match serve::boot_embedder(
                         &session,
                         &embedder_cfg,
                         embedder,
                         hf_token.as_deref(),
-                        per_embedder_util,
+                        embedder.gpu_memory_utilization,
                         Some(&move |line| {
                             let _ = app_c.emit("setup://log", serde_json::json!({ "line": line }));
                         }),
@@ -1202,10 +1156,27 @@ async fn run_deploy_teacher_task(
         }));
     }
 
-let app_cfg = config::load().await.unwrap_or_default();
+    let app_cfg = config::load().await.unwrap_or_default();
+    let has_protected_embedder = app_cfg
+        .embedders
+        .iter()
+        .enumerate()
+        .any(|(idx, e)| pipeline::is_protected_semantic_embedder(idx, e));
     if !app_cfg.embedders.is_empty() {
-        let killable: Vec<_> = app_cfg.embedders.iter().filter(|e| !e.persistent).collect();
-        let persistent: Vec<_> = app_cfg.embedders.iter().filter(|e| e.persistent).collect();
+        let killable: Vec<_> = app_cfg
+            .embedders
+            .iter()
+            .enumerate()
+            .filter(|(idx, e)| !pipeline::is_protected_semantic_embedder(*idx, e))
+            .map(|(_, e)| e)
+            .collect();
+        let persistent: Vec<_> = app_cfg
+            .embedders
+            .iter()
+            .enumerate()
+            .filter(|(idx, e)| pipeline::is_protected_semantic_embedder(*idx, e))
+            .map(|(_, e)| e)
+            .collect();
         let killable_names: Vec<String> = killable.iter().map(|e| e.name.clone()).collect();
         let persistent_names: Vec<String> = persistent.iter().map(|e| e.name.clone()).collect();
         let _ = app.emit("deploy://log", serde_json::json!({
@@ -1222,11 +1193,11 @@ let app_cfg = config::load().await.unwrap_or_default();
         let killable_ports: Vec<u16> = killable.iter().map(|e| e.port).collect();
         // Host: port-targeted only — the broad embed-vLLM pattern sweep would
         // also match a persistent embedder running on the host, so never run it
-        // here. Inside containers (where only non-persistent embedders live) the
-        // broad sweep is safe.
+        // here. Inside containers, use port-targeted cleanup too because older
+        // configs may still run embedder_1 inside the shared rocm-vllm container.
         let host_kill = pipeline::build_embedder_port_kill_cmd(&killable_ports);
         let _ = session.exec_blocking(&host_kill).await;
-        let inner_kill = pipeline::build_embedder_kill_cmd(&killable_ports);
+        let inner_kill = pipeline::build_embedder_port_kill_cmd(&killable_ports);
         if let Ok(ps_r) = session.exec_blocking("docker ps --format '{{.Names}}' 2>/dev/null || true").await {
             for cname in ps_r.stdout.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
                 let inner = pipeline::wrap_docker_cmd(&inner_kill, &cname);
@@ -1243,7 +1214,19 @@ let app_cfg = config::load().await.unwrap_or_default();
 
     let gpu_state = ssh::nvidia_smi(&session).await.ok();
     let gpu_memory_total_mb = gpu_state.as_ref().map(|gpu| gpu.memory_total);
-    let teacher = teacher.resolved_for_gpu(gpu_memory_total_mb);
+    let mut teacher = teacher.resolved_for_gpu(gpu_memory_total_mb);
+    if has_protected_embedder {
+        if let Some((old, new)) = pipeline::cap_teacher_vram_for_semantic_embedder(&mut teacher) {
+            let _ = app.emit("deploy://log", serde_json::json!({
+                "streamId": id,
+                "kind": "info",
+                "line": format!(
+                    "[vram] protected embedder_1 is reserved for semantic search; capping teacher VRAM util from {:.2} to {:.2}\n",
+                    old, new
+                )
+            }));
+        }
+    }
     let mut docker_cfg = docker.clone();
     if teacher.serving_engine == ServingEngine::Sglang {
         docker_cfg.container_name = "rocm-sglang".to_string();
@@ -1303,9 +1286,9 @@ let app_cfg = config::load().await.unwrap_or_default();
         teacher.vllm_port
     };
 
-let mut ports_to_free = vec![port_to_free];
-    for emb in &app_cfg.embedders {
-        if !emb.persistent {
+    let mut ports_to_free = vec![port_to_free];
+    for (idx, emb) in app_cfg.embedders.iter().enumerate() {
+        if !pipeline::is_protected_semantic_embedder(idx, emb) {
             ports_to_free.push(emb.port);
         }
     }
@@ -1336,26 +1319,45 @@ let mut ports_to_free = vec![port_to_free];
         ));
     }
 
-    let pkill_body = format!(
-        "pkill -f '[v]llm.entrypoints' 2>/dev/null; \
-         pkill -f '[v]llm serve' 2>/dev/null; \
-         pkill -f 'multiproc.*vllm' 2>/dev/null; \
-         pkill -f 'python.*vllm' 2>/dev/null; \
-         pkill -f 'sglang.launch_server' 2>/dev/null; \
-         pkill -f 'python.*sglang' 2>/dev/null; \
-         sleep 1; \
-         pkill -9 -f '[v]llm.entrypoints' 2>/dev/null; \
-         pkill -9 -f '[v]llm serve' 2>/dev/null; \
-         pkill -9 -f 'multiproc.*vllm' 2>/dev/null; \
-         pkill -9 -f 'python.*vllm' 2>/dev/null; \
-         pkill -9 -f 'sglang.launch_server' 2>/dev/null; \
-         pkill -9 -f 'python.*sglang' 2>/dev/null; \
-         {port_cleanup} \
-         {port_wait} \
-         true",
-        port_cleanup = port_cleanup_cmds,
-        port_wait = port_wait_cmds,
-    );
+    let pkill_body = if has_protected_embedder {
+        let vllm_pattern = pipeline::sh_quote(&format!("vllm serve {}", teacher.repo_id));
+        let sglang_pattern = pipeline::sh_quote(&format!("sglang.launch_server.*{}", teacher.repo_id));
+        format!(
+            "pkill -f {vllm_pattern} 2>/dev/null; \
+             pkill -f {sglang_pattern} 2>/dev/null; \
+             sleep 1; \
+             pkill -9 -f {vllm_pattern} 2>/dev/null; \
+             pkill -9 -f {sglang_pattern} 2>/dev/null; \
+             {port_cleanup} \
+             {port_wait} \
+             true",
+            vllm_pattern = vllm_pattern,
+            sglang_pattern = sglang_pattern,
+            port_cleanup = port_cleanup_cmds,
+            port_wait = port_wait_cmds,
+        )
+    } else {
+        format!(
+            "pkill -f '[v]llm.entrypoints' 2>/dev/null; \
+             pkill -f '[v]llm serve' 2>/dev/null; \
+             pkill -f 'multiproc.*vllm' 2>/dev/null; \
+             pkill -f 'python.*vllm' 2>/dev/null; \
+             pkill -f 'sglang.launch_server' 2>/dev/null; \
+             pkill -f 'python.*sglang' 2>/dev/null; \
+             sleep 1; \
+             pkill -9 -f '[v]llm.entrypoints' 2>/dev/null; \
+             pkill -9 -f '[v]llm serve' 2>/dev/null; \
+             pkill -9 -f 'multiproc.*vllm' 2>/dev/null; \
+             pkill -9 -f 'python.*vllm' 2>/dev/null; \
+             pkill -9 -f 'sglang.launch_server' 2>/dev/null; \
+             pkill -9 -f 'python.*sglang' 2>/dev/null; \
+             {port_cleanup} \
+             {port_wait} \
+             true",
+            port_cleanup = port_cleanup_cmds,
+            port_wait = port_wait_cmds,
+        )
+    };
     // First sweep on the host — covers any vLLM started outside docker
     // and any process holding the port directly on the bare metal.
     let _ = session.exec_blocking(&pkill_body).await;
@@ -2666,6 +2668,8 @@ fn main() {
             save_config,
             load_config,
             read_local_file_text,
+            save_ingest_state,
+            load_ingest_state,
             do_list_gpu_sizes,
             do_list_droplets,
             do_list_gpu_droplets,
@@ -2685,12 +2689,10 @@ fn main() {
             qdrant_sample,
             qdrant_ensure_collection,
             qdrant_sample_in_collection,
-qdrant_scroll_in_collection,
+            qdrant_scroll_in_collection,
             qdrant_scroll_all,
             qdrant_scroll_all_in_collection,
             list_qdrant_collections,
-            ingest_documents,
-            cancel_ingest,
             list_qdrant_snapshots,
             create_qdrant_snapshot,
             restore_qdrant_snapshot,
@@ -2698,8 +2700,8 @@ qdrant_scroll_in_collection,
             qdrant_download_snapshot,
             create_all_qdrant_snapshots,
             download_all_qdrant_snapshots,
-            save_ingest_state,
-            load_ingest_state,
+            ingest_documents,
+            cancel_ingest,
             serve_ensure_qdrant,
             serve_boot_embedder,
             serve_check_embedder,
@@ -2713,11 +2715,11 @@ qdrant_scroll_in_collection,
             list_local_dataset,
             open_runs_folder,
             read_run_log,
-            ping_teacher,
+ping_teacher,
             teacher_chat,
-test_trained_model,
+            test_trained_model,
             run_inference_benchmark,
-merge_and_upload_model,
+            merge_and_upload_model,
             merge_convert_upload_model,
             hf_whoami,
             hf_list_datasets,

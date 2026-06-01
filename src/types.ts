@@ -156,7 +156,8 @@ export interface EmbedderConfig {
   concurrency: number;
   vectorDim?: number;
   enabled: boolean;
-  gpuMemoryUtilization?: number;
+  persistent: boolean;
+  gpuMemoryUtilization: number;
 }
 
 export interface PaddleOcrConfig {
@@ -174,6 +175,8 @@ export const DEFAULT_EMBEDDER: EmbedderConfig = {
   concurrency: 2,
   vectorDim: undefined,
   enabled: true,
+  persistent: false,
+  gpuMemoryUtilization: 0.084,
 };
 
 export interface EmbeddingConfig {
@@ -628,7 +631,7 @@ export const DEFAULT_TEACHER: TeacherConfig = {
   maxModelLen: 32768,
   dtype: "bfloat16",
   tensorParallel: 1,
-  gpuMemoryUtilization: 0.95,
+  gpuMemoryUtilization: 0.80,
   autoTune: true,
   enableChunkedPrefill: true,
   maxNumBatchedTokens: 8192,

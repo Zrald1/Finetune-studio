@@ -44,7 +44,7 @@ export default function CredentialsPanel({
   const [qdrantSnapshots, setQdrantSnapshots] = useState<any[]>([]);
   const [loadingSnapshots, setLoadingSnapshots] = useState(false);
   const [downloadingSnapshot, setDownloadingSnapshot] = useState<string | null>(null);
-  const [selectedCollection, setSelectedCollection] = useState("");
+  const [selectedCollection, setSelectedCollection] = useState(config.qdrant.collection || "");
   const [snapshotSaving, setSnapshotSaving] = useState(false);
   const [snapshotUploading, setSnapshotUploading] = useState(false);
   const [snapshotStatus, setSnapshotStatus] = useState<string | null>(null);
@@ -129,7 +129,7 @@ export default function CredentialsPanel({
     onChange({
       embedders: [
         ...embedders,
-        { ...DEFAULT_EMBEDDER, name: `embedder_${newIdx + 1}`, port: 8101 + newIdx }
+        { ...DEFAULT_EMBEDDER, name: `embedder_${newIdx + 1}`, port: 8101 + newIdx, persistent: newIdx === 0 }
       ]
     });
   };
@@ -172,6 +172,19 @@ export default function CredentialsPanel({
     try {
       const cols = await api.qdrantListCollections(qd);
       setQdrantCollections(cols);
+      const names = cols.map((c) => c.name);
+      const nextCollection =
+        selectedCollection && names.includes(selectedCollection)
+          ? selectedCollection
+          : qd.collection && names.includes(qd.collection)
+            ? qd.collection
+            : names[0] || qd.collection || "";
+      if (nextCollection && nextCollection !== selectedCollection) {
+        setSelectedCollection(nextCollection);
+        if (nextCollection !== qd.collection) {
+          patchQd({ collection: nextCollection });
+        }
+      }
     } catch (e) {
       console.error("list collections:", e);
     } finally {
@@ -232,18 +245,39 @@ export default function CredentialsPanel({
     loadChunks(prevOffset);
   };
 
+  const reloadSelectedCollection = async () => {
+    if (!selectedCollection) return;
+    setCurrentOffset(null);
+    setOffsetsHistory([]);
+    await Promise.all([
+      loadQdrantSnapshots(selectedCollection),
+      loadChunks(null),
+    ]);
+  };
+
   useEffect(() => {
     if (selectedCollection && qd.endpoint) {
-      loadQdrantSnapshots(selectedCollection);
       setCurrentOffset(null);
       setOffsetsHistory([]);
-      loadChunks(null);
+      void reloadSelectedCollection();
     } else {
       setChunks([]);
       setNextOffset(null);
       setOffsetsHistory([]);
     }
   }, [selectedCollection, qd.endpoint]);
+
+  useEffect(() => {
+    if (qd.collection && qd.collection !== selectedCollection) {
+      setSelectedCollection(qd.collection);
+    }
+  }, [qd.collection]);
+
+  useEffect(() => {
+    if (showQdrantDb && qd.endpoint) {
+      void loadQdrantCollections();
+    }
+  }, [showQdrantDb, qd.endpoint]);
 
 
 
@@ -273,7 +307,8 @@ export default function CredentialsPanel({
       await api.qdrantCreateSnapshot(qd, selectedCollection);
       setSnapshotStatus(`Snapshot saved for ${selectedCollection}`);
       setSnapshotIsError(false);
-      loadQdrantSnapshots(selectedCollection);
+      await loadQdrantCollections();
+      await reloadSelectedCollection();
     } catch (e: any) {
       setSnapshotStatus(e.message || "Failed to save snapshot");
       setSnapshotIsError(true);
@@ -297,7 +332,7 @@ export default function CredentialsPanel({
       await api.qdrantUploadSnapshot(qd, selectedCollection, filePath);
       setSnapshotStatus(`Snapshot uploaded to ${selectedCollection}`);
       setSnapshotIsError(false);
-      loadQdrantSnapshots(selectedCollection);
+      await reloadSelectedCollection();
     } catch (e: any) {
       setSnapshotStatus(e.message || "Failed to upload snapshot");
       setSnapshotIsError(true);
@@ -328,7 +363,7 @@ export default function CredentialsPanel({
         setSnapshotStatus(`Saved snapshots for all ${ok.length} collections`);
         setSnapshotIsError(false);
       }
-      if (selectedCollection) loadQdrantSnapshots(selectedCollection);
+      if (selectedCollection) await reloadSelectedCollection();
     } catch (e: any) {
       setSnapshotStatus(e.message || "Failed to save all snapshots");
       setSnapshotIsError(true);
@@ -771,12 +806,15 @@ export default function CredentialsPanel({
                     }}
                     className="flex-1 px-4 py-3 premium-input rounded-xl text-sm-fluid font-mono bg-black/20 focus:outline-none shadow-inner border border-white/5 text-white"
                   >
-                    {qdrantCollections.length === 0 && <option value="">No collections found</option>}
+                    {qdrantCollections.length === 0 && !selectedCollection && <option value="">No collections found</option>}
+                    {selectedCollection && !qdrantCollections.some((c) => c.name === selectedCollection) && (
+                      <option value={selectedCollection}>{selectedCollection}</option>
+                    )}
                     {qdrantCollections.map((c) => (
                       <option key={c.name} value={c.name}>{c.name}</option>
                     ))}
                   </select>
-                  <button onClick={loadQdrantCollections} disabled={loadingCollections} className="p-3 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 transition-all disabled:opacity-30">
+                  <button onClick={async () => { await loadQdrantCollections(); await reloadSelectedCollection(); }} disabled={loadingCollections || loadingSnapshots || loadingChunks} className="p-3 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 transition-all disabled:opacity-30" title="Reload collections and previews" type="button">
                     <RefreshCw className={`w-4 h-4 ${loadingCollections ? "animate-spin" : ""} theme-muted`} />
                   </button>
                 </div>
@@ -896,8 +934,8 @@ export default function CredentialsPanel({
                 <div className="space-y-2">
                   <p className="text-[8px] uppercase tracking-widest theme-muted font-black opacity-40 flex items-center gap-2">
                     <Database className="w-3 h-3" /> Snapshots
-                    <button onClick={() => loadQdrantSnapshots(selectedCollection)} className="p-1 rounded hover:bg-white/10 transition-all" title="Refresh">
-                      <RefreshCw className="w-3 h-3" />
+                    <button onClick={reloadSelectedCollection} className="p-1 rounded hover:bg-white/10 transition-all" title="Refresh" type="button">
+                      <RefreshCw className={`w-3 h-3 ${(loadingSnapshots || loadingChunks) ? "animate-spin" : ""}`} />
                     </button>
                   </p>
                   {qdrantSnapshots.map((s) => (
@@ -919,6 +957,7 @@ export default function CredentialsPanel({
                             setSnapshotIsError(false);
                             await api.qdrantRestoreSnapshot(qd, selectedCollection, s.name);
                             setSnapshotStatus(`Restored: ${s.name}`);
+                            await reloadSelectedCollection();
                           } catch (e: any) { setSnapshotStatus(e.message); setSnapshotIsError(true); }
                         }} className="px-3 py-1.5 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-[9px] font-black uppercase hover:bg-emerald-500 hover:text-black transition-all">
                           Restore
@@ -1065,33 +1104,21 @@ export default function CredentialsPanel({
                               className="flex-1 px-3 py-2 rounded-lg bg-black/30 border border-white/5 text-xs font-mono text-white focus:outline-none focus:border-theme-accent/30"
                             />
                           </div>
-                          {idx === 0 && (
-                            <div className="flex items-center gap-3 pt-1">
-                              <label className="text-[9px] uppercase tracking-widest theme-muted font-black whitespace-nowrap">VRAM Util</label>
-                              <input
-                                type="range"
-                                min={0.01}
-                                max={0.45}
-                                step={0.01}
-                                value={emb.gpuMemoryUtilization ?? 0.084}
-                                onChange={(e) => updateEmbedder(idx, { gpuMemoryUtilization: parseFloat(e.target.value) })}
-                                className="flex-1 h-1.5 rounded-full appearance-none bg-white/10 cursor-pointer accent-theme-accent"
-                              />
-                              <span className="text-[10px] font-mono theme-muted w-10 text-right">
-                                {Math.round((emb.gpuMemoryUtilization ?? 0.084) * 100)}%
-                              </span>
-                              {emb.gpuMemoryUtilization !== undefined && (
-                                <button
-                                  type="button"
-                                  onClick={() => updateEmbedder(idx, { gpuMemoryUtilization: undefined })}
-                                  className="p-1 rounded border border-white/5 theme-surface-soft text-red-400 hover:text-red-300 hover:bg-red-500/10 transition-all"
-                                  title="Auto (equal split)"
-                                >
-                                  <X className="w-3 h-3" />
-                                </button>
-                              )}
-                            </div>
-                          )}
+                          <div className="flex items-center gap-3 pt-1">
+                            <label className="text-[9px] uppercase tracking-widest theme-muted font-black whitespace-nowrap">VRAM Util</label>
+                            <input
+                              type="range"
+                              min={0.01}
+                              max={0.45}
+                              step={0.01}
+                              value={emb.gpuMemoryUtilization}
+                              onChange={(e) => updateEmbedder(idx, { gpuMemoryUtilization: parseFloat(e.target.value) })}
+                              className="flex-1 h-1.5 rounded-full appearance-none bg-white/10 cursor-pointer accent-theme-accent"
+                            />
+                            <span className="text-[10px] font-mono theme-muted w-10 text-right">
+                              {Math.round(emb.gpuMemoryUtilization * 100)}%
+                            </span>
+                          </div>
                         </div>
                         {status !== "idle" && (
                           <div className="mt-2 text-[9px] font-mono theme-muted">

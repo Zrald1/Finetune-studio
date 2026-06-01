@@ -140,7 +140,7 @@ function autoTuneTeacherConfig(base: TeacherConfig, gpuStatus?: GPUState | null)
     maxModelLen,
     dtype: "bfloat16",
     tensorParallel: Math.max(base.tensorParallel || 1, 1),
-    gpuMemoryUtilization: 0.95,
+    gpuMemoryUtilization: 0.80,
     enableChunkedPrefill: true,
     maxNumBatchedTokens,
     maxNumSeqs,
@@ -998,12 +998,21 @@ function QdrantDbPanel({ config, onConfigChange }: { config: AppConfig; onConfig
     loadChunks(prevOffset);
   };
 
+  const reloadSelectedCollection = async () => {
+    if (!selectedCollection) return;
+    setCurrentOffset(null);
+    setOffsetsHistory([]);
+    await Promise.all([
+      loadSnapshots(selectedCollection),
+      loadChunks(null),
+    ]);
+  };
+
   useEffect(() => {
     if (selectedCollection && qdrantEndpoint) {
-      loadSnapshots(selectedCollection);
       setCurrentOffset(null);
       setOffsetsHistory([]);
-      loadChunks(null);
+      void reloadSelectedCollection();
     } else {
       setChunks([]);
       setNextOffset(null);
@@ -1018,7 +1027,7 @@ function QdrantDbPanel({ config, onConfigChange }: { config: AppConfig; onConfig
       const snap = await api.qdrantCreateSnapshot(qdCfg, selectedCollection);
       setStatus(`Snapshot saved: ${snap.name}`);
       setIsError(false);
-      await loadSnapshots();
+      await reloadSelectedCollection();
     } catch (e: any) {
       setStatus(e.message || String(e)); setIsError(true);
     } finally { setSaving(false); }
@@ -1037,7 +1046,7 @@ function QdrantDbPanel({ config, onConfigChange }: { config: AppConfig; onConfig
         setStatus(`Saved snapshots for all ${ok.length} collections.`);
         setIsError(false);
       }
-      await loadSnapshots();
+      await reloadSelectedCollection();
     } catch (e: any) {
       setStatus(e.message || "Failed to save all snapshots"); setIsError(true);
     } finally { setSavingAll(false); }
@@ -1049,7 +1058,7 @@ function QdrantDbPanel({ config, onConfigChange }: { config: AppConfig; onConfig
     try {
       const sel = await openFileDialog({
         multiple: false,
-        filters: [{ name: "Qdrant Snapshot", extensions: ["snapshot"] }]
+        filters: [{ name: "Qdrant Snapshot", extensions: ["snapshot", "tar"] }]
       });
       if (!sel) return;
       const snapshotPath = Array.isArray(sel) ? sel[0] : sel;
@@ -1062,7 +1071,7 @@ function QdrantDbPanel({ config, onConfigChange }: { config: AppConfig; onConfig
       await api.qdrantUploadSnapshot(qdCfg, selectedCollection, snapshotPath);
       setStatus(`Successfully uploaded and restored database from snapshot.`);
       setIsError(false);
-      await loadSnapshots();
+      await reloadSelectedCollection();
     } catch (e: any) {
       setStatus(e.message || String(e));
       setIsError(true);
@@ -1132,8 +1141,8 @@ function QdrantDbPanel({ config, onConfigChange }: { config: AppConfig; onConfig
           </select>
         </div>
         <div className="flex items-center gap-2">
-          <button onClick={() => loadSnapshots()} disabled={loading} className="p-2 rounded-lg bg-white/5 hover:bg-white/10 transition-all" title="Refresh">
-            <RefreshCw className={`w-3.5 h-3.5 ${loading ? "animate-spin" : ""} theme-muted`} />
+          <button onClick={reloadSelectedCollection} disabled={loading || loadingChunks} className="p-2 rounded-lg bg-white/5 hover:bg-white/10 transition-all" title="Refresh">
+            <RefreshCw className={`w-3.5 h-3.5 ${(loading || loadingChunks) ? "animate-spin" : ""} theme-muted`} />
           </button>
           <button
             onClick={downloadAllSnapshots}
@@ -1206,6 +1215,7 @@ function QdrantDbPanel({ config, onConfigChange }: { config: AppConfig; onConfig
                     setIsError(false);
                     await api.qdrantRestoreSnapshot(qdCfg, selectedCollection, s.name);
                     setStatus(`Restored: ${s.name}`);
+                    await reloadSelectedCollection();
                   } catch (e: any) { setStatus(e.message); setIsError(true); }
                 }} className="px-3 py-1.5 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-[9px] font-black uppercase hover:bg-emerald-500 hover:text-black transition-all">
                   Restore
@@ -1401,6 +1411,8 @@ setSetupAllLoading(true); setSetupAllError(null); setSetupAllLog([]);
       concurrency: 2,
       vectorDim: undefined,
       enabled: true,
+      persistent: embedders.length === 0,
+      gpuMemoryUtilization: 0.084,
     }];
     onConfigChange({ embedders: newEmbedders });
   };
@@ -1794,7 +1806,7 @@ function TeacherStep({
         <div className="grid grid-cols-2 sm:grid-cols-5 gap-4">
           <div className="space-y-2">
             <label className="text-[9px] uppercase tracking-[0.15em] theme-muted font-black ml-1">VRAM Util</label>
-            <input type="number" step="0.01" min="0.1" max="1" value={value.gpuMemoryUtilization ?? 0.95} onChange={(e) => set("gpuMemoryUtilization", Number(e.target.value))} disabled={managedDisabled} className="w-full px-4 py-3 premium-input rounded-xl text-[11px] font-black font-mono focus:outline-none" />
+            <input type="number" step="0.01" min="0.1" max="1" value={value.gpuMemoryUtilization ?? 0.80} onChange={(e) => set("gpuMemoryUtilization", Number(e.target.value))} disabled={managedDisabled} className="w-full px-4 py-3 premium-input rounded-xl text-[11px] font-black font-mono focus:outline-none" />
           </div>
           <div className="space-y-2">
             <label className="text-[9px] uppercase tracking-[0.15em] theme-muted font-black ml-1">Batch Tokens</label>
