@@ -618,7 +618,7 @@ __exec_logs__
 \`\`\`bash
 __exec_logs__ setup
 \`\`\`
-→ the boot/serving output for the teacher (vLLM/SGLang), embedder models, PaddleOCR, and Qdrant — i.e. the logs shown while a model is loading on the Credentials/Pipeline pages. \`__exec_logs__ setup 600\` for more lines.
+→ the boot/serving output for the teacher (vLLM), embedder models, PaddleOCR, and Qdrant — i.e. the logs shown while a model is loading on the Credentials/Pipeline pages. \`__exec_logs__ setup 600\` for more lines.
 
 3. **The live terminal console** (what the user sees in the right pane):
 \`\`\`bash

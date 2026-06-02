@@ -17,7 +17,7 @@ export interface QdrantConfig {
   collection: string;
 }
 
-export type ServingEngine = "vllm" | "sglang";
+export type ServingEngine = "vllm";
 
 export interface TeacherConfig {
   repoId: string;
@@ -56,6 +56,7 @@ export interface DigitalOceanConfig {
   dropletName: string;
   region: string;
   size: string;
+  hourlyRateUsd?: number | null;
   image: string;
   sshKeys: string;
   projectId: string;
@@ -148,6 +149,25 @@ export interface DigitalOceanDroplet {
   tags?: string[];
 }
 
+export interface DigitalOceanUsageRecord {
+  dropletId: number;
+  name: string;
+  sizeSlug: string;
+  region: string;
+  ipAddress: string;
+  status: string;
+  source: string;
+  hourlyRateUsd?: number | null;
+  localStartedAt: string;
+  lastSeenAt?: string | null;
+  localStoppedAt?: string | null;
+  durationSeconds: number;
+  durationHours: number;
+  durationHms: string;
+  localEstimatedCostUsd?: number | null;
+  costBasis: string;
+}
+
 export interface EmbedderConfig {
   name: string;
   modelId: string;
@@ -212,6 +232,7 @@ export const DEFAULT_DIGITAL_OCEAN: DigitalOceanConfig = {
   dropletName: "",
   region: "",
   size: "",
+  hourlyRateUsd: null,
   image: "220895104",
   sshKeys: "",
   projectId: "",
@@ -657,7 +678,7 @@ export const DEFAULT_TEACHER: TeacherConfig = {
   enableAutoToolChoice: false,
   toolCallParser: "",
   customServeCmd: "",
-  servingEngine: "sglang",
+  servingEngine: "vllm",
 };
 
 export interface IngestStream {

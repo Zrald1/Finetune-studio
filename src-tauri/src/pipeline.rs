@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::config::{AppConfig, DockerConfig, EmbedderConfig, TeacherConfig, ServingEngine};
+use crate::config::{AppConfig, DockerConfig, EmbedderConfig, TeacherConfig};
 use crate::error::{AppError, Result};
 use crate::generator::{self, GeneratedPair, GeneratorConfig};
 use crate::llamafactory;
@@ -593,23 +593,7 @@ async fn run_pipeline(
         None
     };
 
-    let mut docker_cfg = cfg.docker.clone();
-    let is_sglang = cfg.teacher.serving_engine == ServingEngine::Sglang;
-    if is_sglang {
-        docker_cfg.container_name = "rocm-sglang".to_string();
-        if !cfg.docker.image_name.contains("sglang") {
-            let mut tag = "v0.5.12-rocm720-mi35x"; // Default fallback
-            if let Some(ref gs) = gpu_state {
-                let name = gs.gpu_name.to_lowercase();
-                if name.contains("mi30") {
-                    tag = "v0.5.12-rocm720-mi30x";
-                } else if name.contains("mi35") {
-                    tag = "v0.5.12-rocm720-mi35x";
-                }
-            }
-            docker_cfg.image_name = format!("lmsysorg/sglang:{}", tag);
-        }
-    }
+    let docker_cfg = cfg.docker.clone();
     let mut container_name = docker_cfg.container_name.clone();
 
     // Hoisted flag: set during GPU cleanup, consumed by teacher boot (Phase 2).
@@ -1420,38 +1404,21 @@ else: print('NOT_FOUND')\
                     let extra_args = t.vllm_extra_args();
                     let runtime_prepare = t.vllm_runtime_prepare_cmd();
 
-                    let is_sgl = t.serving_engine == ServingEngine::Sglang;
-                    let serve_cmd_display = if is_sgl {
-                        let sgl_extra = t.sglang_extra_args();
-                        let sgl_tok = if tokenizer_arg.is_empty() { String::new() } else { tokenizer_arg.replace("--tokenizer ", "--tokenizer-path ") };
-                        format!(
-                            "HF_TOKEN=*** python3 -m sglang.launch_server --model-path {} --port {} --host 0.0.0.0 \
-                             --context-length {} --mem-fraction-static {} --tp {} {} {}\n",
-                            t.repo_id,
-                            port_to_check_inner,
-                            t.max_model_len,
-                            t.gpu_memory_utilization,
-                            t.tensor_parallel,
-                            sgl_tok,
-                            sgl_extra
-                        )
-                    } else {
-                        format!(
-                            "HF_TOKEN=*** vllm serve {} --port {} --host 0.0.0.0 \
-                             --max-model-len {} --dtype {} \
-                             --download-dir /root/hf-cache \
-                             --tensor-parallel-size {} --gpu-memory-utilization {} {} {}\n",
-                            t.repo_id,
-                            port_to_check_inner,
-                            t.max_model_len,
-                            t.dtype,
-                            t.tensor_parallel,
-                            t.gpu_memory_utilization,
-                            tokenizer_arg,
-                            extra_args
-                        )
-                    };
-                    emit_log(app, &run.id, &format!("[stage] booting teacher {}\n", if is_sgl { "SGLang" } else { "vLLM" }), "stage");
+                    let serve_cmd_display = format!(
+                        "HF_TOKEN=*** vllm serve {} --port {} --host 0.0.0.0 \
+                         --max-model-len {} --dtype {} \
+                         --download-dir /root/hf-cache \
+                         --tensor-parallel-size {} --gpu-memory-utilization {} {} {}\n",
+                        t.repo_id,
+                        port_to_check_inner,
+                        t.max_model_len,
+                        t.dtype,
+                        t.tensor_parallel,
+                        t.gpu_memory_utilization,
+                        tokenizer_arg,
+                        extra_args
+                    );
+                    emit_log(app, &run.id, "[stage] booting teacher vLLM\n", "stage");
                     emit_log(
                         app,
                         &run.id,
@@ -1460,98 +1427,50 @@ else: print('NOT_FOUND')\
                     );
 
                     if docker_cfg.enabled {
-                        let inner_cmd = if is_sgl {
-                            let sgl_extra = t.sglang_extra_args();
-                            let sgl_tok = if tokenizer_arg.is_empty() { String::new() } else { tokenizer_arg.replace("--tokenizer ", "--tokenizer-path ") };
-                            format!(
-                                "mkdir -p /root/hf-cache; \
-                                 mkdir -p $(dirname {teacher_log}); \
-                                 truncate -s 0 {teacher_log} 2>/dev/null || rm -f {teacher_log}; \
-                                 {env}{runtime_prepare}python3 -m sglang.launch_server --model-path {model} --port {port} --host 0.0.0.0 \
-                                    --context-length {mml} --mem-fraction-static {gpu_mem} --tp {tp} {tok_arg} {extra_args} \
-                                    > {log} 2>&1",
-                                teacher_log = teacher_log,
-                                env = vllm_env,
-                                runtime_prepare = runtime_prepare,
-                                model = t.repo_id,
-                                port = port_to_check_inner,
-                                mml = t.max_model_len,
-                                gpu_mem = t.gpu_memory_utilization,
-                                tp = t.tensor_parallel,
-                                tok_arg = sgl_tok,
-                                extra_args = sgl_extra,
-                                log = teacher_log,
-                            )
-                        } else {
-                            format!(
-                                "mkdir -p /root/hf-cache; \
-                                 mkdir -p $(dirname {teacher_log}); \
-                                 truncate -s 0 {teacher_log} 2>/dev/null || rm -f {teacher_log}; \
-                                 cd /app && {env}{runtime_prepare}vllm serve {model} --port {port} --host 0.0.0.0 \
-                                    --max-model-len {mml} --dtype {dtype} --download-dir /root/hf-cache \
-                                    --tensor-parallel-size {tp} --gpu-memory-utilization {gpu_mem} {tok_arg} {extra_args} \
-                                    > {log} 2>&1",
-                                teacher_log = teacher_log,
-                                env = vllm_env,
-                                runtime_prepare = runtime_prepare,
-                                model = t.repo_id,
-                                port = port_to_check_inner,
-                                mml = t.max_model_len,
-                                dtype = t.dtype,
-                                tp = t.tensor_parallel,
-                                gpu_mem = t.gpu_memory_utilization,
-                                tok_arg = tokenizer_arg,
-                                extra_args = extra_args,
-                                log = teacher_log,
-                            )
-                        };
+                        let inner_cmd = format!(
+                            "mkdir -p /root/hf-cache; \
+                             mkdir -p $(dirname {teacher_log}); \
+                             truncate -s 0 {teacher_log} 2>/dev/null || rm -f {teacher_log}; \
+                             cd /app && {env}{runtime_prepare}vllm serve {model} --port {port} --host 0.0.0.0 \
+                                --max-model-len {mml} --dtype {dtype} --download-dir /root/hf-cache \
+                                --tensor-parallel-size {tp} --gpu-memory-utilization {gpu_mem} {tok_arg} {extra_args} \
+                                > {log} 2>&1",
+                            teacher_log = teacher_log,
+                            env = vllm_env,
+                            runtime_prepare = runtime_prepare,
+                            model = t.repo_id,
+                            port = port_to_check_inner,
+                            mml = t.max_model_len,
+                            dtype = t.dtype,
+                            tp = t.tensor_parallel,
+                            gpu_mem = t.gpu_memory_utilization,
+                            tok_arg = tokenizer_arg,
+                            extra_args = extra_args,
+                            log = teacher_log,
+                        );
                         wrap_docker_cmd_detached(&inner_cmd, &container_name)
                     } else {
-                        if is_sgl {
-                            let sgl_extra = t.sglang_extra_args();
-                            let sgl_tok = if tokenizer_arg.is_empty() { String::new() } else { tokenizer_arg.replace("--tokenizer ", "--tokenizer-path ") };
-                            format!(
-                                "mkdir -p /root/hf-cache; \
-                                 truncate -s 0 {teacher_log} 2>/dev/null || rm -f {teacher_log}; \
-                                 nohup bash -lc '{env}{runtime_prepare}python3 -m sglang.launch_server --model-path {model} --port {port} --host 0.0.0.0 \
-                                    --context-length {mml} --mem-fraction-static {gpu_mem} --tp {tp} {tok_arg} {extra_args} \
-                                    > {log} 2>&1' < /dev/null & \
-                                 echo TEACHER_LAUNCHED",
-                                teacher_log = teacher_log,
-                                env = vllm_env,
-                                runtime_prepare = runtime_prepare,
-                                model = t.repo_id,
-                                port = port_to_check_inner,
-                                mml = t.max_model_len,
-                                gpu_mem = t.gpu_memory_utilization,
-                                tp = t.tensor_parallel,
-                                tok_arg = sgl_tok,
-                                extra_args = sgl_extra,
-                                log = teacher_log,
-                            )
-                        } else {
-                            format!(
-                                "mkdir -p /root/hf-cache; \
-                                 truncate -s 0 {teacher_log} 2>/dev/null || rm -f {teacher_log}; \
-                                 nohup bash -lc 'cd /app && {env}{runtime_prepare}vllm serve {model} --port {port} --host 0.0.0.0 \
-                                    --max-model-len {mml} --dtype {dtype} --download-dir /root/hf-cache \
-                                    --tensor-parallel-size {tp} --gpu-memory-utilization {gpu_mem} {tok_arg} {extra_args} \
-                                    > {log} 2>&1' < /dev/null & \
-                                 echo TEACHER_LAUNCHED",
-                                teacher_log = teacher_log,
-                                env = vllm_env,
-                                runtime_prepare = runtime_prepare,
-                                model = t.repo_id,
-                                port = port_to_check_inner,
-                                mml = t.max_model_len,
-                                dtype = t.dtype,
-                                tp = t.tensor_parallel,
-                                gpu_mem = t.gpu_memory_utilization,
-                                tok_arg = tokenizer_arg,
-                                extra_args = extra_args,
-                                log = teacher_log,
-                            )
-                        }
+                        format!(
+                            "mkdir -p /root/hf-cache; \
+                             truncate -s 0 {teacher_log} 2>/dev/null || rm -f {teacher_log}; \
+                             nohup bash -lc 'cd /app && {env}{runtime_prepare}vllm serve {model} --port {port} --host 0.0.0.0 \
+                                --max-model-len {mml} --dtype {dtype} --download-dir /root/hf-cache \
+                                --tensor-parallel-size {tp} --gpu-memory-utilization {gpu_mem} {tok_arg} {extra_args} \
+                                > {log} 2>&1' < /dev/null & \
+                             echo TEACHER_LAUNCHED",
+                            teacher_log = teacher_log,
+                            env = vllm_env,
+                            runtime_prepare = runtime_prepare,
+                            model = t.repo_id,
+                            port = port_to_check_inner,
+                            mml = t.max_model_len,
+                            dtype = t.dtype,
+                            tp = t.tensor_parallel,
+                            gpu_mem = t.gpu_memory_utilization,
+                            tok_arg = tokenizer_arg,
+                            extra_args = extra_args,
+                            log = teacher_log,
+                        )
                     }
                 };
 
@@ -1615,8 +1534,7 @@ else: print('NOT_FOUND')\
                             || lower.contains("hip out of memory")
                             || lower.contains("outofmemoryerror")
                         {
-                            let is_sgl = t.serving_engine == ServingEngine::Sglang;
-                            let engine_name = if is_sgl { "SGLang" } else { "vLLM" };
+                            let engine_name = "vLLM";
                             let err_msg = if lower.contains("out of memory") || lower.contains("hip out of memory") || lower.contains("outofmemoryerror") {
                                 format!(
                                     "{} crashed during startup with an Out Of Memory (OOM) error. \

@@ -72,7 +72,7 @@ export default function App() {
           ssh: { ...DEFAULT_CONFIG.ssh, ...(loaded.ssh ?? {}) },
           qdrant: { ...DEFAULT_CONFIG.qdrant, ...(loaded.qdrant ?? {}) },
           digitalOcean: { ...DEFAULT_DIGITAL_OCEAN, ...(loaded.digitalOcean ?? {}) },
-          teacher: { ...DEFAULT_TEACHER, ...(loaded.teacher ?? {}) },
+          teacher: { ...DEFAULT_TEACHER, ...(loaded.teacher ?? {}), servingEngine: "vllm" as const },
           student: { ...DEFAULT_CONFIG.student, ...(loaded.student ?? {}) },
           docker: { ...DEFAULT_CONFIG.docker, ...(loaded.docker ?? {}) },
           aiAgent: { ...DEFAULT_AI_AGENT, ...(loaded.aiAgent ?? {}) },

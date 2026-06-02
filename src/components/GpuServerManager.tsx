@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   AppConfig,
   DigitalOceanAccount,
@@ -7,10 +7,11 @@ import type {
   DigitalOceanProject,
   DigitalOceanSize,
   DigitalOceanSshKey,
+  DigitalOceanUsageRecord,
 } from "../types";
 import { DEFAULT_DIGITAL_OCEAN } from "../types";
 import { api } from "../lib/tauri";
-import { CheckCircle2, Cloud, Cpu, Loader2, Radar, RefreshCw, Server, Trash2, Zap } from "lucide-react";
+import { CheckCircle2, Clock3, Cloud, Cpu, DollarSign, Download, FileSpreadsheet, Loader2, Radar, RefreshCw, Server, Trash2, Zap } from "lucide-react";
 
 interface ImageOption {
   value: string;
@@ -26,7 +27,6 @@ const QUICK_START_IMAGES: ImageOption[] = [
   { value: "220895104", label: "ROCm Software | ROCm 7.2" },
   { value: "201932560", label: "OpenAI GPT OSS | ROCm 7.0, vLLM 0.9.2" },
   { value: "221160341", label: "vLLM | vLLM 0.17.1, ROCm 7.2.0" },
-  { value: "221157360", label: "SGLang | SGLang 0.5.9, ROCm 7.0.0" },
   { value: "201616009", label: "PyTorch | PyTorch 2.6.0, ROCm 7.0.0" },
   { value: "201813315", label: "Megatron | Megatron-LM 0.10.0, ROCm 7.0" },
   { value: "194144121", label: "JAX | JAX 0.4.35, ROCm 6.4.2" },
@@ -84,6 +84,52 @@ function customGpuSize(slug: string): DigitalOceanSize | undefined {
   };
 }
 
+function validHourlyRate(rate: number | null | undefined): rate is number {
+  return typeof rate === "number" && Number.isFinite(rate) && rate > 0;
+}
+
+function knownHourlyRate(slug: string) {
+  const normalized = slug.trim().replace(/-devcloud$/i, "");
+  const rates: Record<string, number> = {
+    "gpu-mi300x1-192gb": 1.99,
+    "gpu-mi300x8-1536gb": 15.92,
+    "gpu-mi325x1-256gb": 2.29,
+    "gpu-mi325x8-2048gb": 18.32,
+    "gpu-mi350x1-288gb": 4.4,
+    "gpu-mi350x8-2304gb": 35.2,
+  };
+  return rates[normalized] ?? null;
+}
+
+function usageDurationSeconds(record: DigitalOceanUsageRecord, nowMs: number) {
+  const started = Date.parse(record.localStartedAt);
+  if (!Number.isFinite(started)) return Math.max(0, Math.floor(record.durationSeconds || 0));
+  const stopped = record.localStoppedAt ? Date.parse(record.localStoppedAt) : nowMs;
+  const end = Number.isFinite(stopped) ? stopped : nowMs;
+  return Math.max(0, Math.floor((end - started) / 1000));
+}
+
+function formatDuration(totalSeconds: number) {
+  const seconds = Math.max(0, Math.floor(totalSeconds));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = seconds % 60;
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+}
+
+function formatUsd(value: number | null | undefined, fallback = "Rate needed") {
+  if (!validHourlyRate(value) && (typeof value !== "number" || !Number.isFinite(value))) return fallback;
+  const amount = value ?? 0;
+  return `$${amount.toFixed(Math.abs(amount) < 1 ? 4 : 2)}`;
+}
+
+function formatUsageDate(raw?: string | null) {
+  if (!raw) return "Active";
+  const date = new Date(raw);
+  if (Number.isNaN(date.getTime())) return raw;
+  return date.toLocaleString();
+}
+
 export default function GpuServerManager({ config, onConfigChange }: Props) {
   const digitalOcean = { ...DEFAULT_DIGITAL_OCEAN, ...(config.digitalOcean ?? {}) };
   const [sizes, setSizes] = useState<DigitalOceanSize[]>([]);
@@ -92,9 +138,13 @@ export default function GpuServerManager({ config, onConfigChange }: Props) {
   const [projects, setProjects] = useState<DigitalOceanProject[]>([]);
   const [droplets, setDroplets] = useState<DigitalOceanDroplet[]>([]);
   const [account, setAccount] = useState<DigitalOceanAccount | null>(null);
+  const [usageRecords, setUsageRecords] = useState<DigitalOceanUsageRecord[]>([]);
+  const [usageCsvPath, setUsageCsvPath] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [exportingUsage, setExportingUsage] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [usageNow, setUsageNow] = useState(() => Date.now());
   // Name of the droplet currently being polled for ("detected and running"),
   // or null when no detection loop is active. The loop runs constantly until
   // the server is detected, then stops on its own.
@@ -103,6 +153,11 @@ export default function GpuServerManager({ config, onConfigChange }: Props) {
   const [toast, setToast] = useState<string | null>(null);
   const detectTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const refreshUsage = useCallback(async () => {
+    const nextUsage = await api.doListDropletUsage();
+    setUsageRecords(nextUsage);
+  }, []);
 
   const visibleImages = useMemo(() => {
     const seen = new Set<string>();
@@ -130,6 +185,39 @@ export default function GpuServerManager({ config, onConfigChange }: Props) {
   }, [sizes]);
 
   const gpuDroplets = droplets;
+
+  const selectedSize = useMemo(
+    () => sizes.find((size) => size.slug === digitalOcean.size) || customGpuSize(digitalOcean.size),
+    [digitalOcean.size, sizes],
+  );
+
+  const selectedHourlyRate = validHourlyRate(digitalOcean.hourlyRateUsd)
+    ? digitalOcean.hourlyRateUsd
+    : selectedSize?.priceHourly ?? knownHourlyRate(digitalOcean.size);
+
+  const usageByDroplet = useMemo(() => {
+    const byId = new Map<number, DigitalOceanUsageRecord>();
+    for (const record of usageRecords) {
+      byId.set(record.dropletId, record);
+    }
+    return byId;
+  }, [usageRecords]);
+
+  const usageTotals = useMemo(() => {
+    let totalSeconds = 0;
+    let totalCost = 0;
+    let hasUnknownCost = false;
+    for (const record of usageRecords) {
+      const seconds = usageDurationSeconds(record, usageNow);
+      totalSeconds += seconds;
+      if (validHourlyRate(record.hourlyRateUsd)) {
+        totalCost += (seconds / 3600) * record.hourlyRateUsd;
+      } else {
+        hasUnknownCost = true;
+      }
+    }
+    return { totalSeconds, totalCost, hasUnknownCost };
+  }, [usageNow, usageRecords]);
 
   const selectedProject = useMemo(
     () => projects.find((project) => project.id === digitalOcean.projectId),
@@ -177,13 +265,18 @@ export default function GpuServerManager({ config, onConfigChange }: Props) {
       const nextProject = nextProjects.find((project) => project.id === digitalOcean.projectId)
         ? digitalOcean.projectId
         : nextProjects.find((project) => project.isDefault)?.id || nextProjects[0]?.id || "";
+      const nextHourlyRate = validHourlyRate(digitalOcean.hourlyRateUsd)
+        ? digitalOcean.hourlyRateUsd
+        : nextSize?.priceHourly ?? knownHourlyRate(nextSize?.slug || digitalOcean.size);
       patchDigitalOcean({
         size: nextSize?.slug || digitalOcean.size,
+        hourlyRateUsd: nextHourlyRate,
         region: digitalOcean.region,
         image: nextImage ? ("value" in nextImage ? nextImage.value : imageValue(nextImage)) : digitalOcean.image,
         sshKeys: digitalOcean.sshKeys || nextKeys[0]?.id?.toString() || "",
         projectId: nextProject,
       });
+      await refreshUsage();
       setMessage(`Loaded DigitalOcean data: ${nextSizes.length} AMD GPU plans, ${nextImages.length} ROCm images, ${nextKeys.length} SSH keys, and ${nextDroplets.length} GPU droplets.`);
     } catch (e: any) {
       setMessage(String(e));
@@ -197,6 +290,15 @@ export default function GpuServerManager({ config, onConfigChange }: Props) {
       sync();
     }
   }, [digitalOcean.apiKey]);
+
+  useEffect(() => {
+    void refreshUsage();
+  }, [refreshUsage]);
+
+  useEffect(() => {
+    const timer = setInterval(() => setUsageNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
 
   const stopDetecting = () => {
     if (detectTimer.current) {
@@ -217,6 +319,7 @@ export default function GpuServerManager({ config, onConfigChange }: Props) {
       try {
         const next = await api.doListGpuDroplets(digitalOcean);
         setDroplets(next);
+        await refreshUsage();
         const found = next.find((d) => d.name === name);
         if (found && dropletReady(found)) {
           stopDetecting();
@@ -256,9 +359,10 @@ export default function GpuServerManager({ config, onConfigChange }: Props) {
     setCreating(true);
     setMessage(null);
     try {
-      const droplet = await api.doCreateGpuDroplet(digitalOcean);
+      const droplet = await api.doCreateGpuDroplet({ ...digitalOcean, hourlyRateUsd: selectedHourlyRate });
       setMessage(`Created ${droplet.name}. Detecting the GPU server — this runs until it is online.`);
       await sync();
+      await refreshUsage();
       // Kick off the constant detection loop; it stops once the server is up.
       startDetecting(droplet.name);
     } catch (e: any) {
@@ -278,10 +382,26 @@ export default function GpuServerManager({ config, onConfigChange }: Props) {
       if (detecting === droplet.name) stopDetecting();
       setMessage(`Delete requested for ${droplet.name}.`);
       await sync();
+      await refreshUsage();
     } catch (e: any) {
       setMessage(String(e));
     } finally {
       setLoading(false);
+    }
+  };
+
+  const exportUsageCsv = async () => {
+    setExportingUsage(true);
+    setMessage(null);
+    try {
+      const path = await api.doExportDropletUsageCsv();
+      setUsageCsvPath(path);
+      await refreshUsage();
+      setMessage(`Usage CSV saved: ${path}`);
+    } catch (e: any) {
+      setMessage(String(e));
+    } finally {
+      setExportingUsage(false);
     }
   };
 
@@ -293,7 +413,7 @@ export default function GpuServerManager({ config, onConfigChange }: Props) {
     showToast(`✓ Now using ${droplet.name} — ${ip}`);
   };
 
-  const canCreate = !!digitalOcean.apiKey && !!digitalOcean.dropletName && !!digitalOcean.size && !!digitalOcean.image && selectedSshKeys.length > 0;
+  const canCreate = !!digitalOcean.apiKey && !!digitalOcean.dropletName && !!digitalOcean.size && !!digitalOcean.image && selectedSshKeys.length > 0 && validHourlyRate(selectedHourlyRate);
 
   return (
     <div className="premium-card rounded-2xl animate-premium overflow-hidden">
@@ -344,7 +464,10 @@ export default function GpuServerManager({ config, onConfigChange }: Props) {
                     key={size.slug}
                     type="button"
                     onClick={() => {
-                      patchDigitalOcean({ size: size.slug });
+                      patchDigitalOcean({
+                        size: size.slug,
+                        hourlyRateUsd: validHourlyRate(size.priceHourly) ? size.priceHourly : digitalOcean.hourlyRateUsd,
+                      });
                     }}
                     className={`text-left rounded-2xl border p-5 transition-all premium-button ${digitalOcean.size === size.slug ? "theme-accent-soft theme-accent border-theme-accent/40" : "border-white/5 bg-white/[0.015] theme-muted hover:theme-text"}`}
                   >
@@ -386,6 +509,22 @@ export default function GpuServerManager({ config, onConfigChange }: Props) {
               <div className="space-y-2 sm:col-span-2">
                 <label className="text-[10px] uppercase tracking-widest theme-muted font-black ml-1">GPU Size Slug</label>
                 <input value={digitalOcean.size} onChange={(e) => patchDigitalOcean({ size: e.target.value })} placeholder="gpu-mi...-contracted" className="w-full px-4 py-3 premium-input rounded-xl text-sm-fluid font-mono focus:outline-none" />
+              </div>
+              <div className="space-y-2 sm:col-span-2">
+                <label className="text-[10px] uppercase tracking-widest theme-muted font-black ml-1">Local Hourly USD</label>
+                <input
+                  type="number"
+                  min="0"
+                  step="0.0001"
+                  value={digitalOcean.hourlyRateUsd ?? ""}
+                  onChange={(e) => {
+                    const raw = e.target.value.trim();
+                    const value = Number(raw);
+                    patchDigitalOcean({ hourlyRateUsd: raw && Number.isFinite(value) && value > 0 ? value : null });
+                  }}
+                  placeholder={validHourlyRate(selectedHourlyRate) ? selectedHourlyRate.toFixed(4) : "0.0000"}
+                  className="w-full px-4 py-3 premium-input rounded-xl text-sm-fluid font-mono focus:outline-none"
+                />
               </div>
               <div className="space-y-2 sm:col-span-2">
                 <label className="text-[10px] uppercase tracking-widest theme-muted font-black ml-1">Region Slug</label>
@@ -459,6 +598,11 @@ export default function GpuServerManager({ config, onConfigChange }: Props) {
               ) : gpuDroplets.map((droplet) => {
                 const ip = publicIp(droplet);
                 const ready = dropletReady(droplet);
+                const usage = usageByDroplet.get(droplet.id);
+                const usageSeconds = usage ? usageDurationSeconds(usage, usageNow) : null;
+                const usageCost = usage && usageSeconds !== null && validHourlyRate(usage.hourlyRateUsd)
+                  ? (usageSeconds / 3600) * usage.hourlyRateUsd
+                  : null;
                 return (
                   <div key={droplet.id} className="p-4 border-b border-white/5 last:border-b-0 flex flex-col sm:flex-row gap-4 sm:items-center justify-between">
                     <div>
@@ -475,6 +619,18 @@ export default function GpuServerManager({ config, onConfigChange }: Props) {
                         )}
                       </div>
                       <div className="text-[10px] theme-muted font-mono uppercase mt-1">#{droplet.id} | {droplet.status} | {droplet.sizeSlug || "unknown"} | {ip || "IP pending"}</div>
+                      {usage && usageSeconds !== null && (
+                        <div className="mt-2 flex flex-wrap gap-2 text-[10px] font-mono uppercase tracking-widest">
+                          <span className="inline-flex items-center gap-1 rounded-full border border-white/5 bg-white/[0.03] px-2 py-1 theme-muted">
+                            <Clock3 className="w-3 h-3 theme-accent" />
+                            {formatDuration(usageSeconds)}
+                          </span>
+                          <span className="inline-flex items-center gap-1 rounded-full border border-white/5 bg-white/[0.03] px-2 py-1 theme-muted">
+                            <DollarSign className="w-3 h-3 theme-accent" />
+                            {formatUsd(usageCost)}
+                          </span>
+                        </div>
+                      )}
                     </div>
                     <div className="flex gap-2">
                       <button
@@ -501,6 +657,88 @@ export default function GpuServerManager({ config, onConfigChange }: Props) {
               })}
             </div>
           </div>
+        </div>
+
+        <div className="space-y-4">
+          <div className="flex flex-col gap-4 border-t border-white/5 pt-6 lg:flex-row lg:items-center lg:justify-between">
+            <div className="flex items-center gap-3">
+              <FileSpreadsheet className="w-5 h-5 theme-accent" />
+              <div>
+                <h3 className="text-base-fluid text-white font-black">Local Usage CSV</h3>
+                <p className="text-[10px] uppercase tracking-widest theme-muted font-mono mt-1">Local timestamps only | Provider usage API disabled</p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={exportUsageCsv}
+              disabled={exportingUsage}
+              className="premium-button px-4 py-2 rounded-lg border border-theme-accent/40 theme-accent-soft theme-accent text-[9px] uppercase tracking-widest font-black disabled:opacity-30 flex items-center justify-center gap-2"
+            >
+              {exportingUsage ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
+              Export CSV
+            </button>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div className="rounded-xl border border-white/5 bg-white/[0.015] px-4 py-3">
+              <div className="text-[9px] uppercase tracking-widest theme-muted font-black">Droplets Tracked</div>
+              <div className="mt-2 text-xl font-black text-white font-mono">{usageRecords.length}</div>
+            </div>
+            <div className="rounded-xl border border-white/5 bg-white/[0.015] px-4 py-3">
+              <div className="text-[9px] uppercase tracking-widest theme-muted font-black">Total Duration</div>
+              <div className="mt-2 text-xl font-black text-white font-mono">{formatDuration(usageTotals.totalSeconds)}</div>
+            </div>
+            <div className="rounded-xl border border-white/5 bg-white/[0.015] px-4 py-3">
+              <div className="text-[9px] uppercase tracking-widest theme-muted font-black">Total Local Cost</div>
+              <div className="mt-2 text-xl font-black text-white font-mono">{usageTotals.hasUnknownCost ? "Rate needed" : formatUsd(usageTotals.totalCost, "$0.0000")}</div>
+            </div>
+          </div>
+
+          <div className="rounded-2xl border border-white/5 overflow-hidden bg-black/10">
+            {usageRecords.length === 0 ? (
+              <div className="p-8 text-center theme-muted font-serif italic">No local droplet usage recorded yet.</div>
+            ) : usageRecords.map((record) => {
+              const seconds = usageDurationSeconds(record, usageNow);
+              const cost = validHourlyRate(record.hourlyRateUsd) ? (seconds / 3600) * record.hourlyRateUsd : null;
+              const active = !record.localStoppedAt;
+              return (
+                <div key={`${record.dropletId}-${record.localStartedAt}`} className="p-4 border-b border-white/5 last:border-b-0 grid grid-cols-1 lg:grid-cols-[1fr_auto_auto_auto] gap-3 lg:items-center">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-white font-black truncate">{record.name || `Droplet ${record.dropletId}`}</span>
+                      <span className={`inline-flex rounded-full border px-2 py-0.5 text-[8px] uppercase tracking-widest font-black ${active ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300" : "border-white/10 bg-white/[0.03] theme-muted"}`}>
+                        {active ? "Active" : record.status}
+                      </span>
+                    </div>
+                    <div className="text-[10px] theme-muted font-mono uppercase mt-1">
+                      #{record.dropletId} | {record.sizeSlug || "unknown"} | {record.region || "region unknown"} | {record.ipAddress || "IP unknown"}
+                    </div>
+                    <div className="text-[10px] theme-muted font-mono mt-1">
+                      {formatUsageDate(record.localStartedAt)} to {formatUsageDate(record.localStoppedAt)}
+                    </div>
+                  </div>
+                  <div className="text-[10px] uppercase tracking-widest font-mono theme-muted lg:text-right">
+                    <span className="block opacity-70">Duration</span>
+                    <span className="block mt-1 text-white font-black">{formatDuration(seconds)}</span>
+                  </div>
+                  <div className="text-[10px] uppercase tracking-widest font-mono theme-muted lg:text-right">
+                    <span className="block opacity-70">Hourly</span>
+                    <span className="block mt-1 text-white font-black">{formatUsd(record.hourlyRateUsd)}</span>
+                  </div>
+                  <div className="text-[10px] uppercase tracking-widest font-mono theme-muted lg:text-right">
+                    <span className="block opacity-70">Cost</span>
+                    <span className="block mt-1 text-white font-black">{formatUsd(cost)}</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {usageCsvPath && (
+            <div className="text-[10px] theme-muted font-mono truncate" title={usageCsvPath}>
+              CSV: {usageCsvPath}
+            </div>
+          )}
         </div>
 
         {message && (

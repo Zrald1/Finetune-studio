@@ -2,6 +2,7 @@
 
 mod config;
 mod digitalocean;
+mod droplet_usage;
 mod error;
 mod generator;
 mod guides;
@@ -14,7 +15,7 @@ mod runs;
 mod serve;
 mod ssh;
 
-use crate::config::{AppConfig, DigitalOceanConfig, QdrantConfig, SshConfig, DockerConfig, TeacherConfig, EmbedderConfig, ServingEngine};
+use crate::config::{AppConfig, DigitalOceanConfig, QdrantConfig, SshConfig, DockerConfig, TeacherConfig, EmbedderConfig};
 use crate::error::{AppError, Result};
 use crate::pipeline::{PipelineRegistry, RunConfig};
 use crate::qdrant::Chunk;
@@ -122,6 +123,16 @@ async fn do_create_gpu_droplet(cfg: DigitalOceanConfig) -> Result<digitalocean::
 #[tauri::command]
 async fn do_destroy_droplet(cfg: DigitalOceanConfig, droplet_id: u64) -> Result<()> {
     digitalocean::destroy_droplet(&cfg, droplet_id).await
+}
+
+#[tauri::command]
+async fn do_list_droplet_usage() -> Result<Vec<droplet_usage::DropletUsageSummary>> {
+    droplet_usage::list_summaries()
+}
+
+#[tauri::command]
+async fn do_export_droplet_usage_csv() -> Result<String> {
+    droplet_usage::export_csv()
 }
 
 // ── ssh commands ───────────────────────────────────────────────────────────
@@ -992,22 +1003,7 @@ async fn check_teacher_deployed(
         Err(_) => return Ok(None),
     };
 
-    let mut docker_cfg = docker.clone();
-    if teacher.serving_engine == ServingEngine::Sglang {
-        docker_cfg.container_name = "rocm-sglang".to_string();
-        if !docker.image_name.contains("sglang") {
-            let mut tag = "v0.5.12-rocm720-mi35x"; // Default fallback
-            if let Ok(gs) = ssh::nvidia_smi(&session).await {
-                let name = gs.gpu_name.to_lowercase();
-                if name.contains("mi30") {
-                    tag = "v0.5.12-rocm720-mi30x";
-                } else if name.contains("mi35") {
-                    tag = "v0.5.12-rocm720-mi35x";
-                }
-            }
-            docker_cfg.image_name = format!("lmsysorg/sglang:{}", tag);
-        }
-    }
+    let docker_cfg = docker.clone();
 
     let (model_to_check, port_to_check) = if let Some(ref cmd) = teacher.custom_serve_cmd.as_ref().filter(|s| !s.is_empty()) {
         pipeline::extract_model_and_port(cmd, &teacher.repo_id, teacher.vllm_port)
@@ -1227,22 +1223,7 @@ async fn run_deploy_teacher_task(
             }));
         }
     }
-    let mut docker_cfg = docker.clone();
-    if teacher.serving_engine == ServingEngine::Sglang {
-        docker_cfg.container_name = "rocm-sglang".to_string();
-        if !docker.image_name.contains("sglang") {
-            let mut tag = "v0.5.12-rocm720-mi35x"; // Default fallback
-            if let Some(ref gs) = gpu_state {
-                let name = gs.gpu_name.to_lowercase();
-                if name.contains("mi30") {
-                    tag = "v0.5.12-rocm720-mi30x";
-                } else if name.contains("mi35") {
-                    tag = "v0.5.12-rocm720-mi35x";
-                }
-            }
-            docker_cfg.image_name = format!("lmsysorg/sglang:{}", tag);
-        }
-    }
+    let docker_cfg = docker.clone();
     let mut container_name = docker_cfg.container_name.clone();
 
     if docker_cfg.enabled {
@@ -1555,41 +1536,24 @@ async fn run_deploy_teacher_task(
         let extra_args = teacher.vllm_extra_args();
         let runtime_prepare = teacher.vllm_runtime_prepare_cmd();
 
-        let is_sgl = teacher.serving_engine == ServingEngine::Sglang;
-        let serve_cmd_display = if is_sgl {
-            let sgl_extra = teacher.sglang_extra_args();
-            let sgl_tok = if tokenizer_arg.is_empty() { String::new() } else { tokenizer_arg.replace("--tokenizer ", "--tokenizer-path ") };
-            format!(
-                "HF_TOKEN=*** python3 -m sglang.launch_server --model-path {} --port {} --host 0.0.0.0 \
-                 --context-length {} --mem-fraction-static {} --tp {} {} {}\n",
-                teacher.repo_id,
-                port_to_check,
-                teacher.max_model_len,
-                teacher.gpu_memory_utilization,
-                teacher.tensor_parallel,
-                sgl_tok,
-                sgl_extra
-            )
-        } else {
-            format!(
-                "HF_TOKEN=*** vllm serve {} --port {} --host 0.0.0.0 \
-                 --max-model-len {} --dtype {} \
-                 --download-dir /root/hf-cache \
-                 --tensor-parallel-size {} --gpu-memory-utilization {} {} {}\n",
-                teacher.repo_id,
-                port_to_check,
-                teacher.max_model_len,
-                teacher.dtype,
-                teacher.tensor_parallel,
-                teacher.gpu_memory_utilization,
-                tokenizer_arg,
-                extra_args
-            )
-        };
+        let serve_cmd_display = format!(
+            "HF_TOKEN=*** vllm serve {} --port {} --host 0.0.0.0 \
+             --max-model-len {} --dtype {} \
+             --download-dir /root/hf-cache \
+             --tensor-parallel-size {} --gpu-memory-utilization {} {} {}\n",
+            teacher.repo_id,
+            port_to_check,
+            teacher.max_model_len,
+            teacher.dtype,
+            teacher.tensor_parallel,
+            teacher.gpu_memory_utilization,
+            tokenizer_arg,
+            extra_args
+        );
         let _ = app.emit("deploy://log", serde_json::json!({
             "streamId": id,
             "kind": "info",
-            "line": format!("[stage] booting teacher {}\n", if is_sgl { "SGLang" } else { "vLLM" })
+            "line": "[stage] booting teacher vLLM\n"
         }));
         let _ = app.emit("deploy://log", serde_json::json!({
             "streamId": id,
@@ -1597,39 +1561,21 @@ async fn run_deploy_teacher_task(
             "line": format!("[cmd] {}\n", serve_cmd_display)
         }));
 
-        let serve_cmd_inner = if is_sgl {
-            let sgl_extra = teacher.sglang_extra_args();
-            let sgl_tok = if tokenizer_arg.is_empty() { String::new() } else { tokenizer_arg.replace("--tokenizer ", "--tokenizer-path ") };
-            format!(
-                "{env}{runtime_prepare}python3 -m sglang.launch_server --model-path {model} --port {port} --host 0.0.0.0 \
-                   --context-length {mml} --mem-fraction-static {gpu_mem} --tp {tp} {tok_arg} {extra_args}",
-                env = vllm_env,
-                runtime_prepare = runtime_prepare,
-                model = teacher.repo_id,
-                port = port_to_check,
-                mml = teacher.max_model_len,
-                gpu_mem = teacher.gpu_memory_utilization,
-                tp = teacher.tensor_parallel,
-                tok_arg = sgl_tok,
-                extra_args = sgl_extra,
-            )
-        } else {
-            format!(
-                "cd /app && {env}{runtime_prepare}vllm serve {model} --port {port} --host 0.0.0.0 \
-                   --max-model-len {mml} --dtype {dtype} --download-dir /root/hf-cache \
-                   --tensor-parallel-size {tp} --gpu-memory-utilization {gpu_mem} {tok_arg} {extra_args}",
-                env = vllm_env,
-                runtime_prepare = runtime_prepare,
-                model = teacher.repo_id,
-                port = port_to_check,
-                mml = teacher.max_model_len,
-                dtype = teacher.dtype,
-                tp = teacher.tensor_parallel,
-                gpu_mem = teacher.gpu_memory_utilization,
-                tok_arg = tokenizer_arg,
-                extra_args = extra_args,
-            )
-        };
+        let serve_cmd_inner = format!(
+            "cd /app && {env}{runtime_prepare}vllm serve {model} --port {port} --host 0.0.0.0 \
+               --max-model-len {mml} --dtype {dtype} --download-dir /root/hf-cache \
+               --tensor-parallel-size {tp} --gpu-memory-utilization {gpu_mem} {tok_arg} {extra_args}",
+            env = vllm_env,
+            runtime_prepare = runtime_prepare,
+            model = teacher.repo_id,
+            port = port_to_check,
+            mml = teacher.max_model_len,
+            dtype = teacher.dtype,
+            tp = teacher.tensor_parallel,
+            gpu_mem = teacher.gpu_memory_utilization,
+            tok_arg = tokenizer_arg,
+            extra_args = extra_args,
+        );
 
         if docker_cfg.enabled {
             // Foreground docker exec with nohup inside so we can detect
@@ -1819,8 +1765,7 @@ async fn run_deploy_teacher_task(
                     }));
                 }
                 let lower = log_chunk.to_lowercase();
-                let is_sgl = teacher.serving_engine == ServingEngine::Sglang;
-                let engine_name = if is_sgl { "SGLang" } else { "vLLM" };
+                let engine_name = "vLLM";
                 if lower.contains("traceback")
                     || lower.contains("validationerror")
                     || lower.contains("does not recognize this architecture")
@@ -2776,6 +2721,8 @@ fn main() {
             do_get_account,
             do_create_gpu_droplet,
             do_destroy_droplet,
+            do_list_droplet_usage,
+            do_export_droplet_usage_csv,
             test_ssh,
             nvidia_smi,
             ssh_exec_stream,

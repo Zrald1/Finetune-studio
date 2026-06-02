@@ -146,6 +146,7 @@ function autoTuneTeacherConfig(base: TeacherConfig, gpuStatus?: GPUState | null)
     maxNumSeqs,
     enableAutoToolChoice: isQwen3,
     toolCallParser: isQwen3 ? "qwen3_coder" : "",
+    servingEngine: "vllm",
   };
 }
 
@@ -1731,13 +1732,12 @@ function TeacherStep({
             <label className="text-[10px] uppercase tracking-widest theme-muted font-black ml-1">Serving Engine</label>
             <div className="relative">
               <select
-                value={value.servingEngine || "vllm"}
-                onChange={(e) => set("servingEngine", e.target.value as any)}
-                disabled={!!value.customServeCmd}
-                className="w-full px-4 py-3.5 premium-input rounded-xl text-sm-fluid font-black font-mono text-white focus:outline-none shadow-inner appearance-none cursor-pointer"
+                value="vllm"
+                onChange={() => set("servingEngine", "vllm")}
+                disabled
+                className="w-full px-4 py-3.5 premium-input rounded-xl text-sm-fluid font-black font-mono text-white focus:outline-none shadow-inner appearance-none opacity-80"
               >
                 <option className={OPTION_CLASS} value="vllm">vLLM (Default)</option>
-                <option className={OPTION_CLASS} value="sglang">SGLang (Optimized for DeepSeek)</option>
               </select>
               <ChevronRight className="absolute right-4 top-1/2 -translate-y-1/2 w-4 h-4 rotate-90 pointer-events-none theme-faint opacity-50" />
             </div>

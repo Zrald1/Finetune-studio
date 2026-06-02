@@ -216,6 +216,11 @@ No code changes are needed for new domains, models, or datasets.
 - **Remote ML:** vLLM (teacher serving), LLaMA-Factory (LoRA training), Hugging Face Hub
 
 ---
+## About
+
+Fine-Tune Model is a desktop fine-tuning workspace for building LoRA adapters from a knowledge base. The main app, Fine-Tune Studio, is a Tauri 2 desktop application that orchestrates Qdrant retrieval, vLLM teacher serving, JSONL dataset generation, LLaMA-Factory training, and adapter output on a remote GPU droplet over SSH.
+
+The local machine stays lightweight while the GPU server handles model serving and training. The app also records local droplet usage time and estimated cost without relying on provider usage reports.
 
 ## License
 

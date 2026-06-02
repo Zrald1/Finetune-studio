@@ -172,7 +172,7 @@ impl Default for TeacherConfig {
             enable_auto_tool_choice: false,
             tool_call_parser: None,
             custom_serve_cmd: None,
-            serving_engine: ServingEngine::Sglang,
+            serving_engine: ServingEngine::Vllm,
         }
     }
 }
@@ -180,6 +180,7 @@ impl Default for TeacherConfig {
 impl TeacherConfig {
     pub fn resolved_for_gpu(&self, gpu_memory_total_mb: Option<f64>) -> Self {
         let mut resolved = self.clone();
+        resolved.serving_engine = ServingEngine::Vllm;
         if !resolved.auto_tune
             || resolved
                 .custom_serve_cmd
@@ -265,15 +266,6 @@ impl TeacherConfig {
         "python3 -c \"from transformers.models.auto.configuration_auto import CONFIG_MAPPING; import sys; sys.exit(0 if \\\"deepseek_v4\\\" in CONFIG_MAPPING else 1)\" || { echo [compat] installing Transformers with DeepSeek V4 support; python3 -m pip install --no-cache-dir --upgrade git+https://github.com/huggingface/transformers.git || exit 42; }; ".to_string()
     }
 
-    pub fn sglang_extra_args(&self) -> String {
-        let mut args = Vec::new();
-        let repo = self.repo_id.to_lowercase();
-        // If it's a DeepSeek V3 or R1 model, optimize with FP8
-        if repo.contains("deepseek") && (repo.contains("v3") || repo.contains("r1")) {
-            args.push("--quantization fp8".to_string());
-        }
-        args.join(" ")
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -309,6 +301,7 @@ pub struct DigitalOceanConfig {
     pub droplet_name: String,
     pub region: String,
     pub size: String,
+    pub hourly_rate_usd: Option<f64>,
     pub image: String,
     pub ssh_keys: String,
     pub project_id: String,
@@ -326,6 +319,7 @@ impl Default for DigitalOceanConfig {
             droplet_name: String::new(),
             region: String::new(),
             size: String::new(),
+            hourly_rate_usd: None,
             image: "220895104".to_string(),
             ssh_keys: String::new(),
             project_id: String::new(),

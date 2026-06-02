@@ -33,6 +33,7 @@ import type {
   DigitalOceanRegion,
   DigitalOceanSize,
   DigitalOceanSshKey,
+  DigitalOceanUsageRecord,
   EmbedderConfig,
 } from "../types";
 
@@ -65,6 +66,10 @@ export const api = {
     invoke<DigitalOceanDroplet>("do_create_gpu_droplet", { cfg }),
   doDestroyDroplet: (cfg: DigitalOceanConfig, dropletId: number) =>
     invoke<void>("do_destroy_droplet", { cfg, dropletId }),
+  doListDropletUsage: () =>
+    invoke<DigitalOceanUsageRecord[]>("do_list_droplet_usage"),
+  doExportDropletUsageCsv: () =>
+    invoke<string>("do_export_droplet_usage_csv"),
 
   // ssh
   testSsh: (cfg: SSHConfig) => invoke<string>("test_ssh", { cfg }),

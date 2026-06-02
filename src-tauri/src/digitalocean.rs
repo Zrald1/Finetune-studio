@@ -543,6 +543,7 @@ pub async fn list_gpu_droplets(cfg: &DigitalOceanConfig) -> Result<Vec<DoDroplet
             None => break,
         }
     }
+    crate::droplet_usage::reconcile_active(cfg, &droplets)?;
     Ok(droplets)
 }
 
@@ -987,6 +988,7 @@ pub async fn create_droplet(cfg: &DigitalOceanConfig) -> Result<DoDroplet> {
             match create_once(cfg, &req).await {
                 Ok(droplet) => {
                     assign_project(cfg, &droplet).await?;
+                    crate::droplet_usage::record_created(cfg, &droplet)?;
                     return Ok(droplet);
                 }
                 Err(err) => attempts.push(CreateAttemptLog {
@@ -1006,6 +1008,7 @@ pub async fn create_droplet(cfg: &DigitalOceanConfig) -> Result<DoDroplet> {
             match create_once(cfg, &req).await {
                 Ok(droplet) => {
                     assign_project(cfg, &droplet).await?;
+                    crate::droplet_usage::record_created(cfg, &droplet)?;
                     return Ok(droplet);
                 }
                 Err(err) => attempts.push(CreateAttemptLog {
@@ -1062,10 +1065,12 @@ pub async fn destroy_droplet(cfg: &DigitalOceanConfig, droplet_id: u64) -> Resul
         .send()
         .await?;
     if res.status() == StatusCode::NO_CONTENT {
+        crate::droplet_usage::record_destroyed(droplet_id)?;
         return Ok(());
     }
     if !res.status().is_success() {
         return Err(parse_error(res, "destroy droplet").await);
     }
+    crate::droplet_usage::record_destroyed(droplet_id)?;
     Ok(())
 }
