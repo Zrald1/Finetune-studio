@@ -24,7 +24,7 @@ use crate::ssh::{GpuState, SshSession, SshSessionManager, StreamChunk};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -2674,6 +2674,17 @@ fn main() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
+            if let Some(window) = app.get_webview_window("main") {
+                match tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png")) {
+                    Ok(icon) => {
+                        if let Err(error) = window.set_icon(icon) {
+                            tracing::warn!("failed to set window icon: {error}");
+                        }
+                    }
+                    Err(error) => tracing::warn!("failed to load window icon: {error}"),
+                }
+            }
+
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let _ = config::ensure_dirs().await;
