@@ -1,0 +1,201 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  version-tag:
+    name: Create next release tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.bump.outputs.tag }}
+      version: ${{ steps.bump.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create next patch tag
+        id: bump
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git fetch --force --tags
+
+          head_tag="$(git tag --points-at HEAD --list 'v[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -n 1 || true)"
+          if [[ -n "$head_tag" ]]; then
+            tag="$head_tag"
+          else
+            latest_tag="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -n 1 || true)"
+            if [[ -z "$latest_tag" ]]; then
+              latest_tag="v0.0.0"
+            fi
+
+            version="${latest_tag#v}"
+            IFS='.' read -r major minor patch <<< "$version"
+            patch="$((patch + 1))"
+            tag="v${major}.${minor}.${patch}"
+
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$tag" -m "Build $tag"
+            git push origin "$tag"
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.label }}
+    needs: version-tag
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: windows
+            runner: windows-latest
+            bundles: nsis,msi
+            extra_args: --no-sign
+          - label: macos
+            runner: macos-latest
+            bundles: dmg
+            extra_args: --no-sign
+          - label: linux
+            runner: ubuntu-22.04
+            bundles: appimage,deb
+            extra_args: ""
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version-tag.outputs.tag }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux dependencies
+        if: matrix.label == 'linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            libgtk-3-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            librsvg2-dev \
+            patchelf \
+            pkg-config \
+            wget
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Use tag as bundle version
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.version-tag.outputs.version }}
+        run: |
+          node <<'NODE'
+          const fs = require("fs");
+          const version = process.env.RELEASE_VERSION;
+
+          for (const file of ["package.json", "src-tauri/tauri.conf.json"]) {
+            const json = JSON.parse(fs.readFileSync(file, "utf8"));
+            json.version = version;
+            fs.writeFileSync(file, `${JSON.stringify(json, null, 2)}\n`);
+          }
+          NODE
+
+      - name: Build Tauri bundles
+        run: npm run tauri -- build --bundles ${{ matrix.bundles }} ${{ matrix.extra_args }}
+
+      - name: Collect release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+
+          while IFS= read -r -d '' file; do
+            case "$file" in
+              *.AppImage|*.deb|*.dmg|*.exe|*.msi|*.rpm|*.app.tar.gz)
+                cp "$file" "release-assets/${{ matrix.label }}-$(basename "$file")"
+                ;;
+            esac
+          done < <(find src-tauri/target/release/bundle -type f -print0)
+
+          if [[ -z "$(find release-assets -type f -print -quit)" ]]; then
+            echo "No release assets were produced."
+            exit 1
+          fi
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}-release-assets
+          path: release-assets/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs:
+      - version-tag
+      - build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded-assets
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.version-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p upload
+          while IFS= read -r -d '' file; do
+            cp "$file" "upload/$(basename "$file")"
+          done < <(find downloaded-assets -type f -print0)
+
+          mapfile -d '' files < <(find upload -type f -print0)
+          if [[ "${#files[@]}" -eq 0 ]]; then
+            echo "No release files were downloaded."
+            exit 1
+          fi
+
+          cat > release-notes.md <<EOF
+          Automated Fine-Tune Studio release for ${RELEASE_TAG}.
+
+          Downloads include Windows, macOS, and Linux bundles built from this tag.
+          EOF
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${files[@]}" --clobber
+          else
+            gh release create "$RELEASE_TAG" "${files[@]}" \
+              --title "Fine-Tune Studio ${RELEASE_TAG}" \
+              --notes-file release-notes.md
+          fi
