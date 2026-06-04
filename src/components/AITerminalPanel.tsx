@@ -549,6 +549,9 @@ export default function AITerminalPanel({
       if (activeTab === "credentials") {
         pageContext = "Credentials tab (SSH / Qdrant / embedders / OCR setup)";
         preferredLogSource = "`__exec_logs__ setup` (embedder / OCR / Qdrant boot logs)";
+      } else if (activeTab === "robotVision") {
+        pageContext = "Robot Vision tab (robot bearer tokens, captures, research, model pull)";
+        preferredLogSource = "`__exec_logs__ setup` for robot service setup, or `__exec_logs__ terminal` for visible SSH output";
       } else if (activeTab === "gpu") {
         pageContext = "GPU Servers tab (droplet & GPU management)";
         preferredLogSource = "`__exec_logs__ setup` for any serving/boot output, or `__exec_logs__ terminal` for the visible console";

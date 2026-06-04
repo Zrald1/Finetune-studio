@@ -711,8 +711,8 @@ async fn run_pipeline(
                 // not already up — if it is, the embedders inside are already in
                 // their steady state and the teacher needs no extra VRAM freed).
                 if !teacher_already_up && !non_persistent_ports.is_empty() {
-                    // Host: port-targeted only (a persistent embedder runs on the
-                    // host on a different port and must not be pattern-matched).
+                    // Port-targeted only so protected embedders on other ports
+                    // are preserved whether they run on the host or in Docker.
                     let host_kill = build_embedder_port_kill_cmd(&non_persistent_ports);
                     let _ = session.exec_blocking(&host_kill).await;
 
@@ -790,7 +790,7 @@ async fn run_pipeline(
                     "[embedder] GPU server has no Qdrant on :6333 — skipping embedder deployment (no vector store to search)\n",
                     "stage",
                 );
-            } else if let Some((embedder_index, embedder)) = cfg
+            } else if let Some((_embedder_index, embedder)) = cfg
                 .embedders
                 .iter()
                 .enumerate()
@@ -798,17 +798,9 @@ async fn run_pipeline(
             {
                 // Embedder index 0 is the semantic-search embedder and is
                 // protected even for older configs that predate `persistent`.
-                let is_protected = is_protected_semantic_embedder(embedder_index, embedder);
-                let embedder_cfg = if is_protected {
-                    // Host-mode: probe + launch directly on the droplet, not
-                    // inside any container.
-                    DockerConfig {
-                        enabled: false,
-                        ..docker_cfg.clone()
-                    }
-                } else {
-                    docker_cfg.clone()
-                };
+                // Keep it in the configured vLLM Docker runtime; cleanup is
+                // port-targeted so protected embedders survive teacher deploys.
+                let embedder_cfg = docker_cfg.clone();
 
                 // Already serving?
                 let already_up = crate::serve::health_check_embedder(
@@ -832,14 +824,13 @@ async fn run_pipeline(
                         "stage",
                     );
                 } else {
-                    let mode = if is_protected { "host" } else { "docker" };
                     let gpu_mem = embedder.gpu_memory_utilization as f64;
                     emit_log(
                         app,
                         &run.id,
                         &format!(
-                            "[embedder] Qdrant present — deploying 1 embedder '{}' ({}) on port {} via {} ({} GPU util)\n",
-                            embedder.name, embedder.model_id, embedder.port, mode, gpu_mem
+                            "[embedder] Qdrant present — deploying 1 embedder '{}' ({}) on port {} via docker ({} GPU util)\n",
+                            embedder.name, embedder.model_id, embedder.port, gpu_mem
                         ),
                         "stage",
                     );
@@ -3842,6 +3833,10 @@ for item in adapter_path.iterdir():
     if item.is_file() and item.name not in skip_files and not item.name.endswith(skip_suffixes):
         shutil.copy2(item, stage_path / item.name)
 
+zrald_artifacts = adapter_path / "zrald_artifacts"
+if zrald_artifacts.is_dir():
+    shutil.copytree(zrald_artifacts, stage_path / "zrald_artifacts", dirs_exist_ok=True)
+
 data = json.loads(adapter_config_path.read_text())
 if not data.get("base_model_name_or_path"):
     data["base_model_name_or_path"] = base_model
@@ -3956,14 +3951,16 @@ export HF_TOKEN={token}
 export HUGGING_FACE_HUB_TOKEN={token}
 python3 - <<'PY'
 import os
+import shutil
+from pathlib import Path
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 from peft import PeftModel
 from huggingface_hub import HfApi, create_repo
 
 base_model = {base_model}
-adapter_path = {adapter_path}
-merged_dir = {merged_dir}
+adapter_path = Path({adapter_path})
+merged_dir = Path({merged_dir})
 repo_id = {repo}
 private = {private}
 token = os.environ.get("HF_TOKEN")
@@ -3998,16 +3995,21 @@ except TypeError:
         trust_remote_code=True,
     )
 print("[merge] applying adapter", flush=True)
-model = PeftModel.from_pretrained(base, adapter_path)
+model = PeftModel.from_pretrained(base, str(adapter_path))
 print("[merge] merging & unloading", flush=True)
 merged = model.merge_and_unload()
 print(f"[merge] saving to {{merged_dir}}", flush=True)
-merged.save_pretrained(merged_dir, safe_serialization=True, max_shard_size="4GB")
-tokenizer.save_pretrained(merged_dir)
+merged.save_pretrained(str(merged_dir), safe_serialization=True, max_shard_size="4GB")
+tokenizer.save_pretrained(str(merged_dir))
 try:
-    AutoProcessor.from_pretrained(base_model, trust_remote_code=True).save_pretrained(merged_dir)
+    AutoProcessor.from_pretrained(base_model, trust_remote_code=True).save_pretrained(str(merged_dir))
 except Exception:
     pass
+
+zrald_artifacts = adapter_path / "zrald_artifacts"
+if zrald_artifacts.is_dir():
+    shutil.copytree(zrald_artifacts, merged_dir / "zrald_artifacts", dirs_exist_ok=True)
+    print("[merge] included ZRALD prompts, rewards, and benchmark artifacts", flush=True)
 
 print(f"[merge] uploading to {{repo_id}}", flush=True)
 create_repo(repo_id=repo_id, repo_type="model", private=private, token=token, exist_ok=True)
@@ -4015,7 +4017,7 @@ api = HfApi(token=token)
 api.upload_folder(
     repo_id=repo_id,
     repo_type="model",
-    folder_path=merged_dir,
+    folder_path=str(merged_dir),
     commit_message="Upload merged fine-tuned model",
 )
 print(f"https://huggingface.co/{{repo_id}}")
@@ -4709,8 +4711,8 @@ pub fn wrap_docker_cmd_detached(cmd: &str, container_name: &str) -> String {
 }
 
 /// Per-port kill body: frees each given TCP port by `fuser`/`ss`. Safe to run on
-/// the HOST because it touches only the listed ports — pass ONLY non-persistent
-/// embedder ports so a persistent (first) embedder on its own port is untouched.
+/// the host or inside a container because it touches only the listed ports —
+/// pass ONLY non-persistent embedder ports so protected embedders are untouched.
 fn embedder_port_kill(non_persistent_ports: &[u16]) -> String {
     non_persistent_ports
         .iter()
@@ -4726,17 +4728,16 @@ fn embedder_port_kill(non_persistent_ports: &[u16]) -> String {
 
 /// Build a shell command that stops only the embedder vLLM *processes* — never a
 /// Docker container. It kills the generic embed-vLLM process patterns and force-
-/// frees each given port. The broad pattern sweep (`vllm.*pooling`, etc.) would
-/// also match a persistent embedder, so this is meant to run INSIDE CONTAINERS,
-/// where only non-persistent embedders live; persistent embedders run on the host
-/// (docker disabled) and are never reached. Pass only non-persistent ports.
+/// frees each given port. Broad pattern sweeps (`vllm.*pooling`, etc.) would
+/// also match protected embedders, so cleanup stays port-targeted everywhere.
+/// Pass only non-persistent ports.
 /// Mirrors the cleanup in `main.rs::run_deploy_teacher_task`.
 pub fn build_embedder_kill_cmd(non_persistent_ports: &[u16]) -> String {
     build_embedder_port_kill_cmd(non_persistent_ports)
 }
 
-/// Host-safe embedder stop: ONLY frees the given non-persistent ports (no broad
-/// pattern sweep that could hit a persistent embedder running on the host).
+/// Embedder stop: ONLY frees the given non-persistent ports (no broad pattern
+/// sweep that could hit a protected embedder on another port).
 pub fn build_embedder_port_kill_cmd(non_persistent_ports: &[u16]) -> String {
     format!("{}true", embedder_port_kill(non_persistent_ports))
 }
@@ -4844,6 +4845,7 @@ import json
 import os
 import random
 import re
+import shutil
 import statistics
 import time
 from pathlib import Path
@@ -5233,8 +5235,70 @@ report["paired"] = {
     "losses": sum(1 for d in paired if d < -0.05),
     "ties": sum(1 for d in paired if -0.05 <= d <= 0.05),
 }
+benchmark_summary = {
+    "before": report["before"],
+    "after": report["after"],
+    "deltaMean": report["deltaMean"],
+    "paired": report["paired"],
+}
+artifacts_dir = OUTPUT_DIR / "zrald_artifacts"
+artifacts_dir.mkdir(parents=True, exist_ok=True)
+copied_artifacts = []
+
+def copy_artifact(src, name=None):
+    src = Path(src)
+    if not src.exists():
+        return
+    dest_name = name or src.name
+    shutil.copy2(src, artifacts_dir / dest_name)
+    copied_artifacts.append(dest_name)
+
+for artifact_name in [
+    "zrald_train_prompts.jsonl",
+    "zrald_benchmark_prompts.jsonl",
+    "zrald_rewards_train.jsonl",
+    "zrald_benchmark_before.jsonl",
+    "zrald_benchmark_after.jsonl",
+]:
+    copy_artifact(RUN_DIR / artifact_name)
+
+for source_dataset in [DATA_DIR / "qa_dataset.jsonl", RUN_DIR / "qa_dataset.jsonl"]:
+    if source_dataset.exists():
+        copy_artifact(source_dataset, "qa_dataset.jsonl")
+        break
+
+copied_artifacts.extend(["zrald_report.json", "README.md", "manifest.json"])
+report["benchmark"] = benchmark_summary
+report["artifactDir"] = str(artifacts_dir)
+report["artifacts"] = copied_artifacts
 (RUN_DIR / "zrald_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+(artifacts_dir / "zrald_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+(artifacts_dir / "README.md").write_text(
+    '# ZRALD artifacts\n\n'
+    'This folder is saved with the trained adapter and copied into merged model uploads.\n\n'
+    '- zrald_train_prompts.jsonl: training prompt/reference pool used for reward learning.\n'
+    '- zrald_benchmark_prompts.jsonl: held-out benchmark prompt/reference pool.\n'
+    '- zrald_rewards_train.jsonl: reward teacher scores and verdicts during GRPO training.\n'
+    '- zrald_benchmark_before.jsonl: student benchmark before ZRALD training.\n'
+    '- zrald_benchmark_after.jsonl: student benchmark after ZRALD training.\n'
+    '- zrald_report.json: benchmark summary, reward source, and paired win/loss counts.\n\n'
+    f'Benchmark mean: {benchmark_summary["before"]["mean"]:.4f} to {benchmark_summary["after"]["mean"]:.4f}; '
+    f'delta {benchmark_summary["deltaMean"]:.4f}.\n',
+    encoding="utf-8",
+)
+(artifacts_dir / "manifest.json").write_text(json.dumps({
+    "method": "ZRALD",
+    "baseModel": BASE_MODEL,
+    "rewardModel": REWARD_MODEL,
+    "rewardEndpoint": REWARD_ENDPOINT,
+    "trainQuestions": len(train_rows),
+    "benchmarkQuestions": len(benchmark_rows),
+    "numGenerations": NUM_GENERATIONS,
+    "benchmark": benchmark_summary,
+    "files": copied_artifacts,
+}, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 print("[zrald] report", json.dumps(report, ensure_ascii=False), flush=True)
+print(f"[zrald] artifacts saved to {artifacts_dir}: {', '.join(copied_artifacts)}", flush=True)
 print("[zrald] LoRA saved to", OUTPUT_DIR, flush=True)
 "#.to_string();
 

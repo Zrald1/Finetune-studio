@@ -69,10 +69,10 @@ pub struct EmbedderConfig {
     pub vector_dim: Option<usize>,
     /// Whether this embedder participates in "Setup all embedding models".
     pub enabled: bool,
-    /// If true, this embedder runs outside Docker on the host and is NOT
-    /// stopped by GPU cleanup during teacher deploy. Persistent embedders
-    /// survive across teacher deployments so the pipeline can reuse them
-    /// without the 3–5 minute VRAM load time on every dataset generation run.
+    /// If true, this embedder is protected from GPU cleanup during teacher
+    /// deploy. Persistent embedders survive across teacher deployments so the
+    /// pipeline can reuse them without the 3–5 minute VRAM load time on every
+    /// dataset generation run.
     #[serde(default)]
     pub persistent: bool,
     /// GPU memory utilization (0.0–1.0) for this embedder's vLLM instance.

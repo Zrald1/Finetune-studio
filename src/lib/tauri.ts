@@ -39,6 +39,7 @@ import type {
   RobotCaptureInput,
   ModelManifest,
   ModelManifestStore,
+  TeacherDeploymentStatus,
 } from "../types";
 
 export const api = {
@@ -179,7 +180,7 @@ export const api = {
   hfValidateDataset: (repoId: string) =>
     invoke<{ repo_id: string; valid: boolean; sample_count?: number; format?: string; columns: string[]; error?: string }>("hf_validate_dataset", { repoId }),
   checkTeacherDeployed: (ssh: SSHConfig, docker: AppConfig["docker"], teacher: AppConfig["teacher"]) =>
-    invoke<number | null>("check_teacher_deployed", { ssh, docker, teacher }),
+    invoke<TeacherDeploymentStatus | null>("check_teacher_deployed", { ssh, docker, teacher }),
   deployTeacher: (ssh: SSHConfig, docker: AppConfig["docker"], teacher: AppConfig["teacher"], hfToken?: string | null) =>
     invoke<string>("deploy_teacher", { ssh, docker, teacher, hfToken }),
   updateRunConfig: (runId: string, studentModel: string, lora: LoraConfig, hub: HubConfig) =>

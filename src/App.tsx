@@ -22,9 +22,10 @@ import {
   Wrench,
   Server,
   Rocket,
+  Bot,
 } from "lucide-react";
 
-type Tab = "pipeline" | "gpu" | "credentials" | "terminal" | "runs" | "deploy";
+type Tab = "pipeline" | "gpu" | "credentials" | "terminal" | "runs" | "deploy" | "robotVision";
 
 const DEFAULT_CONFIG: AppConfig = {
   ssh: { host: "", port: 22, username: "root" },
@@ -394,6 +395,7 @@ export default function App() {
           <TabButton active={tab === "credentials"} onClick={() => setTab("credentials")} icon={<Wrench className="w-3.5 h-3.5" />} label="Credentials" />
           <TabButton active={tab === "runs"} onClick={() => setTab("runs")} icon={<ListChecks className="w-3.5 h-3.5" />} label="Runs" />
           <TabButton active={tab === "deploy"} onClick={() => setTab("deploy")} icon={<Rocket className="w-3.5 h-3.5" />} label="Deploy" />
+          <TabButton active={tab === "robotVision"} onClick={() => setTab("robotVision")} icon={<Bot className="w-3.5 h-3.5" />} label="Robot Vision" />
         </div>
 
         <div className="flex items-center space-x-3 text-xs-fluid font-mono h-full">
@@ -432,6 +434,8 @@ export default function App() {
                 connection={connection}
                 onTestConnection={testConnection}
               />
+            </div>
+            <div style={{ display: tab === "robotVision" ? "" : "none" }} className="max-w-7xl w-full mx-auto grid grid-cols-1 gap-6 items-start lg:h-full lg:overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-white/10">
               <RoboticsWidget
                 config={config}
                 onChange={(patch) => setConfig((prev) => ({ ...prev, ...patch }))}

@@ -120,9 +120,9 @@ export default function DeployPanel({ config }: Props) {
     }
     setChecking(true);
     try {
-      const port = await api.checkTeacherDeployed(config.ssh, config.docker, buildTeacher());
+      const status = await api.checkTeacherDeployed(config.ssh, config.docker, buildTeacher());
       if (checkSeq === deploymentCheckSeqRef.current) {
-        setActivePort(port ?? null);
+        setActivePort(status?.port ?? null);
       }
     } catch (e) {
       console.error("check_teacher_deployed:", e);

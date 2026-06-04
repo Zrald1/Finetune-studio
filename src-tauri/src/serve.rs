@@ -2,6 +2,10 @@ use crate::config::{DockerConfig, EmbedderConfig, PaddleOcrConfig};
 use crate::error::{AppError, Result};
 use crate::ssh::SshSession;
 
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\"'\"'"))
+}
+
 pub async fn ensure_qdrant(
     session: &SshSession,
     _cfg: &DockerConfig,
@@ -59,20 +63,14 @@ pub async fn ensure_qdrant(
 }
 
 pub fn wrap_docker_cmd(cmd: &str, container: &str) -> String {
-    format!(
-        "docker exec {} bash -c '{}'",
-        container,
-        cmd.replace('\'', "'\\''")
-    )
+    format!("docker exec -i {} bash -lc {}", container, sh_quote(cmd))
 }
 
 pub fn wrap_docker_cmd_detached(cmd: &str, container: &str) -> String {
-    let inner_cmd = cmd.replace('"', "\\\"");
     format!(
-        "nohup bash -lc 'docker exec {} bash -c \"{}\"' < /dev/null > /dev/null 2>&1 & \
-         echo EMBEDDER_LAUNCHED",
+        "docker exec -d {} bash -lc {} >/dev/null 2>&1 && echo EMBEDDER_LAUNCHED",
         container,
-        inner_cmd.replace('\'', "'\\''")
+        sh_quote(cmd)
     )
 }
 
@@ -157,34 +155,46 @@ pub async fn launch_embedder(
                      export NCCL_SOCKET_IFNAME=lo; \
                      export VLLM_HOST_IP=127.0.0.1; ".to_string();
         if let Some(tok) = hf_token.filter(|s| !s.is_empty()) {
-            e.push_str(&format!("export HF_TOKEN={} HUGGING_FACE_HUB_TOKEN={}; ", tok, tok));
+            e.push_str(&format!(
+                "export HF_TOKEN={} HUGGING_FACE_HUB_TOKEN={}; ",
+                tok, tok
+            ));
         }
         e
     };
 
+    let model_id = sh_quote(&embedder.model_id);
     let serve_cmd = format!(
-        "cd /root && {env}vllm serve {model} \
-         --runner pooling \
-         --port {port} \
-         --host 0.0.0.0 \
-         --max-model-len 32768 \
-         --dtype half \
-         --download-dir /root/hf-cache \
-         --tensor-parallel-size 1 \
-         --gpu-memory-utilization {gpu_mem:.3}{max_seqs} \
+        "cd /root && {env} \
+         MODEL_ID={model}; \
+         run_vllm() {{ \
+           if command -v vllm >/dev/null 2>&1; then vllm serve \"$MODEL_ID\" \"$@\"; \
+           elif python3 -c 'import vllm' >/dev/null 2>&1; then python3 -m vllm.entrypoints.openai.api_server --model \"$MODEL_ID\" \"$@\"; \
+           elif python -c 'import vllm' >/dev/null 2>&1; then python -m vllm.entrypoints.openai.api_server --model \"$MODEL_ID\" \"$@\"; \
+           else echo 'vLLM is not installed or not on PATH in this runtime' >&2; return 127; fi; \
+         }}; \
+         run_vllm \
+           --runner pooling \
+           --port {port} \
+           --host 0.0.0.0 \
+           --max-model-len 32768 \
+           --dtype half \
+           --download-dir /root/hf-cache \
+           --tensor-parallel-size 1 \
+           --gpu-memory-utilization {gpu_mem:.3}{max_seqs} \
          > /root/embedder_{port}.log 2>&1 || \
-         (cd /root && {env}vllm serve {model} \
-         --task embed \
-         --port {port} \
-         --host 0.0.0.0 \
-         --max-model-len 32768 \
-         --dtype half \
-         --download-dir /root/hf-cache \
-         --tensor-parallel-size 1 \
-         --gpu-memory-utilization {gpu_mem:.3}{max_seqs} \
-         > /root/embedder_{port}.log 2>&1)",
+         run_vllm \
+           --task embed \
+           --port {port} \
+           --host 0.0.0.0 \
+           --max-model-len 32768 \
+           --dtype half \
+           --download-dir /root/hf-cache \
+           --tensor-parallel-size 1 \
+           --gpu-memory-utilization {gpu_mem:.3}{max_seqs} \
+         > /root/embedder_{port}.log 2>&1",
         env = env,
-        model = embedder.model_id,
+        model = model_id,
         port = port,
         gpu_mem = effective_gpu_mem,
         max_seqs = max_num_seqs,

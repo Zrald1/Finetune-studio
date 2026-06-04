@@ -129,6 +129,9 @@ export default function RoboticsWidget({ config, onChange }: Props) {
     "w-full min-w-0 bg-black/30 border border-white/10 rounded-lg px-3 py-2 text-sm font-mono text-theme-text focus:border-theme-accent outline-none";
   const secretField = `${field} pr-10`;
   const label = "text-[10px] uppercase tracking-widest font-bold theme-muted mb-1 block";
+  const tokenLabel = "text-[10px] uppercase tracking-widest font-bold theme-muted";
+  const tokenAction =
+    "px-2.5 py-1 text-[10px] uppercase tracking-widest rounded-md bg-white/5 border border-white/10 hover:border-theme-accent theme-muted shrink-0";
 
   return (
     <div className="theme-surface border border-white/10 rounded-2xl p-5 space-y-5 min-w-0 overflow-hidden">
@@ -165,10 +168,19 @@ export default function RoboticsWidget({ config, onChange }: Props) {
         <div className="flex items-center gap-2 text-xs font-bold theme-muted uppercase tracking-widest">
           <KeyRound className="w-3.5 h-3.5" /> API Tokens
         </div>
-        <div>
-          <span className={label}>Robot API token</span>
-          <div className="flex flex-col sm:flex-row gap-2">
-            <div className="relative flex-1">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div className="min-w-0">
+            <div className="mb-1 flex min-h-6 items-center justify-between gap-3">
+              <span className={tokenLabel}>Robot API token</span>
+              <button
+                type="button"
+                className={tokenAction}
+                onClick={() => patchRobot({ robotApiToken: randomToken() })}
+              >
+                Generate
+              </button>
+            </div>
+            <div className="relative">
               <input
                 className={secretField}
                 type={showRobotTok ? "text" : "password"}
@@ -184,19 +196,19 @@ export default function RoboticsWidget({ config, onChange }: Props) {
                 {showRobotTok ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
               </button>
             </div>
-            <button
-              type="button"
-              className="px-3 py-2 text-xs rounded-lg bg-white/5 border border-white/10 hover:border-theme-accent theme-muted shrink-0"
-              onClick={() => patchRobot({ robotApiToken: randomToken() })}
-            >
-              Generate
-            </button>
           </div>
-        </div>
-        <div>
-          <span className={label}>Dashboard API token</span>
-          <div className="flex flex-col sm:flex-row gap-2">
-            <div className="relative flex-1">
+          <div className="min-w-0">
+            <div className="mb-1 flex min-h-6 items-center justify-between gap-3">
+              <span className={tokenLabel}>Dashboard API token</span>
+              <button
+                type="button"
+                className={tokenAction}
+                onClick={() => patchRobot({ dashboardApiToken: randomToken() })}
+              >
+                Generate
+              </button>
+            </div>
+            <div className="relative">
               <input
                 className={secretField}
                 type={showDashTok ? "text" : "password"}
@@ -212,13 +224,6 @@ export default function RoboticsWidget({ config, onChange }: Props) {
                 {showDashTok ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
               </button>
             </div>
-            <button
-              type="button"
-              className="px-3 py-2 text-xs rounded-lg bg-white/5 border border-white/10 hover:border-theme-accent theme-muted shrink-0"
-              onClick={() => patchRobot({ dashboardApiToken: randomToken() })}
-            >
-              Generate
-            </button>
           </div>
         </div>
       </div>

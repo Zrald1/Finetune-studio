@@ -472,6 +472,14 @@ export default function TrainingConfigForm({
 
         {method === "zrald" && (
           <div className="rounded-2xl border border-white/5 theme-surface-soft p-5 glass-panel space-y-5">
+            <div className="rounded-xl border border-theme-accent/20 bg-theme-accent/10 p-4">
+              <p className="text-[10px] uppercase tracking-widest font-black font-mono theme-accent">
+                Teacher-generated reward loop
+              </p>
+              <p className="mt-2 text-[11px] theme-muted font-mono leading-relaxed">
+                The GPU teacher generates the prompt/answer pool first, the current student is benchmarked on the configured sample, then ZRALD trains with reward-teacher scoring.
+              </p>
+            </div>
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
               <div className="space-y-2">
                 <label className="text-[10px] uppercase tracking-widest theme-muted font-black ml-1">
@@ -481,7 +489,7 @@ export default function TrainingConfigForm({
                   type="text"
                   value={value.zraldRewardEndpoint || ""}
                   onChange={(e) => set("zraldRewardEndpoint", e.target.value)}
-                  placeholder="http://127.0.0.1:8000 or external OpenAI-compatible URL"
+                  placeholder="Blank = use detected/deployed GPU teacher"
                   className="w-full px-4 py-3 premium-input rounded-xl text-sm-fluid font-mono text-white focus:outline-none shadow-inner"
                 />
               </div>

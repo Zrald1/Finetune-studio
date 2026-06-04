@@ -307,6 +307,12 @@ export interface AppConfig {
   webResearch?: WebResearchConfig;
 }
 
+export interface TeacherDeploymentStatus {
+  port: number;
+  modelId: string;
+  exact: boolean;
+}
+
 // ── Robotics bridge ──────────────────────────────────────────────────────────
 
 export interface RobotConfig {

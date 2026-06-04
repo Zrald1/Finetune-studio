@@ -1707,6 +1707,7 @@ function TeacherStep({
   hfToken,
   checkingTeacher,
   teacherDeployed,
+  deployedTeacherModel,
   deploying,
   deployLogs,
   deployError,
@@ -1720,6 +1721,7 @@ function TeacherStep({
   hfToken: string;
   checkingTeacher: boolean;
   teacherDeployed: boolean;
+  deployedTeacherModel: string | null;
   deploying: boolean;
   deployLogs: string;
   deployError: string | null;
@@ -1739,6 +1741,7 @@ function TeacherStep({
 
   const autoTuneActive = !!value.autoTune && !(value.customServeCmd || "").trim();
   const managedDisabled = !!value.customServeCmd || autoTuneActive;
+  const canDeployTeacher = !!((value.customServeCmd || "").trim() || (value.repoId || "").trim());
 
   const deployLogRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
@@ -1851,6 +1854,11 @@ function TeacherStep({
               placeholder="e.g. deepseek-ai/DeepSeek-R1-Distill-Llama-70B"
               className="w-full px-4 py-3.5 premium-input rounded-xl text-sm-fluid font-mono text-white focus:outline-none shadow-inner transition-all animate-premium"
             />
+            {!teacherDeployed && !(value.repoId || "").trim() && !value.customServeCmd?.trim() && (
+              <p className="text-[10px] text-amber-300 font-mono uppercase tracking-tight ml-1">
+                No live teacher detected. Enter a Hugging Face model id before deploying.
+              </p>
+            )}
           </div>
         )}
 
@@ -1968,7 +1976,13 @@ function TeacherStep({
               }`} />
               <div className="flex flex-col">
                 <span className="text-[10px] uppercase tracking-[0.3em] font-black font-mono leading-none">NODE STATUS: {checkingTeacher ? "HANDSHAKING" : teacherDeployed ? "UPLINK_ESTABLISHED" : "CONTEXT_IDLE"}</span>
-                <span className="text-[8px] theme-faint font-mono uppercase mt-1">Remote Node Sync Active</span>
+                <span className="text-[8px] theme-faint font-mono uppercase mt-1">
+                  {teacherDeployed && deployedTeacherModel
+                    ? `Serving: ${deployedTeacherModel}`
+                    : teacherDeployed
+                      ? "Live teacher endpoint detected"
+                      : "No live teacher detected; deploy a Hugging Face model"}
+                </span>
               </div>
             </div>
             <div className="flex gap-3">
@@ -1992,7 +2006,8 @@ function TeacherStep({
                 <button
                   type="button"
                   onClick={onDeploy}
-                  className="px-6 py-2 theme-accent-bg text-black rounded-xl text-[10px] font-black uppercase tracking-widest transition-all hover:brightness-125 shadow-xl shadow-theme-accent/20 premium-button"
+                  disabled={!canDeployTeacher}
+                  className="px-6 py-2 theme-accent-bg text-black rounded-xl text-[10px] font-black uppercase tracking-widest transition-all hover:brightness-125 disabled:opacity-20 shadow-xl shadow-theme-accent/20 premium-button"
                 >
                   Deploy Teacher
                 </button>
@@ -2683,6 +2698,7 @@ const [pipelineMode, setPipelineMode] = useState<PipelineMode>("rag");
 
   const [teacher, setTeacher] = useState<TeacherConfig>(config.teacher ?? DEFAULT_TEACHER);
   const [teacherDeployed, setTeacherDeployed] = useState(false);
+  const [deployedTeacherModel, setDeployedTeacherModel] = useState<string | null>(null);
   const [checkingTeacher, setCheckingTeacher] = useState(false);
   const [deployStreamId, setDeployStreamId] = useState<string | null>(null);
   const [deployLogs, setDeployLogs] = useState("");
@@ -2690,18 +2706,25 @@ const [pipelineMode, setPipelineMode] = useState<PipelineMode>("rag");
   const [deployError, setDeployError] = useState<string | null>(null);
 
   const checkDeployment = React.useCallback(async (currentTeacher: TeacherConfig) => {
-    if (!config.ssh.host) { setTeacherDeployed(false); return; }
+    if (!config.ssh.host) { setTeacherDeployed(false); setDeployedTeacherModel(null); return; }
     setCheckingTeacher(true);
     try {
-      const activePort = await api.checkTeacherDeployed(config.ssh, config.docker, currentTeacher);
-      setTeacherDeployed(activePort !== null);
-      if (activePort !== null && activePort !== currentTeacher.vllmPort) {
-        const updatedTeacher = { ...currentTeacher, vllmPort: activePort };
-        setTeacher(updatedTeacher);
-        onConfigChange({ teacher: updatedTeacher });
-        await api.saveConfig({ ...config, teacher: updatedTeacher });
+      const activeTeacher = await api.checkTeacherDeployed(config.ssh, config.docker, currentTeacher);
+      setTeacherDeployed(activeTeacher !== null);
+      setDeployedTeacherModel(activeTeacher?.modelId || null);
+      if (activeTeacher !== null) {
+        const updatedTeacher = {
+          ...currentTeacher,
+          vllmPort: activeTeacher.port,
+          repoId: activeTeacher.modelId || currentTeacher.repoId,
+        };
+        if (!teacherConfigEquals(updatedTeacher, currentTeacher)) {
+          setTeacher(updatedTeacher);
+          onConfigChange({ teacher: updatedTeacher });
+          await api.saveConfig({ ...config, teacher: updatedTeacher });
+        }
       }
-    } catch (e) { console.error(e); setTeacherDeployed(false); } finally { setCheckingTeacher(false); }
+    } catch (e) { console.error(e); setTeacherDeployed(false); setDeployedTeacherModel(null); } finally { setCheckingTeacher(false); }
   }, [config, onConfigChange]);
 
   const startDeployment = async () => {
@@ -2730,6 +2753,7 @@ const [pipelineMode, setPipelineMode] = useState<PipelineMode>("rag");
           setDeploying(false); setDeployStreamId(null);
           if (e.success) {
             setTeacherDeployed(true);
+            setDeployedTeacherModel(teacher.repoId || null);
             if (e.port !== undefined) {
               const actualPort = e.port;
               setTeacher((prev) => {
@@ -2826,9 +2850,10 @@ const [pipelineMode, setPipelineMode] = useState<PipelineMode>("rag");
       const effectiveQdrant = { ...config.qdrant, endpoint: qdrantEndpoint, collection: config.qdrant.collection || "all" };
       const mergedConfig = { ...config, qdrant: effectiveQdrant, teacher };
       onConfigChange({ qdrant: effectiveQdrant, teacher });
-      const legacyTopic = cleanedTopics.length === 1 ? cleanedTopics[0].topic : undefined;
-      const legacyTotal = cleanedTopics.length === 1 ? cleanedTopics[0].totalQuestions : undefined;
-      const rc: RunConfig = { name: `gen-${new Date().toISOString().slice(0, 19).replace(/:/g, "-")}`, teacher, studentModel, lora, promptTemplate: prompt, maxPairsPerChunk, concurrency, maxChunks: maxChunks === "all" ? undefined : (maxChunks as number), topic: legacyTopic, totalQuestions: legacyTotal, topics: cleanedTopics.length > 0 ? cleanedTopics : undefined, hub, hubDataset, generateOnly: true };
+      const legacyTopic = runTopics.length === 1 ? runTopics[0].topic : undefined;
+      const legacyTotal = runTopics.length === 1 ? runTopics[0].totalQuestions : undefined;
+      const generationHubDataset: HubDatasetConfig = isZraldMethod ? { ...hubDataset, trainOnly: false } : hubDataset;
+      const rc: RunConfig = { name: `gen-${new Date().toISOString().slice(0, 19).replace(/:/g, "-")}`, teacher, studentModel, lora, promptTemplate: prompt, maxPairsPerChunk, concurrency, maxChunks: maxChunks === "all" ? undefined : (maxChunks as number), topic: legacyTopic, totalQuestions: legacyTotal, topics: runTopics.length > 0 ? runTopics : undefined, hub, hubDataset: generationHubDataset, generateOnly: true };
       const runId = await api.startPipeline(mergedConfig, rc); setGenerationRunId(runId);
       try { const initialLog = await api.readRunLog(runId, 64 * 1024); if (initialLog.trim()) { setGenerationLogs(initialLog); } const run = await api.getRun(runId); setGenerationProgress({ scanned: run.qaTotal || 0, kept: run.qaKept || 0, rejected: run.qaRejected || 0, status: run.status }); if (run.status === "dataset_ready" || run.status === "done") { setGeneratingDataset(false); setDatasetGenerated(true); setCompletedRunId(runId); } } catch {}
     } catch (e: any) { setGenerationError(e.message || String(e)); setGeneratingDataset(false); }
@@ -2859,11 +2884,21 @@ const [pipelineMode, setPipelineMode] = useState<PipelineMode>("rag");
 
   const [studentModel, setStudentModel] = useState(config.student?.repoId || "Qwen/Qwen2.5-7B-Instruct");
   const [lora, setLora] = useState<LoraConfig>(DEFAULT_LORA);
+  const isZraldMethod = (lora.method || "lora") === "zrald";
   const [hub, setHub] = useState<HubConfig>(DEFAULT_HUB);
   const [runName, setRunName] = useState("");
   const [launching, setLaunching] = useState(false);
   const [launchError, setLaunchError] = useState<string | null>(null);
   const [cleaningVram, setCleaningVram] = useState(false);
+
+  useEffect(() => {
+    if (!isZraldMethod || !isTrainingOnly) return;
+    setPipelineMode("rag");
+    setHubDataset((current) => ({ ...current, enabled: false, trainOnly: false }));
+    if (step === 3 && !datasetGenerated) {
+      setStep(teacherDeployed ? 2 : 1);
+    }
+  }, [isZraldMethod, isTrainingOnly, step, datasetGenerated, teacherDeployed]);
 
   const handleCleanupVram = async () => { if (!config.ssh.host) return; setCleaningVram(true); try { const msg = await api.cleanupVram(config.ssh, config.docker); alert(msg); } catch (e: any) { alert(`Cleanup failed: ${e}`); } finally { setCleaningVram(false); } };
 
@@ -2991,6 +3026,15 @@ const [pipelineMode, setPipelineMode] = useState<PipelineMode>("rag");
 }, [hubDataset.repoIds, hubDataset.repoId]);
 
   const cleanedTopics = useMemo<TopicTarget[]>(() => topics.map((t) => ({ topic: (t.topic || "").trim(), tag: t.tag?.trim() || undefined, totalQuestions: t.totalQuestions && t.totalQuestions > 0 ? t.totalQuestions : undefined, promptTemplate: t.promptTemplate?.trim() ? t.promptTemplate.trim() : undefined })).filter((t) => t.topic.length > 0), [topics]);
+  const runTopics = useMemo<TopicTarget[]>(() => {
+    if (!isZraldMethod || cleanedTopics.length === 0) return cleanedTopics;
+    const target = Math.max(1, lora.zraldTrainQuestions || DEFAULT_LORA.zraldTrainQuestions || 1000);
+    const perTopicTarget = cleanedTopics.length === 1 ? target : Math.max(1, Math.ceil(target / cleanedTopics.length));
+    return cleanedTopics.map((topic) => ({
+      ...topic,
+      totalQuestions: topic.totalQuestions ?? perTopicTarget,
+    }));
+  }, [cleanedTopics, isZraldMethod, lora.zraldTrainQuestions]);
   const allTopicsHavePrompt = useMemo(() => {
     const named = topics.filter((t) => (t.topic || "").trim().length > 0);
     if (named.length === 0) return false;
@@ -3014,7 +3058,9 @@ const [pipelineMode, setPipelineMode] = useState<PipelineMode>("rag");
   }, [step, isTrainingOnly, datasetsValidated, trainingOnlyDatasets]);
 
   const qdrantEndpoint = config.qdrant.endpoint || (config.ssh.host ? `http://${config.ssh.host}:6333` : "");
-  const canLaunch = !!(config.ssh.host && studentModel && (isTrainingOnly ? hubDataset.enabled && trainingOnlyDatasets.length > 0 && datasetsValidated : qdrantEndpoint && (config.qdrant.collection || "all") && teacher.repoId && allTopicsHavePrompt));
+  const requiresCloudTrainingDataset = isTrainingOnly && !isZraldMethod;
+  const teacherModelReady = !!((teacher.repoId || "").trim() || (teacher.customServeCmd || "").trim());
+  const canLaunch = !!(config.ssh.host && studentModel && (requiresCloudTrainingDataset ? hubDataset.enabled && trainingOnlyDatasets.length > 0 && datasetsValidated : qdrantEndpoint && (config.qdrant.collection || "all") && teacherModelReady && allTopicsHavePrompt));
 
   const launch = async () => {
     setLaunching(true); setLaunchError(null);
@@ -3028,10 +3074,10 @@ const [pipelineMode, setPipelineMode] = useState<PipelineMode>("rag");
       onConfigChange({ qdrant: mergedConfig.qdrant, teacher, student: { ...config.student, repoId: studentModel } });
       if (completedRunId) { await api.updateRunConfig(completedRunId, studentModel, lora, hub); await api.resumeRun(completedRunId); onPipelineLaunched(completedRunId); }
       else {
-        const legacyTopic = cleanedTopics.length === 1 ? cleanedTopics[0].topic : undefined;
-        const legacyTotal = cleanedTopics.length === 1 ? cleanedTopics[0].totalQuestions : undefined;
-        const hubDatasetOut: HubDatasetConfig = isTrainingOnly ? { ...hubDataset, enabled: true, trainOnly: true, repoId: trainingOnlyDatasets[0] || "", repoIds: trainingOnlyDatasets } : { ...hubDataset, trainOnly: isTrainingOnly };
-        const rc: RunConfig = { name: runName || `run-${new Date().toISOString().slice(0, 19)}`, teacher, studentModel, lora, promptTemplate: prompt, maxPairsPerChunk, concurrency, maxChunks: maxChunks === "all" ? undefined : (maxChunks as number), topic: legacyTopic, totalQuestions: legacyTotal, topics: cleanedTopics.length > 0 ? cleanedTopics : undefined, hub, hubDataset: hubDatasetOut };
+        const legacyTopic = runTopics.length === 1 ? runTopics[0].topic : undefined;
+        const legacyTotal = runTopics.length === 1 ? runTopics[0].totalQuestions : undefined;
+        const hubDatasetOut: HubDatasetConfig = requiresCloudTrainingDataset ? { ...hubDataset, enabled: true, trainOnly: true, repoId: trainingOnlyDatasets[0] || "", repoIds: trainingOnlyDatasets } : { ...hubDataset, trainOnly: false };
+        const rc: RunConfig = { name: runName || `run-${new Date().toISOString().slice(0, 19)}`, teacher, studentModel, lora, promptTemplate: prompt, maxPairsPerChunk, concurrency, maxChunks: maxChunks === "all" ? undefined : (maxChunks as number), topic: legacyTopic, totalQuestions: legacyTotal, topics: runTopics.length > 0 ? runTopics : undefined, hub, hubDataset: hubDatasetOut };
         const runId = await api.startPipeline(mergedConfig, rc); onPipelineLaunched(runId);
       }
     } catch (e: any) { setLaunchError(e.message || String(e)); } finally { setLaunching(false); }
@@ -3068,7 +3114,7 @@ const [pipelineMode, setPipelineMode] = useState<PipelineMode>("rag");
 
       <div className="p-8 space-y-8 min-h-[520px]">
         {step === 0 && <KnowledgeBaseStep gpuStatus={gpuStatus ?? null} samples={samples} loading={loadingKb} error={kbError} config={config} onConfigChange={onConfigChange} onSkip={() => setStep(1)} />}
-        {step === 1 && <TeacherStep value={teacher} onChange={(t) => { setTeacher(t); onConfigChange({ teacher: t }); }} gpuStatus={gpuStatus} hfToken={config.hfToken || ""} checkingTeacher={checkingTeacher} teacherDeployed={teacherDeployed} deploying={deploying} deployLogs={deployLogs} deployError={deployError} onCheckStatus={() => checkDeployment(teacher)} onDeploy={startDeployment} onCancelDeploy={cancelDeployment} />}
+        {step === 1 && <TeacherStep value={teacher} onChange={(t) => { setTeacher(t); onConfigChange({ teacher: t }); }} gpuStatus={gpuStatus} hfToken={config.hfToken || ""} checkingTeacher={checkingTeacher} teacherDeployed={teacherDeployed} deployedTeacherModel={deployedTeacherModel} deploying={deploying} deployLogs={deployLogs} deployError={deployError} onCheckStatus={() => checkDeployment(teacher)} onDeploy={startDeployment} onCancelDeploy={cancelDeployment} />}
         {step === 2 && !isTrainingOnly && <DatasetStep config={config} onConfigChange={onConfigChange} trainingOnly={isTrainingOnly} onSwitchToGenerateDataset={() => { setPipelineMode("rag"); setStep(0); }} topics={topics} onTopicsChange={setTopics} prompt={prompt} onPromptChange={handlePromptChange} maxPairsPerChunk={maxPairsPerChunk} onMaxPairsChange={setMaxPairsPerChunk} concurrency={concurrency} onConcurrencyChange={setConcurrency} maxChunks={maxChunks} onMaxChunksChange={setMaxChunks} hubDataset={hubDataset} onHubDatasetChange={setHubDataset} hfTokenSet={!!config.hfToken} hfUsername={hfUsername} hfDatasets={hfDatasets} hfLoading={hfLoading} hfError={hfError} onRefreshHf={refreshHf} generating={generatingDataset} generated={datasetGenerated} progress={generationProgress} logs={generationLogs} error={generationError} onGenerate={startDatasetGeneration} onCancel={cancelDatasetGeneration} sshHostSet={!!config.ssh.host} />}
         {step === 3 && <TrainStep trainingOnly={isTrainingOnly} trainingDataset={isTrainingOnly ? <DatasetStep config={config} onConfigChange={onConfigChange} trainingOnly onSwitchToGenerateDataset={() => { setPipelineMode("rag"); setStep(0); }} topics={topics} onTopicsChange={setTopics} prompt={prompt} onPromptChange={handlePromptChange} maxPairsPerChunk={maxPairsPerChunk} onMaxPairsChange={setMaxPairsPerChunk} concurrency={concurrency} onConcurrencyChange={setConcurrency} maxChunks={maxChunks} onMaxChunksChange={setMaxChunks} hubDataset={hubDataset} onHubDatasetChange={setHubDataset} hfTokenSet={!!config.hfToken} hfUsername={hfUsername} hfDatasets={hfDatasets} hfLoading={hfLoading} hfError={hfError} onRefreshHf={refreshHf} generating={generatingDataset} generated={datasetGenerated} progress={generationProgress} logs={generationLogs} error={generationError} onGenerate={startDatasetGeneration} onCancel={cancelDatasetGeneration} sshHostSet={!!config.ssh.host} /> : null} runName={runName} onRunNameChange={setRunName} lora={lora} onLoraChange={setLora} studentModel={studentModel} onStudentChange={setStudentModel} studentModelOptions={studentModelOptions} hfLoading={hfLoading} hfTokenSet={!!config.hfToken} onRefreshModels={refreshModelPickers} hub={hub} onHubChange={setHub} hfUsername={hfUsername} canLaunch={!!canLaunch} launching={launching} launchError={launchError} onLaunch={launch} validatingDataset={validatingDataset} datasetsValidated={datasetsValidated} trainingOnlyDatasets={trainingOnlyDatasets} hubDatasetValidation={hubDataset.validationResult || {}} onValidateDatasets={validateDatasets} validateButtonRef={validateButtonRef} />}
       </div>

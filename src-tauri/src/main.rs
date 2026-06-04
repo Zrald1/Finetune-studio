@@ -28,6 +28,7 @@ use crate::qdrant::Chunk;
 use crate::runs::Run;
 use crate::ssh::{GpuState, SshSession, SshSessionManager, StreamChunk};
 use parking_lot::Mutex;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -554,18 +555,10 @@ async fn serve_boot_embedder(
     hf_token: Option<String>,
 ) -> Result<String> {
     let session = SshSession::connect(&ssh).await?;
-    let embedder_cfg = if embedder.persistent {
-        DockerConfig {
-            enabled: false,
-            ..docker.clone()
-        }
-    } else {
-        docker.clone()
-    };
     let app_c = app.clone();
     let host = serve::boot_embedder(
         &session,
-        &embedder_cfg,
+        &docker,
         &embedder,
         hf_token.as_deref(),
         embedder.gpu_memory_utilization,
@@ -754,14 +747,7 @@ async fn serve_setup_all_embedders(
 
     let mut results = vec![];
     for embedder in embedders.iter() {
-        let embedder_cfg = if embedder.persistent {
-            DockerConfig {
-                enabled: false,
-                ..resolved_docker.clone()
-            }
-        } else {
-            resolved_docker.clone()
-        };
+        let embedder_cfg = resolved_docker.clone();
         let _ = app.emit("setup://log", serde_json::json!({"line": format!("[stage] checking embedder '{}' on port {} (persistent: {})\n", embedder.name, embedder.port, embedder.persistent)}));
         let collection_name = embedder.effective_collection();
         let qdrant_cfg = QdrantConfig {
@@ -1177,12 +1163,20 @@ async fn ping_teacher(endpoint: String) -> Result<bool> {
         .unwrap_or(false))
 }
 
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TeacherDeploymentStatus {
+    port: u16,
+    model_id: String,
+    exact: bool,
+}
+
 #[tauri::command]
 async fn check_teacher_deployed(
     ssh: SshConfig,
     docker: DockerConfig,
     teacher: TeacherConfig,
-) -> Result<Option<u16>> {
+) -> Result<Option<TeacherDeploymentStatus>> {
     if ssh.host.is_empty() {
         return Ok(None);
     }
@@ -1235,13 +1229,13 @@ for p in ports:
                     mid = m[0].get('id', '')
                     cid = mid.lower().replace('.gguf', '').split(':')[0]
                     if m_cfg and cid == m_cfg:
-                        exact = p
+                        exact = (p, mid)
                         break
                     elif not any_m:
-                        any_m = p
+                        any_m = (p, mid)
     except: pass
-if exact: print(f'FOUND::{{exact}}')
-elif any_m: print(f'FOUND::{{any_m}}')
+if exact: print('STATUS::' + json.dumps({{'port': exact[0], 'modelId': exact[1], 'exact': True}}))
+elif any_m: print('STATUS::' + json.dumps({{'port': any_m[0], 'modelId': any_m[1], 'exact': False}}))
 else: print('NOT_FOUND')\
 \" 2>/dev/null || echo 'ERROR'",
         model_to_check.replace("\"", "\\\"").replace("'", "\\'"),
@@ -1302,20 +1296,20 @@ else: print('NOT_FOUND')\
         check_script
     };
 
-    let mut found_port = None;
+    let mut found_status = None;
     if let Ok(probe_r) = session.exec_blocking(&check_probe).await {
-        let out = probe_r.stdout.trim();
-        if out.starts_with("FOUND::") {
-            if let Some(port_str) = out.split("::").nth(1) {
-                if let Ok(port) = port_str.parse::<u16>() {
-                    found_port = Some(port);
+        for line in probe_r.stdout.lines().map(str::trim) {
+            if let Some(json_text) = line.strip_prefix("STATUS::") {
+                if let Ok(status) = serde_json::from_str::<TeacherDeploymentStatus>(json_text) {
+                    found_status = Some(status);
+                    break;
                 }
             }
         }
     }
 
     session.disconnect().await;
-    Ok(found_port)
+    Ok(found_status)
 }
 
 async fn run_deploy_teacher_task(
@@ -1331,9 +1325,10 @@ async fn run_deploy_teacher_task(
 
     // --- GPU VRAM Cleanup ---
     // Stop paddleocr-vl container to free VRAM. Do NOT stop rocm-vllm — instead
-    // kill non-persistent embedder processes inside it via pkill (see below).
+    // kill only non-persistent embedder processes by port (see below).
     // This keeps the container warm so the teacher can reuse it without a full
-    // re-pull/launch. Embedder_1 (persistent) runs on the host and is skipped.
+    // re-pull/launch. Protected embedders are skipped by port, even when they
+    // run inside rocm-vllm.
     let _ = app.emit("deploy://log", serde_json::json!({
         "streamId": id,
         "kind": "info",
@@ -1389,10 +1384,8 @@ async fn run_deploy_teacher_task(
         }));
 
         let killable_ports: Vec<u16> = killable.iter().map(|e| e.port).collect();
-        // Host: port-targeted only — the broad embed-vLLM pattern sweep would
-        // also match a persistent embedder running on the host, so never run it
-        // here. Inside containers, use port-targeted cleanup too because older
-        // configs may still run embedder_1 inside the shared rocm-vllm container.
+        // Port-targeted only — broad vLLM pattern sweeps would also match a
+        // protected embedder, whether it is running on the host or in Docker.
         let host_kill = pipeline::build_embedder_port_kill_cmd(&killable_ports);
         let _ = session.exec_blocking(&host_kill).await;
         let inner_kill = pipeline::build_embedder_port_kill_cmd(&killable_ports);
@@ -2140,7 +2133,7 @@ async fn run_deploy_teacher_task(
         tokio::time::sleep(std::time::Duration::from_secs(poll_interval_secs)).await;
     }
 
-    if let Some((embedder_index, embedder)) = app_cfg
+    if let Some((_embedder_index, embedder)) = app_cfg
         .embedders
         .iter()
         .enumerate()
@@ -2155,15 +2148,7 @@ async fn run_deploy_teacher_task(
         if qdrant_up {
             let mut embedder_docker = docker_cfg.clone();
             embedder_docker.container_name = container_name.clone();
-            let embedder_cfg = if pipeline::is_protected_semantic_embedder(embedder_index, embedder)
-            {
-                DockerConfig {
-                    enabled: false,
-                    ..embedder_docker
-                }
-            } else {
-                embedder_docker
-            };
+            let embedder_cfg = embedder_docker;
 
             let already_up =
                 serve::health_check_embedder(&session, &embedder_cfg, "127.0.0.1", embedder.port)
@@ -2719,14 +2704,16 @@ export HUGGING_FACE_HUB_TOKEN={token}
 python3 - <<'PY'
 import json
 import os
+import shutil
+from pathlib import Path
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 from peft import PeftModel
 from huggingface_hub import HfApi, create_repo
 
 base_model = {base_model}
-adapter_path = {adapter_path}
-merged_dir = {merged_dir}
+adapter_path = Path({adapter_path})
+merged_dir = Path({merged_dir})
 repo_id = {repo}
 private = {private}
 token = os.environ.get("HF_TOKEN")
@@ -2759,21 +2746,26 @@ except TypeError:
         device_map="auto",
         trust_remote_code=True,
     )
-model = PeftModel.from_pretrained(base, adapter_path)
+model = PeftModel.from_pretrained(base, str(adapter_path))
 merged = model.merge_and_unload()
-merged.save_pretrained(merged_dir, safe_serialization=True, max_shard_size="4GB")
-tokenizer.save_pretrained(merged_dir)
+merged.save_pretrained(str(merged_dir), safe_serialization=True, max_shard_size="4GB")
+tokenizer.save_pretrained(str(merged_dir))
 try:
-    AutoProcessor.from_pretrained(base_model, trust_remote_code=True).save_pretrained(merged_dir)
+    AutoProcessor.from_pretrained(base_model, trust_remote_code=True).save_pretrained(str(merged_dir))
 except Exception:
     pass
+
+zrald_artifacts = adapter_path / "zrald_artifacts"
+if zrald_artifacts.is_dir():
+    shutil.copytree(zrald_artifacts, merged_dir / "zrald_artifacts", dirs_exist_ok=True)
+    print("[merge] included ZRALD prompts, rewards, and benchmark artifacts", flush=True)
 
 create_repo(repo_id=repo_id, repo_type="model", private=private, token=token, exist_ok=True)
 api = HfApi(token=token)
 api.upload_folder(
     repo_id=repo_id,
     repo_type="model",
-    folder_path=merged_dir,
+    folder_path=str(merged_dir),
     commit_message="Upload merged fine-tuned model",
 )
 print(f"https://huggingface.co/{{repo_id}}")
@@ -2882,7 +2874,7 @@ from peft import PeftModel
 from huggingface_hub import HfApi, create_repo
 
 base_model = {base_model}
-adapter_path = {adapter_path}
+adapter_path = Path({adapter_path})
 merged_dir = Path({merged_dir})
 gguf_dir = Path({gguf_dir})
 merged_repo = {merged_repo}
@@ -2919,16 +2911,21 @@ except TypeError:
     base = model_cls.from_pretrained(base_model, torch_dtype=dtype, device_map="auto", trust_remote_code=True)
 
 print("[merge] applying adapter", flush=True)
-model = PeftModel.from_pretrained(base, adapter_path)
+model = PeftModel.from_pretrained(base, str(adapter_path))
 print("[merge] merging", flush=True)
 merged = model.merge_and_unload()
 print("[merge] saving", flush=True)
-merged.save_pretrained(merged_dir, safe_serialization=True, max_shard_size="4GB")
-tokenizer.save_pretrained(merged_dir)
+merged.save_pretrained(str(merged_dir), safe_serialization=True, max_shard_size="4GB")
+tokenizer.save_pretrained(str(merged_dir))
 try:
-    AutoProcessor.from_pretrained(base_model, trust_remote_code=True).save_pretrained(merged_dir)
+    AutoProcessor.from_pretrained(base_model, trust_remote_code=True).save_pretrained(str(merged_dir))
 except Exception:
     pass
+
+zrald_artifacts = adapter_path / "zrald_artifacts"
+if zrald_artifacts.is_dir():
+    shutil.copytree(zrald_artifacts, merged_dir / "zrald_artifacts", dirs_exist_ok=True)
+    print("[merge] included ZRALD prompts, rewards, and benchmark artifacts", flush=True)
 
 print("[merge] uploading to " + merged_repo, flush=True)
 create_repo(repo_id=merged_repo, repo_type="model", private=private, token=token, exist_ok=True)
