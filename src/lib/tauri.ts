@@ -35,6 +35,10 @@ import type {
   DigitalOceanSshKey,
   DigitalOceanUsageRecord,
   EmbedderConfig,
+  RobotCapture,
+  RobotCaptureInput,
+  ModelManifest,
+  ModelManifestStore,
 } from "../types";
 
 export const api = {
@@ -184,6 +188,22 @@ export const api = {
     invoke<string>("cleanup_vram", { cfg, docker }),
   matchModelGuide: (studentModel: string) =>
     invoke<MatchedGuideInfo | null>("match_model_guide", { studentModel }),
+
+  // robotics — capture queue + model-pull manifest (shared with the VPS server)
+  robotListCaptures: () => invoke<RobotCapture[]>("robot_list_captures"),
+  robotEnqueueCapture: (input: RobotCaptureInput) =>
+    invoke<RobotCapture>("robot_enqueue_capture", { input }),
+  robotResearchCapture: (id: string) =>
+    invoke<RobotCapture>("robot_research_capture", { id }),
+  robotApproveCapture: (id: string) =>
+    invoke<RobotCapture>("robot_approve_capture", { id }),
+  robotRejectCapture: (id: string) =>
+    invoke<RobotCapture>("robot_reject_capture", { id }),
+  robotListManifests: () => invoke<ModelManifestStore>("robot_list_manifests"),
+  robotPublishManifest: (manifest: ModelManifest) =>
+    invoke<ModelManifestStore>("robot_publish_manifest", { manifest }),
+  robotPromoteModel: (version: string) =>
+    invoke<ModelManifestStore>("robot_promote_model", { version }),
 
   // AI Agent full app control
   aiGetAppState: () => invoke<any>("ai_get_app_state"),

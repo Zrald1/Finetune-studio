@@ -5,11 +5,13 @@ import { api, events } from "./lib/tauri";
 import { startGlobalSubscription } from "./lib/runStreams";
 import { startSetupLogSubscription } from "./lib/setupLogs";
 import CredentialsPanel from "./components/CredentialsPanel";
+import RoboticsWidget from "./components/RoboticsWidget";
 import AITerminalPanel from "./components/AITerminalPanel";
 import GPUStatsDashboard from "./components/GPUStatsDashboard";
 import GpuServerManager from "./components/GpuServerManager";
 import PipelineWizard from "./components/PipelineWizard";
 import RunDashboard from "./components/RunDashboard";
+import DeployPanel from "./components/DeployPanel";
 
 import ThemeSwitcher from "./components/ThemeSwitcher";
 import {
@@ -19,9 +21,10 @@ import {
   ListChecks,
   Wrench,
   Server,
+  Rocket,
 } from "lucide-react";
 
-type Tab = "pipeline" | "gpu" | "credentials" | "terminal" | "runs";
+type Tab = "pipeline" | "gpu" | "credentials" | "terminal" | "runs" | "deploy";
 
 const DEFAULT_CONFIG: AppConfig = {
   ssh: { host: "", port: 22, username: "root" },
@@ -390,6 +393,7 @@ export default function App() {
           <TabButton active={tab === "gpu"} onClick={() => setTab("gpu")} icon={<Server className="w-3.5 h-3.5" />} label="GPU Servers" />
           <TabButton active={tab === "credentials"} onClick={() => setTab("credentials")} icon={<Wrench className="w-3.5 h-3.5" />} label="Credentials" />
           <TabButton active={tab === "runs"} onClick={() => setTab("runs")} icon={<ListChecks className="w-3.5 h-3.5" />} label="Runs" />
+          <TabButton active={tab === "deploy"} onClick={() => setTab("deploy")} icon={<Rocket className="w-3.5 h-3.5" />} label="Deploy" />
         </div>
 
         <div className="flex items-center space-x-3 text-xs-fluid font-mono h-full">
@@ -421,12 +425,16 @@ export default function App() {
                 onStepChange={(step) => setWizardStep(step)}
               />
             </div>
-            <div style={{ display: tab === "credentials" ? "" : "none" }} className="max-w-7xl w-full mx-auto grid grid-cols-1 xl:grid-cols-2 gap-6 items-start lg:h-full lg:overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-white/10">
+            <div style={{ display: tab === "credentials" ? "" : "none" }} className="max-w-7xl w-full mx-auto grid grid-cols-1 gap-6 items-start lg:h-full lg:overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-white/10">
               <CredentialsPanel
                 config={config}
                 onChange={(updated) => setConfig((prev) => ({ ...prev, ...updated }))}
                 connection={connection}
                 onTestConnection={testConnection}
+              />
+              <RoboticsWidget
+                config={config}
+                onChange={(patch) => setConfig((prev) => ({ ...prev, ...patch }))}
               />
             </div>
             <div style={{ display: tab === "gpu" ? "" : "none" }} className="w-full max-w-7xl mx-auto lg:h-full lg:overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-white/10">
@@ -437,6 +445,9 @@ export default function App() {
             </div>
             <div style={{ display: tab === "runs" ? "" : "none" }} className="w-full lg:h-full lg:overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-white/10">
               <RunDashboard refreshKey={runsTick} selectedRunId={selectedRunId} gpuStatus={gpuStatus} />
+            </div>
+            <div style={{ display: tab === "deploy" ? "" : "none" }} className="w-full lg:h-full lg:overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-white/10">
+              <DeployPanel config={config} />
             </div>
           </section>
 

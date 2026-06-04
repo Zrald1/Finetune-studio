@@ -5,6 +5,10 @@ description = "Fine-Tune Studio — Qdrant → Teacher → Dataset → LoRA pipe
 authors = ["Zrald"]
 edition = "2021"
 rust-version = "1.75"
+# Two binaries now exist (desktop `fine-tune` + headless `fine-tune-server`).
+# `tauri dev` runs a bare `cargo run`, which is ambiguous with >1 binary — pin
+# the desktop app as the default so `tauri dev`/`tauri build` keep working.
+default-run = "fine-tune"
 
 [build-dependencies]
 tauri-build = { version = "2.0", features = [] }
@@ -51,6 +55,25 @@ sha2 = "0.10"
 # (yields empty text), which we surface to the user as a per-file error.
 pdf-extract = "0.7"
 docx-lite = "0.2"
+
+# headless VPS server (robot intake + dashboard REST API). Only used by the
+# `fine-tune-server` binary; the desktop app does not link the HTTP server.
+axum = { version = "0.7", features = ["json"] }
+tower-http = { version = "0.5", features = ["cors"] }
+
+[lib]
+name = "fine_tune"
+path = "src/lib.rs"
+
+# Desktop Tauri app (default binary).
+[[bin]]
+name = "fine-tune"
+path = "src/main.rs"
+
+# Headless VPS server: robot capture intake + dashboard API. Reuses the lib.
+[[bin]]
+name = "fine-tune-server"
+path = "src/bin/server.rs"
 
 [features]
 # this feature is used for production builds or when `devPath` points to the filesystem

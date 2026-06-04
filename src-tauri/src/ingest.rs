@@ -357,6 +357,18 @@ pub async fn read_file_text_with_ocr(
     }
 }
 
+/// Public single-image OCR helper used by the robot capture pipeline. Reuses
+/// the same PaddleOCR-VL path as document ingestion. `ssh` should be `Some`
+/// when the OCR server is reached through the GPU droplet (the usual case).
+pub async fn ocr_image(
+    path: &Path,
+    ocr: &PaddleOcrOptions,
+    ssh: Option<&SshSessionManager>,
+) -> Result<String> {
+    let noop: ProgressFn = Box::new(|_, _, _, _| {});
+    ocr_extract_file(path, ocr, ssh, &noop).await
+}
+
 async fn ocr_extract_file(
     path: &Path,
     ocr: &PaddleOcrOptions,

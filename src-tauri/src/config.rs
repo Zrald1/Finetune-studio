@@ -430,6 +430,79 @@ impl Default for PaddleOcrConfig {
     }
 }
 
+/// Configuration for the robot↔server bridge. Round-trips through the same
+/// `config.json` as everything else, so the desktop app and the headless VPS
+/// server share one source of truth. All fields are additive and default-safe
+/// so existing config files keep parsing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RobotConfig {
+    pub enabled: bool,
+    /// Bearer token the robot must present on `/robot/*` endpoints.
+    pub robot_api_token: String,
+    /// Bearer token the desktop/dashboard client presents on operator endpoints.
+    pub dashboard_api_token: String,
+    /// If non-empty, only these robot ids may submit captures.
+    pub allowed_robot_ids: Vec<String>,
+    /// Captures below this detection confidence are rejected at intake.
+    pub min_capture_confidence: f32,
+    /// Skip duplicate captures of the same object within this window.
+    pub dedupe_window_secs: u64,
+    /// Blur faces / license plates before the image is stored (privacy guard).
+    pub blur_faces_plates: bool,
+    /// Qdrant collection robot research packets are embedded into.
+    pub research_collection: String,
+    /// Run web research automatically on capture. Training stays gated by
+    /// human approval regardless of this flag.
+    pub auto_research_on_capture: bool,
+}
+
+impl Default for RobotConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            robot_api_token: String::new(),
+            dashboard_api_token: String::new(),
+            allowed_robot_ids: Vec::new(),
+            min_capture_confidence: 0.0,
+            dedupe_window_secs: 300,
+            blur_faces_plates: false,
+            research_collection: "kb_robot".to_string(),
+            auto_research_on_capture: true,
+        }
+    }
+}
+
+/// Pluggable web-research provider config. The robot pipeline uses this to
+/// research an unfamiliar captured object online before building training data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WebResearchConfig {
+    /// "brave" | "serpapi" | "google_cse".
+    pub provider: String,
+    pub api_key: String,
+    /// Google Programmable Search engine id (google_cse only).
+    pub cse_id: Option<String>,
+    /// Only fetch result pages whose host matches one of these (empty = allow all).
+    pub domain_allowlist: Vec<String>,
+    pub max_results: u32,
+    /// Drop results matching a built-in dangerous-topic blocklist.
+    pub block_dangerous_topics: bool,
+}
+
+impl Default for WebResearchConfig {
+    fn default() -> Self {
+        Self {
+            provider: "brave".to_string(),
+            api_key: String::new(),
+            cse_id: None,
+            domain_allowlist: Vec::new(),
+            max_results: 5,
+            block_dangerous_topics: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct AppConfig {
@@ -459,12 +532,36 @@ pub struct AppConfig {
     #[serde(default)]
     pub prompt_template: Option<String>,
     pub embedding: Option<ingest::EmbeddingConfig>,
+    /// Robot↔server bridge settings (headless VPS mode + robotics widget).
+    #[serde(default)]
+    pub robot: RobotConfig,
+    /// Web-research provider used by the robot capture pipeline.
+    #[serde(default)]
+    pub web_research: WebResearchConfig,
 }
 
 pub fn app_dir() -> Result<PathBuf> {
+    // Headless server mode sets FT_DATA_DIR to a fixed path (e.g. /var/lib/fine-tune)
+    // so it does not depend on an OS "user config dir". The desktop app leaves it
+    // unset and uses the per-user config dir as before.
+    if let Ok(dir) = std::env::var("FT_DATA_DIR") {
+        if !dir.trim().is_empty() {
+            return Ok(PathBuf::from(dir));
+        }
+    }
     let base = dirs::config_dir()
         .ok_or_else(|| AppError::config("no OS config dir available"))?;
     Ok(base.join("fine-tune"))
+}
+
+/// Directory holding the robot capture queue (one JSON file per capture).
+pub fn robot_dir() -> Result<PathBuf> {
+    Ok(app_dir()?.join("robot"))
+}
+
+/// Path to the model-manifest store served to the robot.
+pub fn manifest_path() -> Result<PathBuf> {
+    Ok(app_dir()?.join("model_manifests.json"))
 }
 
 pub fn config_path() -> Result<PathBuf> {
@@ -478,6 +575,7 @@ pub fn runs_dir() -> Result<PathBuf> {
 pub async fn ensure_dirs() -> Result<()> {
     fs::create_dir_all(app_dir()?).await?;
     fs::create_dir_all(runs_dir()?).await?;
+    fs::create_dir_all(robot_dir()?).await?;
     Ok(())
 }
 

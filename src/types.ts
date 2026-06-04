@@ -303,6 +303,110 @@ export interface AppConfig {
   aiAgent?: AIAgentConfig;
   promptTemplate?: string;
   embedding?: EmbeddingConfig;
+  robot?: RobotConfig;
+  webResearch?: WebResearchConfig;
+}
+
+// ── Robotics bridge ──────────────────────────────────────────────────────────
+
+export interface RobotConfig {
+  enabled: boolean;
+  robotApiToken: string;
+  dashboardApiToken: string;
+  allowedRobotIds: string[];
+  minCaptureConfidence: number;
+  dedupeWindowSecs: number;
+  blurFacesPlates: boolean;
+  researchCollection: string;
+  autoResearchOnCapture: boolean;
+}
+
+export const DEFAULT_ROBOT: RobotConfig = {
+  enabled: false,
+  robotApiToken: "",
+  dashboardApiToken: "",
+  allowedRobotIds: [],
+  minCaptureConfidence: 0,
+  dedupeWindowSecs: 300,
+  blurFacesPlates: false,
+  researchCollection: "kb_robot",
+  autoResearchOnCapture: true,
+};
+
+export interface WebResearchConfig {
+  provider: "brave" | "serpapi" | "google_cse";
+  apiKey: string;
+  cseId?: string | null;
+  domainAllowlist: string[];
+  maxResults: number;
+  blockDangerousTopics: boolean;
+}
+
+export const DEFAULT_WEB_RESEARCH: WebResearchConfig = {
+  provider: "brave",
+  apiKey: "",
+  cseId: null,
+  domainAllowlist: [],
+  maxResults: 5,
+  blockDangerousTopics: true,
+};
+
+export type CaptureStatus =
+  | "pending"
+  | "researching"
+  | "researched"
+  | "approved"
+  | "rejected"
+  | "failed";
+
+export interface RobotCitation {
+  url: string;
+  title: string;
+  snippet: string;
+  extract: string;
+  fetchedAt: string;
+}
+
+export interface RobotCapture {
+  id: string;
+  robotId: string;
+  labelGuess: string;
+  confidence: number;
+  sceneNotes: string;
+  imagePath: string;
+  imageSha256: string;
+  status: CaptureStatus;
+  createdAt: string;
+  updatedAt: string;
+  ocrText?: string | null;
+  citations: RobotCitation[];
+  chunksIngested: number;
+  error?: string | null;
+}
+
+export interface RobotCaptureInput {
+  robotId: string;
+  labelGuess?: string;
+  confidence?: number;
+  sceneNotes?: string;
+  imageBase64: string;
+  imageExt?: string | null;
+}
+
+export interface ModelManifest {
+  version: string;
+  hfRepo: string;
+  hfRevision: string;
+  sha256: string;
+  evalSummary?: string | null;
+  createdAt: string;
+  previousVersion?: string | null;
+  runId?: string | null;
+}
+
+export interface ModelManifestStore {
+  currentVersion?: string | null;
+  manifests: ModelManifest[];
 }
 
 export interface LoraConfig {

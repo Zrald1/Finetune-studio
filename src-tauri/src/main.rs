@@ -9,8 +9,11 @@ mod guides;
 mod hf;
 mod ingest;
 mod llamafactory;
+mod manifest;
 mod pipeline;
 mod qdrant;
+mod research;
+mod robot;
 mod runs;
 mod serve;
 mod ssh;
@@ -3247,9 +3250,69 @@ ping_teacher,
             ai_get_config_summary,
             ai_proxy_chat,
             ai_list_models,
+            robot_list_captures,
+            robot_enqueue_capture,
+            robot_research_capture,
+            robot_approve_capture,
+            robot_reject_capture,
+            robot_list_manifests,
+            robot_publish_manifest,
+            robot_promote_model,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+// ── robotics commands (shared with the headless VPS server) ─────────────────
+
+/// List all robot captures (pending/researched/approved/rejected/failed).
+#[tauri::command]
+async fn robot_list_captures() -> Result<Vec<robot::Capture>> {
+    robot::list_captures().await
+}
+
+/// Enqueue a capture from the desktop (testing the robot flow without a robot).
+#[tauri::command]
+async fn robot_enqueue_capture(input: robot::CaptureInput) -> Result<robot::Capture> {
+    let cfg = config::load().await?;
+    robot::enqueue_capture(&cfg, input).await
+}
+
+/// OCR + web-research a capture and embed the cited packet into Qdrant.
+#[tauri::command]
+async fn robot_research_capture(id: String) -> Result<robot::Capture> {
+    let cfg = config::load().await?;
+    robot::research_capture(&cfg, &id).await
+}
+
+/// Approve a researched capture (clears it for training). Human approval gate.
+#[tauri::command]
+async fn robot_approve_capture(id: String) -> Result<robot::Capture> {
+    robot::set_status(&id, robot::CaptureStatus::Approved).await
+}
+
+/// Reject a capture (it will not be used for training).
+#[tauri::command]
+async fn robot_reject_capture(id: String) -> Result<robot::Capture> {
+    robot::set_status(&id, robot::CaptureStatus::Rejected).await
+}
+
+/// Full model-manifest store (all versions + the current served version).
+#[tauri::command]
+async fn robot_list_manifests() -> Result<manifest::ManifestStore> {
+    manifest::load().await
+}
+
+/// Publish a new model manifest and make it the version the robot pulls.
+#[tauri::command]
+async fn robot_publish_manifest(manifest: manifest::ModelManifest) -> Result<manifest::ManifestStore> {
+    crate::manifest::publish(manifest).await
+}
+
+/// Promote/roll back the served model to an already-published version.
+#[tauri::command]
+async fn robot_promote_model(version: String) -> Result<manifest::ManifestStore> {
+    manifest::set_current(&version).await
 }
 
 #[tauri::command]

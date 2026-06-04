@@ -560,10 +560,10 @@ export default function CredentialsPanel({
   };
 
   return (
-    <div className="xl:col-span-2 premium-card rounded-3xl overflow-hidden animate-premium relative">
+    <div className="premium-card rounded-3xl overflow-hidden animate-premium relative">
       {/* Accent rail across the top of the whole panel */}
       <div className="absolute top-0 left-0 w-full h-px bg-gradient-to-r from-transparent via-theme-accent/40 to-transparent" />
-      <div className="px-8 py-7 border-b border-white/5 flex items-start justify-between gap-4 bg-gradient-to-br from-white/[0.04] via-white/[0.015] to-transparent backdrop-blur-md">
+      <div className="px-5 py-6 sm:px-8 sm:py-7 border-b border-white/5 flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4 bg-gradient-to-br from-white/[0.04] via-white/[0.015] to-transparent backdrop-blur-md">
         <div className="space-y-2">
           <div className="flex items-center gap-2.5">
             <div className="w-1.5 h-6 theme-accent-bg rounded-full shadow-[0_0_12px_rgba(var(--app-accent-rgb),0.6)]" />
@@ -578,7 +578,7 @@ export default function CredentialsPanel({
             SSH, vector store, and model provider settings
           </p>
         </div>
-        <div className={`shrink-0 inline-flex items-center gap-2.5 rounded-full border px-4 py-2 text-[10px] uppercase tracking-widest font-black font-mono transition-all duration-500 shadow-lg backdrop-blur-md ${
+        <div className={`shrink-0 self-start inline-flex items-center gap-2.5 rounded-full border px-4 py-2 text-[10px] uppercase tracking-widest font-black font-mono transition-all duration-500 shadow-lg backdrop-blur-md ${
           connection.isConnected
             ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400 shadow-emerald-500/10"
             : "theme-surface-soft theme-muted border-white/5"
@@ -589,9 +589,9 @@ export default function CredentialsPanel({
       </div>
 
       {/* Body: responsive two-column dashboard of credential cards */}
-      <div className="p-6 sm:p-8 grid grid-cols-1 xl:grid-cols-2 gap-6 items-start">
+      <div className="p-5 sm:p-8 grid grid-cols-1 2xl:grid-cols-2 gap-5 sm:gap-6 items-start">
       {/* SSH */}
-      <div className="space-y-5 rounded-2xl border border-white/5 bg-white/[0.015] p-6 shadow-inner transition-colors hover:border-white/10 xl:row-span-2">
+      <div className="space-y-5 rounded-2xl border border-white/5 bg-white/[0.015] p-5 sm:p-6 shadow-inner transition-colors hover:border-white/10 2xl:row-span-2">
         <div className="flex items-center gap-3 pb-3 border-b border-white/5">
           <div className="w-10 h-10 rounded-xl theme-accent-soft theme-accent flex items-center justify-center glass-panel shadow-inner group transition-transform duration-300 hover:scale-105">
             <LockKeyhole className="w-5 h-5 group-hover:rotate-12 transition-transform" />
@@ -601,8 +601,8 @@ export default function CredentialsPanel({
             <p className="text-xs-fluid theme-muted font-mono uppercase tracking-wider opacity-60">Secure remote host access</p>
           </div>
         </div>
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-          <div className="sm:col-span-2 space-y-2">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div className="space-y-2">
             <label className="text-[10px] uppercase tracking-widest theme-muted font-black ml-1">
               GPU Droplet IP
             </label>
@@ -714,7 +714,7 @@ export default function CredentialsPanel({
       </div>
 
       {/* DigitalOcean */}
-      <div className="space-y-4 rounded-2xl border border-white/5 bg-white/[0.015] p-6 shadow-inner transition-colors hover:border-white/10">
+      <div className="space-y-4 rounded-2xl border border-white/5 bg-white/[0.015] p-5 sm:p-6 shadow-inner transition-colors hover:border-white/10">
         <div className="flex items-center gap-3">
           <div className="w-10 h-10 rounded-xl theme-surface-soft theme-muted flex items-center justify-center glass-panel shadow-inner transition-transform duration-300 hover:scale-105 border border-white/5">
             <Cloud className="w-5 h-5" />
@@ -746,7 +746,7 @@ export default function CredentialsPanel({
       </div>
 
       {/* Qdrant */}
-      <div className="space-y-5 rounded-2xl border border-white/5 bg-white/[0.015] p-6 shadow-inner transition-colors hover:border-white/10">
+      <div className="space-y-5 rounded-2xl border border-white/5 bg-white/[0.015] p-5 sm:p-6 shadow-inner transition-colors hover:border-white/10">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-xl theme-accent-soft theme-accent flex items-center justify-center glass-panel shadow-inner transition-transform duration-300 hover:scale-105">
@@ -818,7 +818,7 @@ export default function CredentialsPanel({
 
       {/* Qdrant Database Manager */}
       {qd.endpoint && (
-        <div className="xl:col-span-2 space-y-5 rounded-2xl border border-white/5 bg-white/[0.015] p-6 shadow-inner transition-colors hover:border-white/10">
+        <div className="2xl:col-span-2 space-y-5 rounded-2xl border border-white/5 bg-white/[0.015] p-5 sm:p-6 shadow-inner transition-colors hover:border-white/10">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
               <div className="w-10 h-10 rounded-xl theme-accent-soft theme-accent flex items-center justify-center glass-panel shadow-inner transition-transform duration-300 hover:scale-105">
@@ -866,12 +866,12 @@ export default function CredentialsPanel({
                 </div>
               </div>
 
-              {/* Snapshot Actions */}
-              <div className="flex gap-2 flex-wrap">
+              {/* Snapshot Actions — even 2-col grid (4 across on wide) so buttons never wrap unevenly */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                 <button
                   onClick={saveSnapshot}
                   disabled={snapshotSaving || !selectedCollection || selectedCollection === "all"}
-                  className="flex items-center gap-2 px-4 py-2 theme-accent-bg text-black text-[10px] uppercase tracking-widest font-black rounded-xl hover:brightness-125 disabled:opacity-20 shadow-lg premium-button transition-all"
+                  className="flex items-center justify-center gap-2 px-4 py-2 theme-accent-bg text-black text-[10px] uppercase tracking-widest font-black rounded-xl hover:brightness-125 disabled:opacity-20 shadow-lg premium-button transition-all"
                 >
                   <Save className="w-3.5 h-3.5" />
                   {snapshotSaving ? "Saving..." : "Save Snapshot"}
@@ -879,7 +879,7 @@ export default function CredentialsPanel({
                 <button
                   onClick={uploadSnapshotDb}
                   disabled={snapshotUploading || !selectedCollection || selectedCollection === "all"}
-                  className="flex items-center gap-2 px-4 py-2 bg-white/5 border border-white/10 text-white text-[10px] uppercase tracking-widest font-black rounded-xl hover:bg-white/10 disabled:opacity-20 transition-all"
+                  className="flex items-center justify-center gap-2 px-4 py-2 bg-white/5 border border-white/10 text-white text-[10px] uppercase tracking-widest font-black rounded-xl hover:bg-white/10 disabled:opacity-20 transition-all"
                 >
                   {snapshotUploading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Upload className="w-3.5 h-3.5" />}
                   {snapshotUploading ? "Uploading..." : "Upload Snapshot"}
@@ -887,7 +887,7 @@ export default function CredentialsPanel({
                 <button
                   onClick={saveAllSnapshots}
                   disabled={savingAll}
-                  className="flex items-center gap-2 px-4 py-2 bg-blue-500/10 border border-blue-500/20 text-blue-400 text-[10px] uppercase tracking-widest font-black rounded-xl hover:bg-blue-500 hover:text-black disabled:opacity-20 transition-all"
+                  className="flex items-center justify-center gap-2 px-4 py-2 bg-blue-500/10 border border-blue-500/20 text-blue-400 text-[10px] uppercase tracking-widest font-black rounded-xl hover:bg-blue-500 hover:text-black disabled:opacity-20 transition-all"
                 >
                   <Save className="w-3.5 h-3.5" />
                   {savingAll ? "Saving All..." : "Save All"}
@@ -895,7 +895,7 @@ export default function CredentialsPanel({
                 <button
                   onClick={downloadAllSnapshots}
                   disabled={downloadingAll}
-                  className="flex items-center gap-2 px-4 py-2 bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-[10px] uppercase tracking-widest font-black rounded-xl hover:bg-emerald-500 hover:text-black disabled:opacity-20 transition-all"
+                  className="flex items-center justify-center gap-2 px-4 py-2 bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-[10px] uppercase tracking-widest font-black rounded-xl hover:bg-emerald-500 hover:text-black disabled:opacity-20 transition-all"
                 >
                   <Download className="w-3.5 h-3.5" />
                   {downloadingAll ? "Downloading All..." : "Download All"}
@@ -1037,7 +1037,7 @@ export default function CredentialsPanel({
       )}
 
       {/* Tokens */}
-      <div className="xl:col-span-2 space-y-6 rounded-2xl border border-white/5 bg-white/[0.015] p-6 shadow-inner transition-colors hover:border-white/10">
+      <div className="2xl:col-span-2 space-y-6 rounded-2xl border border-white/5 bg-white/[0.015] p-5 sm:p-6 shadow-inner transition-colors hover:border-white/10">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-xl theme-surface-soft theme-muted flex items-center justify-center glass-panel shadow-inner transition-transform duration-300 hover:scale-105 border border-white/5">
@@ -1078,7 +1078,7 @@ export default function CredentialsPanel({
         </div>
 
         {/* Service config cards — responsive grid on wide screens */}
-        <div className="grid grid-cols-1 xl:grid-cols-2 gap-5 items-start">
+        <div className="grid grid-cols-1 2xl:grid-cols-2 gap-5 items-start">
         {/* Embedding Configuration */}
         <div className="space-y-4 glass-panel rounded-2xl p-5 border border-white/5 relative overflow-hidden group">
           <div className="absolute top-0 left-0 w-1 h-full theme-accent-bg opacity-30" />
@@ -1105,9 +1105,10 @@ export default function CredentialsPanel({
                   {embedders.map((emb, idx) => {
                     const status = embedderStatuses[idx] ?? "idle";
                     return (
-                      <div key={idx} className="glass-panel rounded-xl p-4 border border-white/5">
-                        <div className="flex items-center gap-2 mb-3">
-                          <span className={`w-2 h-2 rounded-full ${
+                      <div key={idx} className="glass-panel rounded-xl p-5 border border-white/5 space-y-5">
+                        {/* Header row: status dot + name, with remove action pinned right */}
+                        <div className="flex items-center gap-3">
+                          <span className={`w-2 h-2 rounded-full shrink-0 ${
                             status === "running" ? "bg-emerald-400" :
                             status === "booting" ? "bg-amber-400 animate-pulse" :
                             status === "error" ? "bg-red-400" : "bg-white/20"
@@ -1119,69 +1120,86 @@ export default function CredentialsPanel({
                             placeholder="e.g. Law, Math, Science"
                             className="flex-1 px-3 py-2 rounded-lg bg-black/30 border border-white/5 text-xs font-mono text-white focus:outline-none focus:border-theme-accent/30"
                           />
-                          <input
-                            type="number"
-                            value={emb.port}
-                            onChange={(e) => updateEmbedder(idx, { port: parseInt(e.target.value) || 8101 })}
-                            className="w-20 px-3 py-2 rounded-lg bg-black/30 border border-white/5 text-xs font-mono text-white focus:outline-none focus:border-theme-accent/30 text-center"
-                            placeholder="Port"
-                          />
                           <button
                             type="button"
                             onClick={() => removeEmbedder(idx)}
-                            className="p-2 rounded-lg border border-white/5 theme-surface-soft text-red-400 hover:text-red-300 hover:bg-red-500/10 transition-all"
+                            className="p-2 rounded-lg border border-white/5 theme-surface-soft text-red-400 hover:text-red-300 hover:bg-red-500/10 transition-all shrink-0"
                             title="Remove"
                           >
                             <X className="w-3.5 h-3.5" />
                           </button>
                         </div>
+
+                        {/* Model id — full width, its own line */}
                         <div className="space-y-2">
-                          <div className="flex gap-2">
+                          <label className="text-[9px] uppercase tracking-widest theme-muted font-black ml-0.5">Model ID</label>
+                          <input
+                            type="text"
+                            value={emb.modelId}
+                            onChange={(e) => updateEmbedder(idx, { modelId: e.target.value })}
+                            placeholder="Qwen/Qwen3-Embedding-8B"
+                            className="w-full px-3 py-2 rounded-lg bg-black/30 border border-white/5 text-xs font-mono text-white focus:outline-none focus:border-theme-accent/30"
+                          />
+                        </div>
+
+                        {/* Port + Concurrency — paired numeric fields on a clean 2-col grid */}
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                          <div className="space-y-2">
+                            <label className="text-[9px] uppercase tracking-widest theme-muted font-black ml-0.5">Port</label>
                             <input
-                              type="text"
-                              value={emb.modelId}
-                              onChange={(e) => updateEmbedder(idx, { modelId: e.target.value })}
-                              placeholder="HuggingFace model id (e.g. Qwen/Qwen3-Embedding-8B)"
-                              className="flex-1 px-3 py-2 rounded-lg bg-black/30 border border-white/5 text-xs font-mono text-white focus:outline-none focus:border-theme-accent/30"
+                              type="number"
+                              value={emb.port}
+                              onChange={(e) => updateEmbedder(idx, { port: parseInt(e.target.value) || 8101 })}
+                              className="w-full px-3 py-2 rounded-lg bg-black/30 border border-white/5 text-xs font-mono text-white focus:outline-none focus:border-theme-accent/30"
+                              placeholder="8101"
                             />
                           </div>
-                          <div className="flex items-center gap-3">
-                            <label className="text-[9px] uppercase tracking-widest theme-muted font-black whitespace-nowrap">Concurrency</label>
+                          <div className="space-y-2">
+                            <label className="text-[9px] uppercase tracking-widest theme-muted font-black ml-0.5">Concurrency</label>
                             <input
                               type="number"
                               min={1}
                               max={8}
                               value={emb.concurrency}
                               onChange={(e) => updateEmbedder(idx, { concurrency: parseInt(e.target.value) || 2 })}
-                              className="w-16 px-3 py-2 rounded-lg bg-black/30 border border-white/5 text-xs font-mono text-white focus:outline-none focus:border-theme-accent/30 text-center"
-                            />
-                            <label className="text-[9px] uppercase tracking-widest theme-muted font-black whitespace-nowrap">Collection</label>
-                            <input
-                              type="text"
-                              value={emb.collection}
-                              onChange={(e) => updateEmbedder(idx, { collection: e.target.value })}
-                              placeholder="kb_law (auto-generated if blank)"
-                              className="flex-1 px-3 py-2 rounded-lg bg-black/30 border border-white/5 text-xs font-mono text-white focus:outline-none focus:border-theme-accent/30"
+                              className="w-full px-3 py-2 rounded-lg bg-black/30 border border-white/5 text-xs font-mono text-white focus:outline-none focus:border-theme-accent/30"
                             />
                           </div>
-                          <div className="flex items-center gap-3 pt-1">
-                            <label className="text-[9px] uppercase tracking-widest theme-muted font-black whitespace-nowrap">VRAM Util</label>
-                            <input
-                              type="range"
-                              min={0.01}
-                              max={0.45}
-                              step={0.01}
-                              value={emb.gpuMemoryUtilization}
-                              onChange={(e) => updateEmbedder(idx, { gpuMemoryUtilization: parseFloat(e.target.value) })}
-                              className="flex-1 h-1.5 rounded-full appearance-none bg-white/10 cursor-pointer accent-theme-accent"
-                            />
-                            <span className="text-[10px] font-mono theme-muted w-10 text-right">
+                        </div>
+
+                        {/* Collection — full width, its own line */}
+                        <div className="space-y-2">
+                          <label className="text-[9px] uppercase tracking-widest theme-muted font-black ml-0.5">Collection</label>
+                          <input
+                            type="text"
+                            value={emb.collection}
+                            onChange={(e) => updateEmbedder(idx, { collection: e.target.value })}
+                            placeholder="kb_law (auto-generated if blank)"
+                            className="w-full px-3 py-2 rounded-lg bg-black/30 border border-white/5 text-xs font-mono text-white focus:outline-none focus:border-theme-accent/30"
+                          />
+                        </div>
+
+                        {/* VRAM utilization slider */}
+                        <div className="space-y-2">
+                          <div className="flex items-center justify-between ml-0.5">
+                            <label className="text-[9px] uppercase tracking-widest theme-muted font-black">VRAM Util</label>
+                            <span className="text-[10px] font-mono theme-muted">
                               {Math.round(emb.gpuMemoryUtilization * 100)}%
                             </span>
                           </div>
+                          <input
+                            type="range"
+                            min={0.01}
+                            max={0.45}
+                            step={0.01}
+                            value={emb.gpuMemoryUtilization}
+                            onChange={(e) => updateEmbedder(idx, { gpuMemoryUtilization: parseFloat(e.target.value) })}
+                            className="w-full h-1.5 rounded-full appearance-none bg-white/10 cursor-pointer accent-theme-accent"
+                          />
                         </div>
+
                         {status !== "idle" && (
-                          <div className="mt-2 text-[9px] font-mono theme-muted">
+                          <div className="text-[9px] font-mono theme-muted">
                             {status === "running" ? "● Serving on GPU server" :
                              status === "booting" ? "◌ Bootstrapping model..." :
                              "✕ Failed to start embedder"}
@@ -1333,7 +1351,7 @@ export default function CredentialsPanel({
         </div>
 
         {/* AI Copilot Agent Configuration */}
-        <div className="xl:col-span-2 space-y-4 glass-panel rounded-2xl p-5 border border-white/5 relative overflow-hidden group">
+        <div className="2xl:col-span-2 space-y-4 glass-panel rounded-2xl p-5 border border-white/5 relative overflow-hidden group">
           <div className="absolute top-0 left-0 w-1 h-full theme-accent-bg opacity-30" />
           <div className="flex items-center justify-between">
             <label className="text-[10px] uppercase tracking-[0.2em] theme-accent font-black italic font-serif flex items-center gap-2">
@@ -1454,7 +1472,7 @@ export default function CredentialsPanel({
       </div>
 
       {/* Docker */}
-      <div className="space-y-6 rounded-2xl border border-white/5 bg-white/[0.015] p-6 shadow-inner transition-colors hover:border-white/10">
+      <div className="space-y-6 rounded-2xl border border-white/5 bg-white/[0.015] p-5 sm:p-6 shadow-inner transition-colors hover:border-white/10">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-xl theme-surface-soft theme-muted flex items-center justify-center glass-panel shadow-inner transition-transform duration-300 hover:scale-105 border border-white/5">
@@ -1530,7 +1548,7 @@ export default function CredentialsPanel({
       </div>
 
       {/* Actions */}
-      <div className="xl:col-span-2 space-y-4 rounded-2xl border border-theme-accent/10 bg-gradient-to-br from-theme-accent/[0.04] to-transparent p-6 shadow-inner">
+      <div className="2xl:col-span-2 space-y-4 rounded-2xl border border-theme-accent/10 bg-gradient-to-br from-theme-accent/[0.04] to-transparent p-5 sm:p-6 shadow-inner">
         <button
           onClick={onTestConnection}
           disabled={connection.isTesting || !ssh.host}

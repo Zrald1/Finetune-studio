@@ -11,7 +11,7 @@ import type {
 } from "../types";
 import { DEFAULT_DIGITAL_OCEAN } from "../types";
 import { api } from "../lib/tauri";
-import { CheckCircle2, Clock3, Cloud, Cpu, DollarSign, Download, FileSpreadsheet, Loader2, Radar, RefreshCw, Server, Trash2, Zap } from "lucide-react";
+import { CheckCircle2, Clock3, Cloud, Cpu, DollarSign, Download, FileSpreadsheet, Loader2, Radar, RefreshCw, Server, Trash2, X, Zap } from "lucide-react";
 
 interface ImageOption {
   value: string;
@@ -21,6 +21,14 @@ interface ImageOption {
 interface Props {
   config: AppConfig;
   onConfigChange: (patch: Partial<AppConfig>) => void;
+}
+
+type NotificationTone = "success" | "error" | "info";
+
+interface NotificationItem {
+  id: number;
+  text: string;
+  tone: NotificationTone;
 }
 
 const QUICK_START_IMAGES: ImageOption[] = [
@@ -149,10 +157,11 @@ export default function GpuServerManager({ config, onConfigChange }: Props) {
   // or null when no detection loop is active. The loop runs constantly until
   // the server is detected, then stops on its own.
   const [detecting, setDetecting] = useState<string | null>(null);
-  // Transient success toast shown when the user presses USE.
-  const [toast, setToast] = useState<string | null>(null);
+  // Right-side notification stack for GPU manager feedback.
+  const [notifications, setNotifications] = useState<NotificationItem[]>([]);
+  const nextNotificationId = useRef(1);
   const detectTimer = useRef<ReturnType<typeof setInterval> | null>(null);
-  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const notificationTimers = useRef<Map<number, ReturnType<typeof setTimeout>>>(new Map());
 
   const refreshUsage = useCallback(async () => {
     const nextUsage = await api.doListDropletUsage();
@@ -235,7 +244,7 @@ export default function GpuServerManager({ config, onConfigChange }: Props) {
 
   const sync = async () => {
     if (!digitalOcean.apiKey.trim()) {
-      setMessage("Add the DigitalOcean API token in Credentials first.");
+      setMessageWithNotification("Add the DigitalOcean API token in Credentials first.");
       return;
     }
     setLoading(true);
@@ -277,9 +286,9 @@ export default function GpuServerManager({ config, onConfigChange }: Props) {
         projectId: nextProject,
       });
       await refreshUsage();
-      setMessage(`Loaded DigitalOcean data: ${nextSizes.length} AMD GPU plans, ${nextImages.length} ROCm images, ${nextKeys.length} SSH keys, and ${nextDroplets.length} GPU droplets.`);
+      setMessageWithNotification(`Loaded DigitalOcean data: ${nextSizes.length} AMD GPU plans, ${nextImages.length} ROCm images, ${nextKeys.length} SSH keys, and ${nextDroplets.length} GPU droplets.`);
     } catch (e: any) {
-      setMessage(String(e));
+      setMessageWithNotification(String(e));
     } finally {
       setLoading(false);
     }
@@ -323,7 +332,7 @@ export default function GpuServerManager({ config, onConfigChange }: Props) {
         const found = next.find((d) => d.name === name);
         if (found && dropletReady(found)) {
           stopDetecting();
-          setMessage(`GPU server "${name}" is detected and running at ${publicIp(found)}.`);
+          setMessageWithNotification(`GPU server "${name}" is detected and running at ${publicIp(found)}.`);
         }
       } catch {
         // Transient API/network errors are ignored; the loop keeps polling.
@@ -334,17 +343,34 @@ export default function GpuServerManager({ config, onConfigChange }: Props) {
     detectTimer.current = setInterval(() => void poll(), 6000);
   };
 
-  const showToast = (text: string) => {
-    setToast(text);
-    if (toastTimer.current) clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => setToast(null), 3200);
+  const dismissNotification = (id: number) => {
+    const timer = notificationTimers.current.get(id);
+    if (timer) clearTimeout(timer);
+    notificationTimers.current.delete(id);
+    setNotifications((current) => current.filter((item) => item.id !== id));
+  };
+
+  const showNotification = (text: string, tone: NotificationTone = "success") => {
+    const id = nextNotificationId.current;
+    nextNotificationId.current += 1;
+    setNotifications((current) => [...current, { id, text, tone }]);
+    const timer = setTimeout(() => dismissNotification(id), 5200);
+    notificationTimers.current.set(id, timer);
+  };
+
+  const setMessageWithNotification = (text: string) => {
+    setMessage(text);
+    const lower = text.toLowerCase();
+    const tone = lower.includes("failed") || lower.includes("error") ? "error" : "success";
+    showNotification(text, tone);
   };
 
   // Tear down timers when the component unmounts.
   useEffect(() => {
     return () => {
       if (detectTimer.current) clearInterval(detectTimer.current);
-      if (toastTimer.current) clearTimeout(toastTimer.current);
+      notificationTimers.current.forEach((timer) => clearTimeout(timer));
+      notificationTimers.current.clear();
     };
   }, []);
 
@@ -360,13 +386,13 @@ export default function GpuServerManager({ config, onConfigChange }: Props) {
     setMessage(null);
     try {
       const droplet = await api.doCreateGpuDroplet({ ...digitalOcean, hourlyRateUsd: selectedHourlyRate });
-      setMessage(`Created ${droplet.name}. Detecting the GPU server — this runs until it is online.`);
+      setMessageWithNotification(`Created ${droplet.name}. Detecting the GPU server — this runs until it is online.`);
       await sync();
       await refreshUsage();
       // Kick off the constant detection loop; it stops once the server is up.
       startDetecting(droplet.name);
     } catch (e: any) {
-      setMessage(String(e));
+      setMessageWithNotification(String(e));
     } finally {
       setCreating(false);
     }
@@ -380,11 +406,11 @@ export default function GpuServerManager({ config, onConfigChange }: Props) {
       await api.doDestroyDroplet(digitalOcean, droplet.id);
       // If we were detecting this droplet, stop the loop.
       if (detecting === droplet.name) stopDetecting();
-      setMessage(`Delete requested for ${droplet.name}.`);
+      setMessageWithNotification(`Delete requested for ${droplet.name}.`);
       await sync();
       await refreshUsage();
     } catch (e: any) {
-      setMessage(String(e));
+      setMessageWithNotification(String(e));
     } finally {
       setLoading(false);
     }
@@ -397,9 +423,9 @@ export default function GpuServerManager({ config, onConfigChange }: Props) {
       const path = await api.doExportDropletUsageCsv();
       setUsageCsvPath(path);
       await refreshUsage();
-      setMessage(`Usage CSV saved: ${path}`);
+      setMessageWithNotification(`Usage CSV saved: ${path}`);
     } catch (e: any) {
-      setMessage(String(e));
+      setMessageWithNotification(String(e));
     } finally {
       setExportingUsage(false);
     }
@@ -409,8 +435,7 @@ export default function GpuServerManager({ config, onConfigChange }: Props) {
     const ip = publicIp(droplet);
     if (!ip) return;
     onConfigChange({ ssh: { ...config.ssh, host: ip, username: config.ssh.username || "root" } });
-    setMessage(`Now using "${droplet.name}" (${ip}) as the active GPU server.`);
-    showToast(`✓ Now using ${droplet.name} — ${ip}`);
+    setMessageWithNotification(`Now using "${droplet.name}" (${ip}) as the active GPU server.`);
   };
 
   const canCreate = !!digitalOcean.apiKey && !!digitalOcean.dropletName && !!digitalOcean.size && !!digitalOcean.image && selectedSshKeys.length > 0 && validHourlyRate(selectedHourlyRate);
@@ -748,12 +773,41 @@ export default function GpuServerManager({ config, onConfigChange }: Props) {
         )}
       </div>
 
-      {toast && (
-        <div className="app-toast">
-          <div className="flex items-center gap-3 rounded-2xl border border-emerald-500/40 bg-emerald-500/15 backdrop-blur-md px-5 py-3.5 shadow-2xl">
-            <CheckCircle2 className="w-5 h-5 text-emerald-300" />
-            <span className="text-sm-fluid font-black text-emerald-100">{toast}</span>
-          </div>
+      {notifications.length > 0 && (
+        <div className="app-toast-stack">
+          {notifications.map((notification) => (
+            <div
+              key={notification.id}
+              className={`app-toast flex items-start gap-3 rounded-2xl border backdrop-blur-md px-5 py-3.5 shadow-2xl ${
+                notification.tone === "error"
+                  ? "border-red-500/40 bg-red-500/15 text-red-100"
+                  : notification.tone === "info"
+                    ? "border-sky-500/40 bg-sky-500/15 text-sky-100"
+                    : "border-emerald-500/40 bg-emerald-500/15 text-emerald-100"
+              }`}
+            >
+              <CheckCircle2
+                className={`mt-0.5 h-5 w-5 shrink-0 ${
+                  notification.tone === "error"
+                    ? "text-red-300"
+                    : notification.tone === "info"
+                      ? "text-sky-300"
+                      : "text-emerald-300"
+                }`}
+              />
+              <span className="min-w-0 flex-1 text-sm-fluid font-black leading-snug">
+                {notification.text}
+              </span>
+              <button
+                type="button"
+                onClick={() => dismissNotification(notification.id)}
+                className="pointer-events-auto -mr-1 rounded px-1 text-white/45 hover:text-white"
+                aria-label="Dismiss notification"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          ))}
         </div>
       )}
     </div>
