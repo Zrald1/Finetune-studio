@@ -642,253 +642,280 @@ const mergeAndUpload = async () => {
         <PipelineProgressBar status={run.status} />
       </div>
 
-      {/* QUADRANT GRID REFRACTOR */}
-      <div className="flex-1 grid grid-cols-2 grid-rows-2 divide-x divide-y theme-surface-soft min-h-0 overflow-hidden">
-        
-        {/* TOP LEFT: Neon Learning Curve */}
-        <div className="p-5 flex flex-col min-h-0">
-          <div className="flex items-center justify-between mb-3 shrink-0">
-            <p className="text-[10px] uppercase tracking-[0.2em] theme-accent font-mono font-bold">
-              Learning Curve
-            </p>
-            {metrics.length > 0 && (
-              <div className="text-[10px] font-mono text-white/50 bg-white/5 px-2 py-0.5 rounded border border-white/5">
-                STEP {metrics[metrics.length-1].step}
-              </div>
-            )}
-          </div>
-          <div className="flex-1 min-h-0">
-            <LossChart points={metrics} />
-          </div>
-        </div>
-
-        {/* TOP RIGHT: Execution Logs */}
-        <div className="flex flex-col min-h-0">
-          <div className="p-3 border-b theme-surface-soft flex items-center justify-between bg-black/10 shrink-0">
-            <p className="text-[10px] uppercase tracking-[0.2em] theme-muted font-mono font-bold">
-              Execution Logs
-            </p>
-            <button
-              onClick={reloadLog}
-              disabled={reloading}
-              className="p-1 rounded theme-faint hover:theme-text hover:theme-surface-soft transition"
-            >
-              <RefreshCw className={`w-3 h-3 ${reloading ? "animate-spin" : ""}`} />
-            </button>
-          </div>
-          <div
-            ref={logBoxRef}
-            onScroll={onLogScroll}
-            className="flex-1 bg-black/30 p-4 text-[11px] font-mono leading-relaxed overflow-y-auto selection:bg-theme-selection scrollbar-thin"
-          >
-            {coloredLogs ?? <span className="theme-faint italic">Awaiting secure session feedback...</span>}
-          </div>
-          <div className="px-4 py-1 border-t theme-surface-soft bg-black/20 text-center shrink-0">
-            <p className="text-[8px] theme-faint font-mono tracking-widest uppercase">
-              SCROLL UP TO PAUSE • SCROLL TO BOTTOM TO TAIL
-            </p>
-          </div>
-        </div>
-
-        {/* BOTTOM LEFT: Run Stats */}
-        <div className="p-5 flex flex-col min-h-0 overflow-y-auto scrollbar-thin">
-          <div className="flex items-center justify-between mb-4 shrink-0">
-            <p className="text-[10px] uppercase tracking-[0.2em] theme-muted font-mono font-bold">
-              Run Stats
-            </p>
-            <span className="text-[9px] theme-faint font-mono tabular-nums uppercase">&nbsp;</span>
-          </div>
-          <div className="grid grid-cols-3 gap-3 shrink-0">
-            <Stat label="Kept" value={progress.kept.toLocaleString()} accent />
-            <Stat label="Scanned" value={progress.scanned.toLocaleString()} />
-            <Stat label="Fail" value={progress.rejected.toLocaleString()} muted />
-          </div>
-          <div className="flex-1 mt-4">
-            <TopicStats run={{ ...run, qaKept: progress.kept || run.qaKept, qaTotal: progress.scanned || run.qaTotal, qaRejected: progress.rejected || run.qaRejected }} />
-          </div>
-        </div>
-
-        {/* BOTTOM RIGHT: Inference & Controls */}
-        <div className="p-6 flex flex-col min-h-0 overflow-y-auto scrollbar-thin space-y-6">
-          {/* Inference Sandbox */}
-          <div className="space-y-3">
-            <div>
-              <p className="text-[10px] uppercase tracking-[0.2em] theme-accent font-mono font-bold">
-                Inference Sandbox
-              </p>
-              <p className="text-[11px] theme-muted mt-1 leading-relaxed">
-                Test the trained Student LoRA on the live GPU to verify domain knowledge transfer.
-              </p>
-            </div>
-            <div className="relative">
-              <textarea
-                value={testPrompt}
-                onChange={(e) => setTestPrompt(e.target.value)}
-                rows={3}
-                className="w-full px-4 py-3 theme-field border rounded-lg text-[12px] font-mono text-white/85 resize-none focus:outline-none focus:border-theme-accent transition leading-relaxed shadow-inner"
-              />
-              <button
-                onClick={runModelTest}
-                disabled={testing || !testPrompt.trim()}
-                className="absolute bottom-2 right-2 flex items-center gap-2 px-3 py-1 rounded theme-accent-bg text-black text-[10px] uppercase tracking-widest font-bold hover:brightness-110 disabled:opacity-50 transition shadow-lg"
-              >
-                {testing ? <Loader2 className="w-3 h-3 animate-spin" /> : <Send className="w-3 h-3" />}
-                Inference
-              </button>
-            </div>
-{testAnswer && (
-              <div className="bg-black/40 border border-emerald-500/20 rounded-lg p-4 text-[12px] text-emerald-200/85 whitespace-pre-wrap leading-relaxed">
-                <div className="text-[8px] uppercase tracking-widest text-emerald-400 font-bold mb-2 opacity-50 font-mono">Response Output</div>
-                {testAnswer}
-              </div>
-            )}
-          </div>
-
-          {/* Benchmark */}
-          <div className="border-t theme-surface-soft pt-5 space-y-3">
-            <div>
-              <p className="text-[10px] uppercase tracking-[0.2em] theme-accent font-mono font-bold">
-                Inference Benchmark
-              </p>
-              <p className="text-[11px] theme-muted mt-1 leading-relaxed">
-                Run {benchSampleSize}-sample evaluation against training dataset.
-              </p>
-            </div>
-            <div className="flex gap-3 items-center">
-              <input
-                type="number"
-                min={10}
-                max={500}
-                value={benchSampleSize}
-                onChange={(e) => setBenchSampleSize(Math.max(10, Math.min(500, Number(e.target.value))))}
-                className="w-20 px-3 py-2 theme-field border rounded-lg text-[12px] font-mono text-white focus:outline-none focus:border-theme-accent transition"
-              />
-              <button
-                onClick={runBenchmark}
-                disabled={benchRunning || run.status !== "done"}
-                className="flex items-center gap-2 px-4 py-2 rounded theme-accent-bg text-black text-[10px] uppercase tracking-widest font-bold hover:brightness-110 disabled:opacity-50 transition shadow-lg whitespace-nowrap"
-              >
-                {benchRunning ? <Loader2 className="w-4 h-4 animate-spin" /> : <Cpu className="w-4 h-4" />}
-                {benchRunning ? "Running..." : "Run Benchmark"}
-              </button>
-            </div>
-            {(benchRunning || benchLogs.length > 0) && (
-              <div className="bg-black/50 border border-white/10 rounded-lg p-3 max-h-32 overflow-y-auto scrollbar-thin">
-                {benchLogs.map((log, i) => (
-                  <div key={i} className="text-[10px] font-mono text-white/70 py-0.5 flex items-center gap-2">
-                    <span className="text-theme-accent/60">{">"}</span>
-                    <span>{log}</span>
-                  </div>
-                ))}
-                {benchRunning && (
-                  <div className="text-[10px] font-mono theme-accent animate-pulse py-0.5 flex items-center gap-2">
-                    <Loader2 className="w-3 h-3 animate-spin" />
-                    <span>Processing...</span>
-                  </div>
+      {/* Runs workspace */}
+      <div className="flex-1 min-h-0 grid grid-rows-[minmax(0,1fr)_auto] theme-surface-soft overflow-hidden">
+        <div className="min-h-0 grid grid-cols-1 xl:grid-cols-[380px_minmax(0,1fr)] grid-rows-[auto_minmax(0,1fr)] xl:grid-rows-1 overflow-hidden">
+          <div className="p-4 space-y-4 border-b xl:border-b-0 xl:border-r theme-surface-soft bg-black/10 overflow-hidden">
+            <section className="space-y-3">
+              <div className="flex items-center justify-between">
+                <p className="text-[10px] uppercase tracking-[0.2em] theme-muted font-mono font-bold">
+                  Run Stats
+                </p>
+                {metrics.length > 0 && (
+                  <span className="text-[9px] font-mono text-white/50 bg-white/5 px-2 py-0.5 rounded border border-white/5">
+                    STEP {metrics[metrics.length - 1].step}
+                  </span>
                 )}
               </div>
-            )}
-            {benchError && (
-              <div className="text-[11px] text-red-400 font-mono bg-red-950/30 border border-red-500/20 rounded-lg p-3">
-                {benchError}
+              <div className="grid grid-cols-3 gap-2">
+                <Stat label="Kept" value={progress.kept.toLocaleString()} accent />
+                <Stat label="Scanned" value={progress.scanned.toLocaleString()} />
+                <Stat label="Fail" value={progress.rejected.toLocaleString()} muted />
               </div>
-            )}
-            {benchResult && (
-              <div className="space-y-3">
+            </section>
+
+            <section className="space-y-3">
+              <div className="flex items-center justify-between">
+                <p className="text-[10px] uppercase tracking-[0.2em] theme-accent font-mono font-bold">
+                  Learning Curve
+                </p>
+                <span className="text-[9px] theme-faint font-mono uppercase">
+                  {metrics.length > 0 ? `${metrics.length} points` : "No telemetry"}
+                </span>
+              </div>
+              <div className="h-44 min-h-0">
+                <LossChart points={metrics} />
+              </div>
+            </section>
+
+            <section className="theme-surface border rounded p-3">
+              <TopicStats run={{ ...run, qaKept: progress.kept || run.qaKept, qaTotal: progress.scanned || run.qaTotal, qaRejected: progress.rejected || run.qaRejected }} />
+            </section>
+          </div>
+
+          <div className="min-h-0 grid grid-rows-[minmax(0,1fr)_minmax(220px,36%)] divide-y theme-surface-soft">
+            <section className="flex flex-col min-h-0">
+              <div className="p-3 border-b theme-surface-soft flex items-center justify-between bg-black/10 shrink-0">
+                <p className="text-[10px] uppercase tracking-[0.2em] theme-muted font-mono font-bold">
+                  Execution Logs
+                </p>
+                <button
+                  onClick={reloadLog}
+                  disabled={reloading}
+                  className="p-1 rounded theme-faint hover:theme-text hover:theme-surface-soft transition"
+                >
+                  <RefreshCw className={`w-3 h-3 ${reloading ? "animate-spin" : ""}`} />
+                </button>
+              </div>
+              <div
+                ref={logBoxRef}
+                onScroll={onLogScroll}
+                className="flex-1 min-h-0 bg-black/30 p-4 text-[11px] font-mono leading-relaxed overflow-y-auto selection:bg-theme-selection scrollbar-thin"
+              >
+                {coloredLogs ?? <span className="theme-faint italic">Awaiting secure session feedback...</span>}
+              </div>
+              <div className="px-4 py-1 border-t theme-surface-soft bg-black/20 text-center shrink-0">
+                <p className="text-[8px] theme-faint font-mono tracking-widest uppercase">
+                  SCROLL UP TO PAUSE • SCROLL TO BOTTOM TO TAIL
+                </p>
+              </div>
+            </section>
+
+            <section className="min-h-0 flex flex-col bg-black/20">
+              <div className="px-4 py-2 border-b theme-surface-soft flex items-center justify-between gap-3 shrink-0">
+                <div>
+                  <p className="text-[10px] uppercase tracking-[0.2em] theme-accent font-mono font-bold">
+                    Generated Q&A Samples
+                  </p>
+                  <p className="text-[9px] theme-faint font-mono uppercase tracking-widest">
+                    {previewTotal > 0
+                      ? `${previewOffset + 1}-${Math.min(previewOffset + previewPageSize, previewTotal)} of ${previewTotal}`
+                      : previewLoading
+                        ? "Loading samples"
+                        : "No accepted pairs yet"}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => setPreviewOffset((o) => Math.max(0, o - previewPageSize))}
+                    disabled={previewOffset === 0 || previewLoading}
+                    className="p-2 rounded theme-surface-soft border theme-faint hover:theme-text disabled:opacity-25 transition"
+                    title="Previous samples"
+                  >
+                    <ChevronLeft className="w-3.5 h-3.5" />
+                  </button>
+                  <button
+                    onClick={() => setPreviewOffset((o) => Math.min(Math.max(0, previewTotal - previewPageSize), o + previewPageSize))}
+                    disabled={previewOffset + previewPageSize >= previewTotal || previewLoading}
+                    className="p-2 rounded theme-surface-soft border theme-faint hover:theme-text disabled:opacity-25 transition"
+                    title="Next samples"
+                  >
+                    <ChevronRight className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </div>
+              <div className="flex-1 min-h-0 overflow-y-auto p-4 scrollbar-thin">
+                {previewLoading ? (
+                  <div className="h-24 flex items-center justify-center theme-faint font-mono text-[10px] uppercase tracking-widest">
+                    <Loader2 className="w-4 h-4 animate-spin mr-2" />
+                    Loading generated samples
+                  </div>
+                ) : (
+                  <DatasetPreview pairs={preview} />
+                )}
+              </div>
+            </section>
+          </div>
+        </div>
+
+        <div className="border-t theme-surface-soft bg-black/20 p-4 shrink-0">
+          <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1.1fr)_minmax(260px,0.8fr)_minmax(360px,1.1fr)] gap-4">
+            <section className="theme-surface border rounded p-4 space-y-3 min-w-0">
+              <div>
+                <p className="text-[10px] uppercase tracking-[0.2em] theme-accent font-mono font-bold">
+                  Inference Sandbox
+                </p>
+                <p className="text-[11px] theme-muted mt-1 leading-relaxed">
+                  Test the trained Student LoRA on the live GPU to verify domain knowledge transfer.
+                </p>
+              </div>
+              <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-3 items-end">
+                <textarea
+                  value={testPrompt}
+                  onChange={(e) => setTestPrompt(e.target.value)}
+                  rows={3}
+                  className="w-full px-3 py-2 theme-field border rounded-lg text-[12px] font-mono text-white/85 resize-none focus:outline-none focus:border-theme-accent transition leading-relaxed shadow-inner"
+                />
+                <button
+                  onClick={runModelTest}
+                  disabled={testing || !testPrompt.trim()}
+                  className="flex items-center gap-2 px-3 py-2 rounded theme-accent-bg text-black text-[10px] uppercase tracking-widest font-bold hover:brightness-110 disabled:opacity-50 transition shadow-lg"
+                >
+                  {testing ? <Loader2 className="w-3 h-3 animate-spin" /> : <Send className="w-3 h-3" />}
+                  Inference
+                </button>
+              </div>
+              {testAnswer && (
+                <div className="bg-black/40 border border-emerald-500/20 rounded-lg p-3 text-[11px] text-emerald-200/85 whitespace-pre-wrap leading-relaxed max-h-20 overflow-hidden">
+                  <div className="text-[8px] uppercase tracking-widest text-emerald-400 font-bold mb-1 opacity-50 font-mono">
+                    Response Output
+                  </div>
+                  {testAnswer}
+                </div>
+              )}
+            </section>
+
+            <section className="theme-surface border rounded p-4 space-y-3 min-w-0">
+              <div>
+                <p className="text-[10px] uppercase tracking-[0.2em] theme-accent font-mono font-bold">
+                  Inference Benchmark
+                </p>
+                <p className="text-[11px] theme-muted mt-1 leading-relaxed">
+                  Run {benchSampleSize}-sample evaluation against training dataset.
+                </p>
+              </div>
+              <div className="flex gap-3 items-center">
+                <input
+                  type="number"
+                  min={10}
+                  max={500}
+                  value={benchSampleSize}
+                  onChange={(e) => setBenchSampleSize(Math.max(10, Math.min(500, Number(e.target.value))))}
+                  className="w-20 px-3 py-2 theme-field border rounded-lg text-[12px] font-mono text-white focus:outline-none focus:border-theme-accent transition"
+                />
+                <button
+                  onClick={runBenchmark}
+                  disabled={benchRunning || run.status !== "done"}
+                  className="flex items-center gap-2 px-4 py-2 rounded theme-accent-bg text-black text-[10px] uppercase tracking-widest font-bold hover:brightness-110 disabled:opacity-50 transition shadow-lg whitespace-nowrap"
+                >
+                  {benchRunning ? <Loader2 className="w-4 h-4 animate-spin" /> : <Cpu className="w-4 h-4" />}
+                  {benchRunning ? "Running..." : "Run Benchmark"}
+                </button>
+              </div>
+              {benchResult && (
                 <div className="grid grid-cols-4 gap-2">
-                  <div className="bg-black/40 border border-emerald-500/20 rounded-lg p-3 text-center">
-                    <div className="text-2xl-fluid font-mono font-black text-emerald-400">{benchResult.accuracy}%</div>
+                  <div className="bg-black/40 border border-emerald-500/20 rounded-lg p-2 text-center">
+                    <div className="text-lg font-mono font-black text-emerald-400">{benchResult.accuracy}%</div>
                     <div className="text-[8px] uppercase tracking-widest text-emerald-400/60 font-mono mt-1">Accuracy</div>
                   </div>
-                  <div className="bg-black/40 border border-emerald-500/20 rounded-lg p-3 text-center">
-                    <div className="text-2xl-fluid font-mono font-black text-emerald-300">{benchResult.correct}</div>
+                  <div className="bg-black/40 border border-emerald-500/20 rounded-lg p-2 text-center">
+                    <div className="text-lg font-mono font-black text-emerald-300">{benchResult.correct}</div>
                     <div className="text-[8px] uppercase tracking-widest text-emerald-400/60 font-mono mt-1">Correct</div>
                   </div>
-                  <div className="bg-black/40 border border-amber-500/20 rounded-lg p-3 text-center">
-                    <div className="text-2xl-fluid font-mono font-black text-amber-300">{benchResult.partial}</div>
+                  <div className="bg-black/40 border border-amber-500/20 rounded-lg p-2 text-center">
+                    <div className="text-lg font-mono font-black text-amber-300">{benchResult.partial}</div>
                     <div className="text-[8px] uppercase tracking-widest text-amber-400/60 font-mono mt-1">Partial</div>
                   </div>
-                  <div className="bg-black/40 border border-red-500/20 rounded-lg p-3 text-center">
-                    <div className="text-2xl-fluid font-mono font-black text-red-300">{benchResult.missed}</div>
+                  <div className="bg-black/40 border border-red-500/20 rounded-lg p-2 text-center">
+                    <div className="text-lg font-mono font-black text-red-300">{benchResult.missed}</div>
                     <div className="text-[8px] uppercase tracking-widest text-red-400/60 font-mono mt-1">Missed</div>
                   </div>
                 </div>
-                <div className="max-h-64 overflow-y-auto scrollbar-thin space-y-2">
-                  {benchResult.samples.map((s: any, i: number) => (
-                    <div key={i} className={`bg-black/30 border rounded-lg p-3 text-[11px] font-mono ${s.match === "exact" ? "border-emerald-500/30" : s.match === "partial" ? "border-amber-500/30" : "border-red-500/30"}`}>
-                      <div className="flex items-start gap-2 mb-2">
-                        <span className={`shrink-0 w-6 h-6 rounded flex items-center justify-center text-[9px] font-black ${s.match === "exact" ? "bg-emerald-500/20 text-emerald-400" : s.match === "partial" ? "bg-amber-500/20 text-amber-400" : "bg-red-500/20 text-red-400"}`}>{s.match === "exact" ? "✓" : s.match === "partial" ? "~" : "✗"}</span>
-                        <span className="text-white/70 break-words whitespace-pre-wrap flex-1 min-w-0">{s.question}</span>
-                      </div>
-                      <div className="pl-8 space-y-1">
-                        <div className="break-words"><span className="text-[8px] uppercase tracking-widest text-emerald-400/50">Expected: </span><span className="text-emerald-300/80 whitespace-pre-wrap break-words">{s.expected}</span></div>
-                        <div className="break-words"><span className="text-[8px] uppercase tracking-widest text-blue-400/50">Model: </span><span className="text-blue-300/80 whitespace-pre-wrap break-words">{s.model_answer}</span></div>
-                      </div>
+              )}
+              {(benchRunning || benchLogs.length > 0 || benchError) && (
+                <div className="bg-black/50 border border-white/10 rounded-lg p-3 overflow-hidden">
+                  {benchLogs.slice(-2).map((log, i) => (
+                    <div key={i} className="text-[10px] font-mono text-white/70 py-0.5 flex items-center gap-2">
+                      <span className="text-theme-accent/60">{">"}</span>
+                      <span className="truncate">{log}</span>
                     </div>
                   ))}
+                  {benchRunning && (
+                    <div className="text-[10px] font-mono theme-accent animate-pulse py-0.5 flex items-center gap-2">
+                      <Loader2 className="w-3 h-3 animate-spin" />
+                      <span>Processing...</span>
+                    </div>
+                  )}
+                  {benchError && <div className="text-[10px] text-red-400 font-mono truncate">{benchError}</div>}
                 </div>
+              )}
+            </section>
+
+            <section className="theme-surface border rounded p-4 space-y-3 min-w-0">
+              <div>
+                <p className="text-[10px] uppercase tracking-[0.2em] theme-text/75 font-mono font-bold">
+                  Model Consolidation
+                </p>
+                <p className="text-[11px] theme-muted mt-1 leading-relaxed">
+                  Merge the base model with LoRA weights and publish a standalone repository.
+                </p>
               </div>
-            )}
-          </div>
-
-          {/* Model Consolidation */}
-          <div className="border-t theme-surface-soft pt-5 space-y-3">
-            <div>
-              <p className="text-[10px] uppercase tracking-[0.2em] theme-text/75 font-mono font-bold">
-                Model Consolidation
-              </p>
-<p className="text-[11px] theme-muted mt-1 leading-relaxed">
-                Merge the base model with LoRA weights and publish a standalone repository.
-              </p>
-            </div>
-            <div className="flex gap-2">
-              <input
-                value={mergeRepo}
-                onChange={(e) => setMergeRepo(e.target.value)}
-                placeholder="Zrald/GE-Ai-Zrald-2.5-merged"
-                className="flex-1 px-4 py-2 theme-field border rounded-lg text-[12px] font-mono text-white focus:outline-none focus:border-theme-accent transition"
-              />
-              <label className="flex items-center gap-2 px-3 py-2 rounded theme-surface border theme-text text-[9px] uppercase tracking-widest font-bold cursor-pointer hover:theme-surface-soft transition shadow-lg">
-                <input type="checkbox" checked={includeGguf} onChange={(e) => setIncludeGguf(e.target.checked)} className="w-3.5 h-3.5 accent-theme-accent" />
-                +GGUF
-              </label>
-              <button
-                onClick={async () => {
-                  setMerging(true);
-                  setMergeError(null);
-                  setMergeResult("");
-                  try {
-                    let result: string;
-                    if (includeGguf) {
-                      const r = await api.mergeConvertUploadModel(run.id, mergeRepo, ggufRepo, ggufQuantization);
-                      result = "Merged: " + r.mergedUrl + "\nGGUF: " + r.ggufUrl;
-                    } else {
-                      result = await api.mergeAndUploadModel(run.id, mergeRepo);
+              <div className="grid grid-cols-[minmax(0,1fr)_auto_auto] gap-2 items-center">
+                <input
+                  value={mergeRepo}
+                  onChange={(e) => setMergeRepo(e.target.value)}
+                  placeholder="Zrald/GE-Ai-Zrald-2.5-merged"
+                  className="min-w-0 px-3 py-2 theme-field border rounded-lg text-[12px] font-mono text-white focus:outline-none focus:border-theme-accent transition"
+                />
+                <label className="flex items-center gap-2 px-3 py-2 rounded theme-surface border theme-text text-[9px] uppercase tracking-widest font-bold cursor-pointer hover:theme-surface-soft transition shadow-lg">
+                  <input type="checkbox" checked={includeGguf} onChange={(e) => setIncludeGguf(e.target.checked)} className="w-3.5 h-3.5 accent-theme-accent" />
+                  +GGUF
+                </label>
+                <button
+                  onClick={async () => {
+                    setMerging(true);
+                    setMergeError(null);
+                    setMergeResult("");
+                    try {
+                      let result: string;
+                      if (includeGguf) {
+                        const r = await api.mergeConvertUploadModel(run.id, mergeRepo, ggufRepo, ggufQuantization);
+                        result = "Merged: " + r.mergedUrl + "\nGGUF: " + r.ggufUrl;
+                      } else {
+                        result = await api.mergeAndUploadModel(run.id, mergeRepo);
+                      }
+                      setMergeResult(result);
+                      onChanged();
+                    } catch (e: any) {
+                      setMergeError(e.message || String(e));
+                    } finally {
+                      setMerging(false);
                     }
-                    setMergeResult(result);
-                    onChanged();
-                  } catch (e: any) {
-                    setMergeError(e.message || String(e));
-                  } finally {
-                    setMerging(false);
-                  }
-                }}
-                disabled={merging || !mergeRepo.trim()}
-                className="flex items-center gap-2 px-4 py-2 rounded theme-surface border theme-text text-[10px] uppercase tracking-widest font-bold hover:theme-surface-soft transition shadow-lg whitespace-nowrap"
-              >
-                {merging ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-3 h-3" />}
-                Merge & Upload
-              </button>
-            </div>
-
-            {includeGguf && (
-              <div className="space-y-2 mt-3 p-3 bg-white/[0.02] rounded-lg border border-white/5">
-                <div className="flex gap-2 items-center">
+                  }}
+                  disabled={merging || !mergeRepo.trim()}
+                  className="flex items-center justify-center gap-2 px-4 py-2 rounded theme-surface border theme-text text-[10px] uppercase tracking-widest font-bold hover:theme-surface-soft transition shadow-lg whitespace-nowrap disabled:opacity-50"
+                >
+                  {merging ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-3 h-3" />}
+                  Merge & Upload
+                </button>
+              </div>
+              {includeGguf && (
+                <div className="grid grid-cols-[minmax(0,1fr)_96px] gap-2">
                   <input
                     value={ggufRepo}
                     onChange={(e) => setGgufRepo(e.target.value)}
                     placeholder="Zrald/GE-Ai-Zrald-2.5-gguf"
-                    className="flex-1 px-3 py-2 theme-field border rounded-lg text-[11px] font-mono text-white focus:outline-none focus:border-theme-accent transition"
+                    className="min-w-0 px-3 py-2 theme-field border rounded-lg text-[11px] font-mono text-white focus:outline-none focus:border-theme-accent transition"
                   />
                   <select
                     value={ggufQuantization}
@@ -901,66 +928,22 @@ const mergeAndUpload = async () => {
                     <option value="Q8_0">Q8</option>
                   </select>
                 </div>
-                <p className="text-[9px] theme-faint font-mono italic">
-                  Run locally: ollama run hf.co/{ggufRepo || `${run.hub?.modelId || "repo"}-gguf`}
-                </p>
-              </div>
-            )}
-
-            <p className="text-[9px] theme-faint font-mono italic">
-              Note: Full model weights can exceed 15GB. LoRA adapters are recommended for rapid iteration.
-            </p>
-            {mergeResult && (
-              <div className="bg-emerald-950/20 border border-emerald-500/30 rounded-lg p-4 text-[12px] text-emerald-300 font-mono whitespace-pre-wrap">
-                {mergeResult}
-              </div>
-            )}
+              )}
+              <p className="text-[9px] theme-faint font-mono italic">
+                Note: Full model weights can exceed 15GB. LoRA adapters are recommended for rapid iteration.
+              </p>
+              {mergeResult && (
+                <div className="bg-emerald-950/20 border border-emerald-500/30 rounded-lg p-3 text-[11px] text-emerald-300 font-mono whitespace-pre-wrap break-words">
+                  {mergeResult}
+                </div>
+              )}
+              {mergeError && (
+                <div className="text-[11px] text-red-400 font-mono bg-red-950/30 border border-red-500/20 rounded-lg p-3">
+                  {mergeError}
+                </div>
+              )}
+            </section>
           </div>
-        </div>
-      </div>
-
-      <div className="border-t theme-surface-soft bg-black/20 shrink-0 max-h-[300px] overflow-hidden">
-        <div className="px-4 py-2 border-b theme-surface-soft flex items-center justify-between gap-3">
-          <div>
-            <p className="text-[10px] uppercase tracking-[0.2em] theme-accent font-mono font-bold">
-              Generated Q&A Samples
-            </p>
-            <p className="text-[9px] theme-faint font-mono uppercase tracking-widest">
-              {previewTotal > 0
-                ? `${previewOffset + 1}-${Math.min(previewOffset + previewPageSize, previewTotal)} of ${previewTotal}`
-                : previewLoading
-                  ? "Loading samples"
-                  : "No accepted pairs yet"}
-            </p>
-          </div>
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => setPreviewOffset((o) => Math.max(0, o - previewPageSize))}
-              disabled={previewOffset === 0 || previewLoading}
-              className="p-2 rounded theme-surface-soft border theme-faint hover:theme-text disabled:opacity-25 transition"
-              title="Previous samples"
-            >
-              <ChevronLeft className="w-3.5 h-3.5" />
-            </button>
-            <button
-              onClick={() => setPreviewOffset((o) => Math.min(Math.max(0, previewTotal - previewPageSize), o + previewPageSize))}
-              disabled={previewOffset + previewPageSize >= previewTotal || previewLoading}
-              className="p-2 rounded theme-surface-soft border theme-faint hover:theme-text disabled:opacity-25 transition"
-              title="Next samples"
-            >
-              <ChevronRight className="w-3.5 h-3.5" />
-            </button>
-          </div>
-        </div>
-        <div className="max-h-[238px] overflow-y-auto p-4 scrollbar-thin">
-          {previewLoading ? (
-            <div className="h-24 flex items-center justify-center theme-faint font-mono text-[10px] uppercase tracking-widest">
-              <Loader2 className="w-4 h-4 animate-spin mr-2" />
-              Loading generated samples
-            </div>
-          ) : (
-            <DatasetPreview pairs={preview} />
-          )}
         </div>
       </div>
 
