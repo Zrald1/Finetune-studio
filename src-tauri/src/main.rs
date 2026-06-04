@@ -15,7 +15,10 @@ mod runs;
 mod serve;
 mod ssh;
 
-use crate::config::{AppConfig, DigitalOceanConfig, QdrantConfig, SshConfig, DockerConfig, TeacherConfig, EmbedderConfig};
+use crate::config::{
+    AppConfig, DigitalOceanConfig, DockerConfig, EmbedderConfig, QdrantConfig, SshConfig,
+    TeacherConfig,
+};
 use crate::error::{AppError, Result};
 use crate::pipeline::{PipelineRegistry, RunConfig};
 use crate::qdrant::Chunk;
@@ -50,9 +53,76 @@ async fn load_config() -> Result<AppConfig> {
 
 #[tauri::command]
 async fn read_local_file_text(path: String) -> Result<String> {
-    let content = tokio::fs::read_to_string(&path).await
+    let content = tokio::fs::read_to_string(&path)
+        .await
         .map_err(|e| AppError::config(format!("read local file `{}`: {}", path, e)))?;
     Ok(content)
+}
+
+fn is_ingestable_extension(ext: &str) -> bool {
+    matches!(
+        ext,
+        "pdf"
+            | "txt"
+            | "md"
+            | "docx"
+            | "pptx"
+            | "ppt"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "webp"
+            | "gif"
+            | "bmp"
+            | "tiff"
+            | "tif"
+    )
+}
+
+#[tauri::command]
+async fn list_ingestable_files(folder_path: String) -> Result<Vec<String>> {
+    let root = std::path::PathBuf::from(folder_path.trim());
+    if root.as_os_str().is_empty() {
+        return Err(AppError::config("folder path is empty"));
+    }
+    if !root.is_dir() {
+        return Err(AppError::config(format!(
+            "`{}` is not a folder",
+            root.display()
+        )));
+    }
+
+    tokio::task::spawn_blocking(move || {
+        let mut files = Vec::<String>::new();
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let Some(ext) = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|s| s.to_ascii_lowercase())
+                else {
+                    continue;
+                };
+                if is_ingestable_extension(&ext) {
+                    files.push(path.to_string_lossy().into_owned());
+                }
+            }
+        }
+        files.sort_by_key(|p| p.to_ascii_lowercase());
+        Ok(files)
+    })
+    .await
+    .map_err(|e| AppError::config(format!("scan folder task failed: {e}")))?
 }
 
 #[tauri::command]
@@ -71,7 +141,11 @@ async fn load_ingest_state() -> Result<String> {
     match tokio::fs::read_to_string(&path).await {
         Ok(content) => Ok(content),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok("{}".to_string()),
-        Err(e) => Err(AppError::config(format!("read ingest state `{}`: {}", path.display(), e))),
+        Err(e) => Err(AppError::config(format!(
+            "read ingest state `{}`: {}",
+            path.display(),
+            e
+        ))),
     }
 }
 
@@ -280,7 +354,7 @@ async fn ssh_exec_stream(
             }
         });
 
-tokio::select! {
+        tokio::select! {
             _ = session.exec_stream(&final_cmd, tx, None) => {}
             _ = async {
                 loop {
@@ -411,7 +485,11 @@ async fn restore_qdrant_snapshot(
 }
 
 #[tauri::command]
-async fn qdrant_upload_snapshot(cfg: QdrantConfig, collection: String, snapshot_path: String) -> Result<()> {
+async fn qdrant_upload_snapshot(
+    cfg: QdrantConfig,
+    collection: String,
+    snapshot_path: String,
+) -> Result<()> {
     qdrant::upload_snapshot(&cfg, &collection, std::path::Path::new(&snapshot_path)).await
 }
 
@@ -422,7 +500,13 @@ async fn qdrant_download_snapshot(
     snapshot_name: String,
     local_path: String,
 ) -> Result<()> {
-    qdrant::download_snapshot(&cfg, &collection, &snapshot_name, std::path::Path::new(&local_path)).await?;
+    qdrant::download_snapshot(
+        &cfg,
+        &collection,
+        &snapshot_name,
+        std::path::Path::new(&local_path),
+    )
+    .await?;
     Ok(())
 }
 
@@ -468,7 +552,10 @@ async fn serve_boot_embedder(
 ) -> Result<String> {
     let session = SshSession::connect(&ssh).await?;
     let embedder_cfg = if embedder.persistent {
-        DockerConfig { enabled: false, ..docker.clone() }
+        DockerConfig {
+            enabled: false,
+            ..docker.clone()
+        }
     } else {
         docker.clone()
     };
@@ -482,7 +569,8 @@ async fn serve_boot_embedder(
         Some(&move |line| {
             let _ = app_c.emit("setup://log", serde_json::json!({ "line": line }));
         }),
-    ).await?;
+    )
+    .await?;
     session.disconnect().await;
     Ok(host)
 }
@@ -517,9 +605,56 @@ async fn serve_boot_paddleocr(
         Some(&move |line| {
             let _ = app_c.emit("setup://log", serde_json::json!({ "line": line }));
         }),
-    ).await?;
+    )
+    .await?;
     session.disconnect().await;
     Ok(host)
+}
+
+async fn connect_ssh_with_setup_logs(app: &AppHandle, ssh: &SshConfig) -> Result<SshSession> {
+    const MAX_ATTEMPTS: usize = 5;
+    let mut last_err: Option<AppError> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let _ = app.emit(
+            "setup://log",
+            serde_json::json!({
+                "line": format!("[stage] connecting to GPU server (attempt {attempt}/{MAX_ATTEMPTS})\n")
+            }),
+        );
+        match SshSession::connect(ssh).await {
+            Ok(session) => {
+                let _ = app.emit(
+                    "setup://log",
+                    serde_json::json!({"line": "[ok] SSH connected\n"}),
+                );
+                return Ok(session);
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if attempt == MAX_ATTEMPTS {
+                    let _ = app.emit(
+                        "setup://log",
+                        serde_json::json!({
+                            "line": format!(
+                                "[error] SSH connection failed after {MAX_ATTEMPTS} attempts: {msg}\n[fix] verify the droplet is powered on, IP address is correct, port 22 is open, and the firewall/security group allows SSH from this machine.\n"
+                            )
+                        }),
+                    );
+                    return Err(e);
+                }
+                let wait_secs = 3u64 * attempt as u64;
+                let _ = app.emit(
+                    "setup://log",
+                    serde_json::json!({
+                        "line": format!("[warn] SSH attempt {attempt}/{MAX_ATTEMPTS} failed: {msg}; retrying in {wait_secs}s\n")
+                    }),
+                );
+                last_err = Some(e);
+                tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| AppError::ssh("SSH connection failed after retries")))
 }
 
 #[tauri::command]
@@ -531,15 +666,7 @@ async fn serve_setup_all_embedders(
     hf_token: Option<String>,
     paddle_ocr: Option<config::PaddleOcrConfig>,
 ) -> Result<Vec<serde_json::Value>> {
-    let _ = app.emit("setup://log", serde_json::json!({"line": "[stage] connecting to GPU server\n"}));
-    let session = match SshSession::connect(&ssh).await {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = app.emit("setup://log", serde_json::json!({"line": format!("[error] SSH connection failed: {e}\n")}));
-            return Err(e);
-        }
-    };
-    let _ = app.emit("setup://log", serde_json::json!({"line": "[ok] SSH connected\n"}));
+    let session = connect_ssh_with_setup_logs(&app, &ssh).await?;
 
     let mut resolved_docker = docker.clone();
     if docker.enabled {
@@ -559,25 +686,43 @@ async fn serve_setup_all_embedders(
         }
     }
 
-    let _ = app.emit("setup://log", serde_json::json!({"line": "[stage] ensuring Qdrant is running\n"}));
+    let _ = app.emit(
+        "setup://log",
+        serde_json::json!({"line": "[stage] ensuring Qdrant is running\n"}),
+    );
     match serve::ensure_qdrant(&session, &resolved_docker, 6333, "/root").await {
         Ok(()) => {
-            let _ = app.emit("setup://log", serde_json::json!({"line": "[ok] Qdrant ready\n"}));
+            let _ = app.emit(
+                "setup://log",
+                serde_json::json!({"line": "[ok] Qdrant ready\n"}),
+            );
         }
         Err(e) => {
-            let _ = app.emit("setup://log", serde_json::json!({"line": format!("[error] Qdrant setup failed: {e}\n")}));
+            let _ = app.emit(
+                "setup://log",
+                serde_json::json!({"line": format!("[error] Qdrant setup failed: {e}\n")}),
+            );
             return Err(e);
         }
     }
 
     if let Some(ref pocr) = paddle_ocr.filter(|p| p.enabled) {
-        let _ = app.emit("setup://log", serde_json::json!({"line": "[stage] checking PaddleOCR-VL\n"}));
+        let _ = app.emit(
+            "setup://log",
+            serde_json::json!({"line": "[stage] checking PaddleOCR-VL\n"}),
+        );
         match serve::health_check_paddleocr(&session, &resolved_docker, pocr.port).await {
             Ok(true) => {
-                let _ = app.emit("setup://log", serde_json::json!({"line": "[ok] PaddleOCR-VL already running\n"}));
+                let _ = app.emit(
+                    "setup://log",
+                    serde_json::json!({"line": "[ok] PaddleOCR-VL already running\n"}),
+                );
             }
             _ => {
-                let _ = app.emit("setup://log", serde_json::json!({"line": "[stage] booting PaddleOCR-VL\n"}));
+                let _ = app.emit(
+                    "setup://log",
+                    serde_json::json!({"line": "[stage] booting PaddleOCR-VL\n"}),
+                );
                 let app_c = app.clone();
                 match serve::boot_paddleocr(
                     &session,
@@ -586,9 +731,14 @@ async fn serve_setup_all_embedders(
                     Some(&move |line| {
                         let _ = app_c.emit("setup://log", serde_json::json!({ "line": line }));
                     }),
-                ).await {
+                )
+                .await
+                {
                     Ok(_) => {
-                        let _ = app.emit("setup://log", serde_json::json!({"line": "[ok] PaddleOCR-VL ready\n"}));
+                        let _ = app.emit(
+                            "setup://log",
+                            serde_json::json!({"line": "[ok] PaddleOCR-VL ready\n"}),
+                        );
                     }
                     Err(e) => {
                         let _ = app.emit("setup://log", serde_json::json!({"line": format!("[warn] PaddleOCR boot failed (non-fatal): {e}\n")}));
@@ -601,7 +751,10 @@ async fn serve_setup_all_embedders(
     let mut results = vec![];
     for embedder in embedders.iter() {
         let embedder_cfg = if embedder.persistent {
-            DockerConfig { enabled: false, ..resolved_docker.clone() }
+            DockerConfig {
+                enabled: false,
+                ..resolved_docker.clone()
+            }
         } else {
             resolved_docker.clone()
         };
@@ -622,12 +775,14 @@ async fn serve_setup_all_embedders(
             let _ = app.emit("setup://log", serde_json::json!({"line": format!("[ok] embeddings already exist ({} points) in collection '{}' for '{}'. Skipping deployment of embedder model.\n", c, collection_name, embedder.name)}));
             "existing_embeddings".to_string()
         } else {
-            match serve::health_check_embedder(&session, &embedder_cfg, "127.0.0.1", embedder.port).await {
+            match serve::health_check_embedder(&session, &embedder_cfg, "127.0.0.1", embedder.port)
+                .await
+            {
                 Ok(Some(_)) => {
                     let _ = app.emit("setup://log", serde_json::json!({"line": format!("[ok] '{}' already running\n", embedder.name)}));
                     "already_running".to_string()
                 }
-_ => {
+                _ => {
                     let _ = app.emit("setup://log", serde_json::json!({"line": format!("[stage] booting '{}' with {}\n", embedder.name, embedder.model_id)}));
                     let app_c = app.clone();
                     match serve::boot_embedder(
@@ -639,7 +794,9 @@ _ => {
                         Some(&move |line| {
                             let _ = app_c.emit("setup://log", serde_json::json!({ "line": line }));
                         }),
-                    ).await {
+                    )
+                    .await
+                    {
                         Ok(_) => {
                             let _ = app.emit("setup://log", serde_json::json!({"line": format!("[ok] '{}' ready on port {}\n", embedder.name, embedder.port)}));
                             "booted".to_string()
@@ -659,7 +816,10 @@ _ => {
             "status": status,
         }));
     }
-    let _ = app.emit("setup://log", serde_json::json!({"line": "[done] setup complete\n"}));
+    let _ = app.emit(
+        "setup://log",
+        serde_json::json!({"line": "[done] setup complete\n"}),
+    );
     session.disconnect().await;
     Ok(results)
 }
@@ -686,7 +846,10 @@ async fn ingest_documents(
     }
     let stream_id = format!("ingest-{}", Uuid::new_v4());
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    state.streams.lock().insert(stream_id.clone(), cancel.clone());
+    state
+        .streams
+        .lock()
+        .insert(stream_id.clone(), cancel.clone());
 
     let id_c = stream_id.clone();
     let app_c = app.clone();
@@ -695,14 +858,12 @@ async fn ingest_documents(
 
     let app_cfg = config::load().await.unwrap_or_default();
     let ocr_opts = match paddle_ocr {
-        Some(ref p) => {
-            ingest::PaddleOcrOptions {
-                enabled: true,
-                host: app_cfg.ssh.host.clone(),
-                port: p.port,
-                model_name: p.model_name.clone(),
-            }
-        }
+        Some(ref p) => ingest::PaddleOcrOptions {
+            enabled: true,
+            host: app_cfg.ssh.host.clone(),
+            port: p.port,
+            model_name: p.model_name.clone(),
+        },
         _ => ingest::PaddleOcrOptions {
             enabled: app_cfg.paddle_ocr.enabled || app_cfg.paddle_ocr.port != 0,
             host: app_cfg.ssh.host.clone(),
@@ -818,11 +979,7 @@ async fn cancel_run(state: State<'_, AppState>, run_id: String) -> Result<()> {
 }
 
 #[tauri::command]
-async fn resume_run(
-    state: State<'_, AppState>,
-    app: AppHandle,
-    run_id: String,
-) -> Result<String> {
+async fn resume_run(state: State<'_, AppState>, app: AppHandle, run_id: String) -> Result<String> {
     let cfg = config::load().await?;
     pipeline::resume(app, state.pipeline.clone(), cfg, run_id).await
 }
@@ -875,6 +1032,29 @@ async fn list_local_dataset(run_id: String, limit: usize) -> Result<Vec<serde_js
         }
     }
     Ok(out)
+}
+
+#[tauri::command]
+async fn list_local_dataset_page(
+    run_id: String,
+    offset: usize,
+    limit: usize,
+) -> Result<serde_json::Value> {
+    let run = runs::load(&run_id).await?;
+    let path = std::path::Path::new(&run.local_dir).join("qa_dataset.jsonl");
+    if !path.exists() {
+        return Ok(serde_json::json!({ "rows": [], "total": 0usize }));
+    }
+    let txt = tokio::fs::read_to_string(path).await?;
+    let lines: Vec<&str> = txt.lines().filter(|l| !l.trim().is_empty()).collect();
+    let total = lines.len();
+    let rows: Vec<serde_json::Value> = lines
+        .into_iter()
+        .skip(offset)
+        .take(limit.max(1))
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect();
+    Ok(serde_json::json!({ "rows": rows, "total": total }))
 }
 
 #[tauri::command]
@@ -986,7 +1166,11 @@ async fn ping_teacher(endpoint: String) -> Result<bool> {
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .map_err(AppError::Http)?;
-    Ok(c.get(url).send().await.map(|r| r.status().is_success()).unwrap_or(false))
+    Ok(c.get(url)
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false))
 }
 
 #[tauri::command]
@@ -1005,11 +1189,12 @@ async fn check_teacher_deployed(
 
     let docker_cfg = docker.clone();
 
-    let (model_to_check, port_to_check) = if let Some(ref cmd) = teacher.custom_serve_cmd.as_ref().filter(|s| !s.is_empty()) {
-        pipeline::extract_model_and_port(cmd, &teacher.repo_id, teacher.vllm_port)
-    } else {
-        (teacher.repo_id.clone(), teacher.vllm_port)
-    };
+    let (model_to_check, port_to_check) =
+        if let Some(ref cmd) = teacher.custom_serve_cmd.as_ref().filter(|s| !s.is_empty()) {
+            pipeline::extract_model_and_port(cmd, &teacher.repo_id, teacher.vllm_port)
+        } else {
+            (teacher.repo_id.clone(), teacher.vllm_port)
+        };
 
     // Scan all listening ports for a running vLLM teacher, same approach as pipeline.rs.
     let check_script = format!(
@@ -1062,14 +1247,22 @@ else: print('NOT_FOUND')\
     let check_probe = if docker_cfg.enabled {
         let mut is_running = false;
         let mut resolved_name = docker_cfg.container_name.clone();
-        if let Ok(ps_r) = session.exec_blocking("docker ps --format '{{.Names}}\t{{.Image}}'").await {
-            let running: Vec<(String, String)> = ps_r.stdout
+        if let Ok(ps_r) = session
+            .exec_blocking("docker ps --format '{{.Names}}\t{{.Image}}'")
+            .await
+        {
+            let running: Vec<(String, String)> = ps_r
+                .stdout
                 .lines()
                 .filter_map(|l| {
                     let mut it = l.splitn(2, '\t');
                     let n = it.next()?.trim().to_string();
                     let img = it.next().unwrap_or("").trim().to_string();
-                    if n.is_empty() { None } else { Some((n, img)) }
+                    if n.is_empty() {
+                        None
+                    } else {
+                        Some((n, img))
+                    }
                 })
                 .collect();
             let running_names: Vec<String> = running.iter().map(|(n, _)| n.clone()).collect();
@@ -1142,14 +1335,18 @@ async fn run_deploy_teacher_task(
         "kind": "info",
         "line": "[GPU CLEANUP] stopping PaddleOCR (paddleocr-vl); preserving rocm-vllm container, will kill non-persistent embedders inside...\n"
     }));
-    let cleanup_cmd = "docker stop paddleocr-vl 2>/dev/null; docker rm paddleocr-vl 2>/dev/null; true";
+    let cleanup_cmd =
+        "docker stop paddleocr-vl 2>/dev/null; docker rm paddleocr-vl 2>/dev/null; true";
     let ocr_cleanup = session.exec_blocking(cleanup_cmd).await;
     if let Err(e) = ocr_cleanup {
-        let _ = app.emit("deploy://log", serde_json::json!({
-            "streamId": id,
-            "kind": "info",
-            "line": format!("[GPU CLEANUP] PaddleOCR stop info: {}\n", e)
-        }));
+        let _ = app.emit(
+            "deploy://log",
+            serde_json::json!({
+                "streamId": id,
+                "kind": "info",
+                "line": format!("[GPU CLEANUP] PaddleOCR stop info: {}\n", e)
+            }),
+        );
     }
 
     let app_cfg = config::load().await.unwrap_or_default();
@@ -1194,18 +1391,29 @@ async fn run_deploy_teacher_task(
         let host_kill = pipeline::build_embedder_port_kill_cmd(&killable_ports);
         let _ = session.exec_blocking(&host_kill).await;
         let inner_kill = pipeline::build_embedder_port_kill_cmd(&killable_ports);
-        if let Ok(ps_r) = session.exec_blocking("docker ps --format '{{.Names}}' 2>/dev/null || true").await {
-            for cname in ps_r.stdout.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        if let Ok(ps_r) = session
+            .exec_blocking("docker ps --format '{{.Names}}' 2>/dev/null || true")
+            .await
+        {
+            for cname in ps_r
+                .stdout
+                .lines()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
                 let inner = pipeline::wrap_docker_cmd(&inner_kill, &cname);
                 let _ = session.exec_blocking(&inner).await;
             }
         }
 
-        let _ = app.emit("deploy://log", serde_json::json!({
-            "streamId": id,
-            "kind": "info",
-            "line": "[GPU CLEANUP] embedders stopped\n"
-        }));
+        let _ = app.emit(
+            "deploy://log",
+            serde_json::json!({
+                "streamId": id,
+                "kind": "info",
+                "line": "[GPU CLEANUP] embedders stopped\n"
+            }),
+        );
     }
 
     let gpu_state = ssh::nvidia_smi(&session).await.ok();
@@ -1235,21 +1443,25 @@ async fn run_deploy_teacher_task(
         match pipeline::ensure_container(&session, &docker_cfg).await {
             Ok(name) => container_name = name,
             Err(e) => {
-                let _ = app.emit("deploy://log", serde_json::json!({
-                    "streamId": id,
-                    "kind": "error",
-                    "line": format!("[DOCKER ERROR] {}\n", e)
-                }));
+                let _ = app.emit(
+                    "deploy://log",
+                    serde_json::json!({
+                        "streamId": id,
+                        "kind": "error",
+                        "line": format!("[DOCKER ERROR] {}\n", e)
+                    }),
+                );
                 return Err(e);
             }
         }
     }
 
-    let (_model_to_check, _port_to_check) = if let Some(ref cmd) = teacher.custom_serve_cmd.as_ref().filter(|s| !s.is_empty()) {
-        pipeline::extract_model_and_port(cmd, &teacher.repo_id, teacher.vllm_port)
-    } else {
-        (teacher.repo_id.clone(), teacher.vllm_port)
-    };
+    let (_model_to_check, _port_to_check) =
+        if let Some(ref cmd) = teacher.custom_serve_cmd.as_ref().filter(|s| !s.is_empty()) {
+            pipeline::extract_model_and_port(cmd, &teacher.repo_id, teacher.vllm_port)
+        } else {
+            (teacher.repo_id.clone(), teacher.vllm_port)
+        };
 
     let teacher_log = "/root/fine-tune/runs/teacher_deploy.log".to_string();
 
@@ -1260,7 +1472,9 @@ async fn run_deploy_teacher_task(
     // `fuser -k` whatever still holds the port (covers crashed parents whose
     // sockets are still bound). Then poll up to 10s for the port to actually
     // become free before declaring success.
-    let port_to_free = if let Some(ref cmd) = teacher.custom_serve_cmd.as_ref().filter(|s| !s.is_empty()) {
+    let port_to_free = if let Some(ref cmd) =
+        teacher.custom_serve_cmd.as_ref().filter(|s| !s.is_empty())
+    {
         let (_m, p) = pipeline::extract_model_and_port(cmd, &teacher.repo_id, teacher.vllm_port);
         p
     } else {
@@ -1302,7 +1516,8 @@ async fn run_deploy_teacher_task(
 
     let pkill_body = if has_protected_embedder {
         let vllm_pattern = pipeline::sh_quote(&format!("vllm serve {}", teacher.repo_id));
-        let sglang_pattern = pipeline::sh_quote(&format!("sglang.launch_server.*{}", teacher.repo_id));
+        let sglang_pattern =
+            pipeline::sh_quote(&format!("sglang.launch_server.*{}", teacher.repo_id));
         format!(
             "pkill -f {vllm_pattern} 2>/dev/null; \
              pkill -f {sglang_pattern} 2>/dev/null; \
@@ -1349,8 +1564,12 @@ async fn run_deploy_teacher_task(
     // will block port binding from container B. Iterate all running
     // containers and run the same kill body inside each.
     if docker_cfg.enabled {
-        if let Ok(ps_r) = session.exec_blocking("docker ps --format '{{.Names}}'").await {
-            let names: Vec<String> = ps_r.stdout
+        if let Ok(ps_r) = session
+            .exec_blocking("docker ps --format '{{.Names}}'")
+            .await
+        {
+            let names: Vec<String> = ps_r
+                .stdout
                 .lines()
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
@@ -1396,9 +1615,7 @@ async fn run_deploy_teacher_task(
         find_port_script.to_string()
     };
     let actual_port: u16 = match session.exec_blocking(&find_port_cmd).await {
-        Ok(r) => {
-            r.stdout.trim().parse().unwrap_or(port_to_free)
-        }
+        Ok(r) => r.stdout.trim().parse().unwrap_or(port_to_free),
         Err(_) => port_to_free,
     };
     if actual_port != port_to_free {
@@ -1414,13 +1631,16 @@ async fn run_deploy_teacher_task(
     }
 
     // Override port_to_check to use the actual port for boot and polling
-    let (_, port_to_check) = if let Some(ref cmd) = teacher.custom_serve_cmd.as_ref().filter(|s| !s.is_empty()) {
-        pipeline::extract_model_and_port(cmd, &teacher.repo_id, actual_port)
-    } else {
-        (teacher.repo_id.clone(), actual_port)
-    };
+    let (_, port_to_check) =
+        if let Some(ref cmd) = teacher.custom_serve_cmd.as_ref().filter(|s| !s.is_empty()) {
+            pipeline::extract_model_and_port(cmd, &teacher.repo_id, actual_port)
+        } else {
+            (teacher.repo_id.clone(), actual_port)
+        };
 
-    let boot_cmd = if let Some(ref cmd) = teacher.custom_serve_cmd.as_ref().filter(|s| !s.is_empty()) {
+    let boot_cmd = if let Some(ref cmd) =
+        teacher.custom_serve_cmd.as_ref().filter(|s| !s.is_empty())
+    {
         let custom_cmd_clean = cmd
             .replace("\\\n", " ")
             .replace("\\\r\n", " ")
@@ -1428,9 +1648,14 @@ async fn run_deploy_teacher_task(
             .replace('\r', " ");
 
         let mut final_custom_cmd = custom_cmd_clean.clone();
-        if !final_custom_cmd.contains("HF_TOKEN") && !final_custom_cmd.contains("HUGGING_FACE_HUB_TOKEN") {
+        if !final_custom_cmd.contains("HF_TOKEN")
+            && !final_custom_cmd.contains("HUGGING_FACE_HUB_TOKEN")
+        {
             if let Some(tok) = hf_token {
-                final_custom_cmd = format!("export HF_TOKEN={} HUGGING_FACE_HUB_TOKEN={}; {}", tok, tok, final_custom_cmd);
+                final_custom_cmd = format!(
+                    "export HF_TOKEN={} HUGGING_FACE_HUB_TOKEN={}; {}",
+                    tok, tok, final_custom_cmd
+                );
             }
         }
 
@@ -1438,22 +1663,32 @@ async fn run_deploy_teacher_task(
         if let Some(idx) = display_cmd.find("HF_TOKEN=") {
             let after_token = &display_cmd[idx + 9..];
             if let Some(space_idx) = after_token.find(' ') {
-                display_cmd = format!("{}HF_TOKEN=***{}", &display_cmd[..idx], &after_token[space_idx..]);
+                display_cmd = format!(
+                    "{}HF_TOKEN=***{}",
+                    &display_cmd[..idx],
+                    &after_token[space_idx..]
+                );
             } else {
                 display_cmd = format!("{}HF_TOKEN=***", &display_cmd[..idx]);
             }
         }
 
-        let _ = app.emit("deploy://log", serde_json::json!({
-            "streamId": id,
-            "kind": "info",
-            "line": "[stage] booting teacher vLLM\n"
-        }));
-        let _ = app.emit("deploy://log", serde_json::json!({
-            "streamId": id,
-            "kind": "info",
-            "line": format!("[cmd] {}\n", display_cmd)
-        }));
+        let _ = app.emit(
+            "deploy://log",
+            serde_json::json!({
+                "streamId": id,
+                "kind": "info",
+                "line": "[stage] booting teacher vLLM\n"
+            }),
+        );
+        let _ = app.emit(
+            "deploy://log",
+            serde_json::json!({
+                "streamId": id,
+                "kind": "info",
+                "line": format!("[cmd] {}\n", display_cmd)
+            }),
+        );
 
         if docker_cfg.enabled {
             // Use foreground docker exec with nohup inside so we can detect
@@ -1476,7 +1711,8 @@ async fn run_deploy_teacher_task(
                 log = teacher_log,
                 serve = pipeline::sh_quote(&final_custom_cmd),
             );
-            format!("docker exec {cn} bash -c {script}",
+            format!(
+                "docker exec {cn} bash -c {script}",
                 cn = container_name,
                 script = pipeline::sh_quote(&inner_script),
             )
@@ -1499,9 +1735,18 @@ async fn run_deploy_teacher_task(
         if repo_id_lower.contains("gguf") {
             let parts: Vec<&str> = teacher.repo_id.split('/').collect();
             let base_repo = if parts.len() >= 2 {
-                format!("{}/{}", parts[0], parts[1].split(':').next().unwrap_or(parts[1]))
+                format!(
+                    "{}/{}",
+                    parts[0],
+                    parts[1].split(':').next().unwrap_or(parts[1])
+                )
             } else {
-                teacher.repo_id.split(':').next().unwrap_or(&teacher.repo_id).to_string()
+                teacher
+                    .repo_id
+                    .split(':')
+                    .next()
+                    .unwrap_or(&teacher.repo_id)
+                    .to_string()
             };
             let base_model = base_repo
                 .replace("-GGUF", "")
@@ -1510,7 +1755,6 @@ async fn run_deploy_teacher_task(
                 .replace(".gguf", "");
             tokenizer_arg = format!("--tokenizer {}", base_model);
         }
-
 
         let vllm_env = {
             let mut envs = format!(
@@ -1529,7 +1773,10 @@ async fn run_deploy_teacher_task(
                  export OMP_NUM_THREADS=4; "
             );
             if let Some(tok) = hf_token {
-                envs.push_str(&format!("export HF_TOKEN={} HUGGING_FACE_HUB_TOKEN={}; ", tok, tok));
+                envs.push_str(&format!(
+                    "export HF_TOKEN={} HUGGING_FACE_HUB_TOKEN={}; ",
+                    tok, tok
+                ));
             }
             envs
         };
@@ -1550,16 +1797,22 @@ async fn run_deploy_teacher_task(
             tokenizer_arg,
             extra_args
         );
-        let _ = app.emit("deploy://log", serde_json::json!({
-            "streamId": id,
-            "kind": "info",
-            "line": "[stage] booting teacher vLLM\n"
-        }));
-        let _ = app.emit("deploy://log", serde_json::json!({
-            "streamId": id,
-            "kind": "info",
-            "line": format!("[cmd] {}\n", serve_cmd_display)
-        }));
+        let _ = app.emit(
+            "deploy://log",
+            serde_json::json!({
+                "streamId": id,
+                "kind": "info",
+                "line": "[stage] booting teacher vLLM\n"
+            }),
+        );
+        let _ = app.emit(
+            "deploy://log",
+            serde_json::json!({
+                "streamId": id,
+                "kind": "info",
+                "line": format!("[cmd] {}\n", serve_cmd_display)
+            }),
+        );
 
         let serve_cmd_inner = format!(
             "cd /app && {env}{runtime_prepare}vllm serve {model} --port {port} --host 0.0.0.0 \
@@ -1596,7 +1849,8 @@ async fn run_deploy_teacher_task(
                 log = teacher_log,
                 serve = pipeline::sh_quote(&serve_cmd_inner),
             );
-            format!("docker exec {cn} bash -c {script}",
+            format!(
+                "docker exec {cn} bash -c {script}",
                 cn = container_name,
                 script = pipeline::sh_quote(&inner_script),
             )
@@ -1621,16 +1875,28 @@ async fn run_deploy_teacher_task(
     let boot_stderr = boot_r.stderr.trim().to_string();
 
     if boot_r.exit_code != 0 {
-        let err_msg = format!("failed to start teacher (exit {}): {}{}",
+        let err_msg = format!(
+            "failed to start teacher (exit {}): {}{}",
             boot_r.exit_code,
-            if !boot_stdout.is_empty() { format!("\n{}", boot_stdout) } else { String::new() },
-            if !boot_stderr.is_empty() { format!("\n{}", boot_stderr) } else { String::new() },
+            if !boot_stdout.is_empty() {
+                format!("\n{}", boot_stdout)
+            } else {
+                String::new()
+            },
+            if !boot_stderr.is_empty() {
+                format!("\n{}", boot_stderr)
+            } else {
+                String::new()
+            },
         );
-        let _ = app.emit("deploy://log", serde_json::json!({
-            "streamId": id,
-            "kind": "error",
-            "line": format!("[error] {}\n", err_msg)
-        }));
+        let _ = app.emit(
+            "deploy://log",
+            serde_json::json!({
+                "streamId": id,
+                "kind": "error",
+                "line": format!("[error] {}\n", err_msg)
+            }),
+        );
         return Err(AppError::pipeline(err_msg));
     }
 
@@ -1639,18 +1905,24 @@ async fn run_deploy_teacher_task(
     if !boot_stdout.is_empty() {
         let failed = boot_stdout.contains("VLLM_FAILED");
         for line in boot_stdout.lines() {
-            let kind = if line.contains("VLLM_FAILED") || line.contains("Error") || line.contains("Traceback") {
+            let kind = if line.contains("VLLM_FAILED")
+                || line.contains("Error")
+                || line.contains("Traceback")
+            {
                 "error"
             } else if line.contains("VLLM_STARTED") {
                 "ok"
             } else {
                 "stdout"
             };
-            let _ = app.emit("deploy://log", serde_json::json!({
-                "streamId": id,
-                "kind": kind,
-                "line": format!("{}\n", line)
-            }));
+            let _ = app.emit(
+                "deploy://log",
+                serde_json::json!({
+                    "streamId": id,
+                    "kind": kind,
+                    "line": format!("{}\n", line)
+                }),
+            );
         }
         if failed {
             return Err(AppError::pipeline(
@@ -1659,11 +1931,14 @@ async fn run_deploy_teacher_task(
         }
     }
     if !boot_stderr.is_empty() {
-        let _ = app.emit("deploy://log", serde_json::json!({
-            "streamId": id,
-            "kind": "error",
-            "line": format!("[boot-stderr] {}\n", boot_stderr)
-        }));
+        let _ = app.emit(
+            "deploy://log",
+            serde_json::json!({
+                "streamId": id,
+                "kind": "error",
+                "line": format!("[boot-stderr] {}\n", boot_stderr)
+            }),
+        );
     }
 
     // Emit startup: let user know polling has begun
@@ -1682,20 +1957,26 @@ async fn run_deploy_teacher_task(
 
     loop {
         if cancel.load(std::sync::atomic::Ordering::SeqCst) {
-            let _ = app.emit("deploy://log", serde_json::json!({
-                "streamId": id,
-                "kind": "error",
-                "line": "Deployment cancelled by user\n"
-            }));
+            let _ = app.emit(
+                "deploy://log",
+                serde_json::json!({
+                    "streamId": id,
+                    "kind": "error",
+                    "line": "Deployment cancelled by user\n"
+                }),
+            );
             return Err(AppError::Cancelled);
         }
         if started.elapsed() > timeout {
             let err_msg = "teacher boot timeout (20 min)";
-            let _ = app.emit("deploy://log", serde_json::json!({
-                "streamId": id,
-                "kind": "error",
-                "line": format!("{}\n", err_msg)
-            }));
+            let _ = app.emit(
+                "deploy://log",
+                serde_json::json!({
+                    "streamId": id,
+                    "kind": "error",
+                    "line": format!("{}\n", err_msg)
+                }),
+            );
             return Err(AppError::pipeline(err_msg));
         }
 
@@ -1727,7 +2008,7 @@ async fn run_deploy_teacher_task(
             )
         };
         // Wrap in bash -c so pipes and semicolons are interpreted by a shell
-        let combo_cmd = format!("bash -c {}" , pipeline::sh_quote(&inner_combo));
+        let combo_cmd = format!("bash -c {}", pipeline::sh_quote(&inner_combo));
 
         let r = loop {
             match session.exec_blocking(&combo_cmd).await {
@@ -1740,11 +2021,14 @@ async fn run_deploy_teacher_task(
                     }));
                     let new_session = SshSession::connect(ssh).await?;
                     session = new_session;
-                    let _ = app.emit("deploy://log", serde_json::json!({
-                        "streamId": id,
-                        "kind": "info",
-                        "line": "[ssh] session reconnected, retrying probe...\n"
-                    }));
+                    let _ = app.emit(
+                        "deploy://log",
+                        serde_json::json!({
+                            "streamId": id,
+                            "kind": "info",
+                            "line": "[ssh] session reconnected, retrying probe...\n"
+                        }),
+                    );
                 }
             }
         };
@@ -1758,11 +2042,14 @@ async fn run_deploy_teacher_task(
                 let lines: Vec<&str> = log_chunk.lines().collect();
                 log_line_offset += lines.len() as u64;
                 for line in lines {
-                    let _ = app.emit("deploy://log", serde_json::json!({
-                        "streamId": id,
-                        "kind": "stdout",
-                        "line": format!("{}\n", line)
-                    }));
+                    let _ = app.emit(
+                        "deploy://log",
+                        serde_json::json!({
+                            "streamId": id,
+                            "kind": "stdout",
+                            "line": format!("{}\n", line)
+                        }),
+                    );
                 }
                 let lower = log_chunk.to_lowercase();
                 let engine_name = "vLLM";
@@ -1774,7 +2061,10 @@ async fn run_deploy_teacher_task(
                     || lower.contains("hip out of memory")
                     || lower.contains("outofmemoryerror")
                 {
-                    let err_msg = if lower.contains("out of memory") || lower.contains("hip out of memory") || lower.contains("outofmemoryerror") {
+                    let err_msg = if lower.contains("out of memory")
+                        || lower.contains("hip out of memory")
+                        || lower.contains("outofmemoryerror")
+                    {
                         format!(
                             "{} crashed during startup with an Out Of Memory (OOM) error. \
                              Suggestions:\n\
@@ -1783,7 +2073,9 @@ async fn run_deploy_teacher_task(
                              3. Ensure other GPU processes are stopped to free up VRAM.",
                             engine_name
                         )
-                    } else if lower.contains("deepseek_v4") || lower.contains("does not recognize this architecture") {
+                    } else if lower.contains("deepseek_v4")
+                        || lower.contains("does not recognize this architecture")
+                    {
                         format!(
                             "{} crashed because the container runtime does not support this model architecture yet. The deploy command now installs a Transformers build with DeepSeek V4 support before launching; deploy again to apply it.",
                             engine_name
@@ -1791,21 +2083,27 @@ async fn run_deploy_teacher_task(
                     } else {
                         format!("{} crashed during startup; check the streamed traceback above for the root cause", engine_name)
                     };
-                    let _ = app.emit("deploy://log", serde_json::json!({
-                        "streamId": id,
-                        "kind": "error",
-                        "line": format!("[error] {}\n", err_msg)
-                    }));
+                    let _ = app.emit(
+                        "deploy://log",
+                        serde_json::json!({
+                            "streamId": id,
+                            "kind": "error",
+                            "line": format!("[error] {}\n", err_msg)
+                        }),
+                    );
                     return Err(AppError::pipeline(err_msg));
                 }
             }
 
             if probe_code == "200" {
-                let _ = app.emit("deploy://log", serde_json::json!({
-                    "streamId": id,
-                    "kind": "ok",
-                    "line": format!("[ok] teacher model is serving on port {}\n", port_to_check)
-                }));
+                let _ = app.emit(
+                    "deploy://log",
+                    serde_json::json!({
+                        "streamId": id,
+                        "kind": "ok",
+                        "line": format!("[ok] teacher model is serving on port {}\n", port_to_check)
+                    }),
+                );
                 break;
             }
 
@@ -1823,11 +2121,14 @@ async fn run_deploy_teacher_task(
         } else {
             // bash -c itself failed or returned no output — emit stderr for debug
             if !r.stderr.trim().is_empty() {
-                let _ = app.emit("deploy://log", serde_json::json!({
-                    "streamId": id,
-                    "kind": "error",
-                    "line": format!("[poll-err] {}\n", r.stderr.trim())
-                }));
+                let _ = app.emit(
+                    "deploy://log",
+                    serde_json::json!({
+                        "streamId": id,
+                        "kind": "error",
+                        "line": format!("[poll-err] {}\n", r.stderr.trim())
+                    }),
+                );
             }
         }
 
@@ -1849,27 +2150,45 @@ async fn deploy_teacher(
 ) -> Result<String> {
     let stream_id = format!("deploy-{}", uuid::Uuid::new_v4());
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    state.streams.lock().insert(stream_id.clone(), cancel.clone());
+    state
+        .streams
+        .lock()
+        .insert(stream_id.clone(), cancel.clone());
 
     let id_c = stream_id.clone();
     let app_c = app.clone();
     tokio::spawn(async move {
-        let res = run_deploy_teacher_task(&app_c, &id_c, &ssh, &docker, &teacher, hf_token.as_deref(), &cancel).await;
+        let res = run_deploy_teacher_task(
+            &app_c,
+            &id_c,
+            &ssh,
+            &docker,
+            &teacher,
+            hf_token.as_deref(),
+            &cancel,
+        )
+        .await;
         match res {
             Ok(actual_port) => {
-                let _ = app_c.emit("deploy://done", serde_json::json!({
-                    "streamId": id_c,
-                    "success": true,
-                    "message": "Teacher model deployed successfully!",
-                    "port": actual_port
-                }));
+                let _ = app_c.emit(
+                    "deploy://done",
+                    serde_json::json!({
+                        "streamId": id_c,
+                        "success": true,
+                        "message": "Teacher model deployed successfully!",
+                        "port": actual_port
+                    }),
+                );
             }
             Err(e) => {
-                let _ = app_c.emit("deploy://done", serde_json::json!({
-                    "streamId": id_c,
-                    "success": false,
-                    "message": e.to_string()
-                }));
+                let _ = app_c.emit(
+                    "deploy://done",
+                    serde_json::json!({
+                        "streamId": id_c,
+                        "success": false,
+                        "message": e.to_string()
+                    }),
+                );
             }
         }
     });
@@ -1894,7 +2213,10 @@ async fn teacher_chat(
         .build()
         .map_err(AppError::Http)?;
     let res = c
-        .post(format!("{}/v1/chat/completions", endpoint.trim_end_matches('/')))
+        .post(format!(
+            "{}/v1/chat/completions",
+            endpoint.trim_end_matches('/')
+        ))
         .json(&body)
         .send()
         .await
@@ -2009,7 +2331,10 @@ generated = output_ids[0][inputs.input_ids.shape[-1]:]
 print(tokenizer.decode(generated, skip_special_tokens=True).strip())
 PY"#,
         run_dir = pipeline::sh_quote(&run.remote_dir),
-        base_model = serde_json::to_string(&crate::llamafactory::resolve_trainable_repo(&run.student_model)).unwrap_or_else(|_| "\"\"".to_string()),
+        base_model = serde_json::to_string(&crate::llamafactory::resolve_trainable_repo(
+            &run.student_model
+        ))
+        .unwrap_or_else(|_| "\"\"".to_string()),
         adapter_path = serde_json::to_string(&adapter_path).unwrap_or_else(|_| "\"\"".to_string()),
         prompt = serde_json::to_string(&prompt).unwrap_or_else(|_| "\"\"".to_string()),
     );
@@ -2023,15 +2348,14 @@ PY"#,
     if result.exit_code != 0 {
         return Err(AppError::pipeline(format!(
             "model test failed: {}{}",
-            result.stderr,
-            result.stdout
+            result.stderr, result.stdout
         )));
     }
     let answer = result.stdout.trim().to_string();
     if answer.is_empty() {
         return Err(AppError::pipeline("model test returned an empty answer"));
     }
-Ok(answer)
+    Ok(answer)
 }
 
 #[tauri::command]
@@ -2213,7 +2537,11 @@ PY"#,
         base_model = crate::llamafactory::resolve_trainable_repo(&run.student_model),
         adapter_path = &adapter_path,
         dataset_path = &dataset_path,
-        hf_repo_id = run.hub_dataset.enabled.then_some(run.hub_dataset.repo_id.as_str()).unwrap_or(""),
+        hf_repo_id = run
+            .hub_dataset
+            .enabled
+            .then_some(run.hub_dataset.repo_id.as_str())
+            .unwrap_or(""),
         sample_size = sample_size,
     );
     let cmd = if cfg.docker.enabled {
@@ -2224,7 +2552,10 @@ PY"#,
     let result = session.exec_blocking(&cmd).await?;
     session.disconnect().await;
     if result.exit_code != 0 {
-        return Err(AppError::pipeline(format!("benchmark failed: {}{}", result.stderr, result.stdout)));
+        return Err(AppError::pipeline(format!(
+            "benchmark failed: {}{}",
+            result.stderr, result.stdout
+        )));
     }
     let output = result.stdout.trim().to_string();
     if output.is_empty() {
@@ -2244,7 +2575,9 @@ async fn merge_and_upload_model(run_id: String, target_repo: Option<String>) -> 
         .hf_token
         .as_ref()
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| AppError::pipeline("Hugging Face token is required to upload a merged model"))?;
+        .ok_or_else(|| {
+            AppError::pipeline("Hugging Face token is required to upload a merged model")
+        })?;
 
     let repo = target_repo
         .map(|s| s.trim().to_string())
@@ -2336,7 +2669,10 @@ print(f"https://huggingface.co/{{repo_id}}")
 PY"#,
         run_dir = pipeline::sh_quote(&run.remote_dir),
         token = pipeline::sh_quote(token),
-        base_model = serde_json::to_string(&crate::llamafactory::resolve_trainable_repo(&run.student_model)).unwrap_or_else(|_| "\"\"".to_string()),
+        base_model = serde_json::to_string(&crate::llamafactory::resolve_trainable_repo(
+            &run.student_model
+        ))
+        .unwrap_or_else(|_| "\"\"".to_string()),
         adapter_path = serde_json::to_string(&adapter_path).unwrap_or_else(|_| "\"\"".to_string()),
         merged_dir = serde_json::to_string(&merged_dir).unwrap_or_else(|_| "\"\"".to_string()),
         repo = serde_json::to_string(&repo).unwrap_or_else(|_| "\"\"".to_string()),
@@ -2356,7 +2692,7 @@ PY"#,
             result.stdout.replace(token, "***")
         )));
     }
-run.hub.merged_model_id = repo.clone();
+    run.hub.merged_model_id = repo.clone();
     runs::save(&run).await?;
     Ok(result.stdout.trim().replace(token, "***"))
 }
@@ -2377,7 +2713,9 @@ async fn merge_convert_upload_model(
         .hf_token
         .as_ref()
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| AppError::pipeline("Hugging Face token is required to upload merged models"))?;
+        .ok_or_else(|| {
+            AppError::pipeline("Hugging Face token is required to upload merged models")
+        })?;
 
     let merged_repo = target_merged_repo
         .map(|s| s.trim().to_string())
@@ -2403,8 +2741,7 @@ async fn merge_convert_upload_model(
         })
         .ok_or_else(|| AppError::pipeline("target GGUF repo is empty"))?;
 
-    let quantization = gguf_quantization
-        .unwrap_or_else(|| "Q4_K_M".to_string());
+    let quantization = gguf_quantization.unwrap_or_else(|| "Q4_K_M".to_string());
 
     let session = SshSession::connect(&cfg.ssh).await?;
     let mut container_name = cfg.docker.container_name.clone();
@@ -2589,7 +2926,10 @@ print("[gguf] done: https://huggingface.co/" + gguf_repo)
 PY"#,
         run_dir = pipeline::sh_quote(&run.remote_dir),
         token = pipeline::sh_quote(token),
-        base_model = serde_json::to_string(&crate::llamafactory::resolve_trainable_repo(&run.student_model)).unwrap_or_else(|_| "\"\"".to_string()),
+        base_model = serde_json::to_string(&crate::llamafactory::resolve_trainable_repo(
+            &run.student_model
+        ))
+        .unwrap_or_else(|_| "\"\"".to_string()),
         adapter_path = serde_json::to_string(&adapter_path).unwrap_or_else(|_| "\"\"".to_string()),
         merged_dir = serde_json::to_string(&merged_dir).unwrap_or_else(|_| "\"\"".to_string()),
         gguf_dir = serde_json::to_string(&gguf_dir).unwrap_or_else(|_| "\"\"".to_string()),
@@ -2631,7 +2971,7 @@ PY"#,
 #[tauri::command]
 async fn cleanup_vram(cfg: SshConfig, docker: DockerConfig) -> Result<String> {
     let session = SshSession::connect(&cfg).await?;
-    
+
     let pkill_body = "pkill -f '[v]llm' 2>/dev/null; \
                       pkill -f '[l]lamafactory' 2>/dev/null; \
                       pkill -9 -f '[v]llm' 2>/dev/null; \
@@ -2643,8 +2983,12 @@ async fn cleanup_vram(cfg: SshConfig, docker: DockerConfig) -> Result<String> {
 
     // 2. Container sweep
     if docker.enabled {
-        if let Ok(ps_r) = session.exec_blocking("docker ps --format '{{.Names}}'").await {
-            let names: Vec<String> = ps_r.stdout
+        if let Ok(ps_r) = session
+            .exec_blocking("docker ps --format '{{.Names}}'")
+            .await
+        {
+            let names: Vec<String> = ps_r
+                .stdout
                 .lines()
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
@@ -2720,6 +3064,7 @@ fn main() {
             save_config,
             load_config,
             read_local_file_text,
+            list_ingestable_files,
             save_ingest_state,
             load_ingest_state,
             do_list_gpu_sizes,
@@ -2767,6 +3112,7 @@ fn main() {
             list_runs,
             get_run,
             list_local_dataset,
+            list_local_dataset_page,
             open_runs_folder,
             read_run_log,
 ping_teacher,
@@ -2815,14 +3161,19 @@ async fn ai_get_app_state() -> Result<serde_json::Value> {
 #[tauri::command]
 async fn ai_get_runs_summary() -> Result<Vec<serde_json::Value>> {
     let runs = runs::list().await?;
-    Ok(runs.into_iter().map(|r| serde_json::json!({
-        "id": r.id,
-        "name": r.name,
-        "status": r.status,
-        "teacherModel": r.teacher_model,
-        "studentModel": r.student_model,
-        "createdAt": r.created_at,
-    })).collect())
+    Ok(runs
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": r.id,
+                "name": r.name,
+                "status": r.status,
+                "teacherModel": r.teacher_model,
+                "studentModel": r.student_model,
+                "createdAt": r.created_at,
+            })
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -2866,7 +3217,7 @@ async fn ai_trigger_pipeline_action(action: String, _params: serde_json::Value) 
             let _ = runs::list().await?;
             Ok("Runs list refreshed".to_string())
         }
-        _ => Err(AppError::pipeline(format!("Unknown action: {}", action)))
+        _ => Err(AppError::pipeline(format!("Unknown action: {}", action))),
     }
 }
 
@@ -2914,10 +3265,16 @@ async fn ai_proxy_chat(
         .map_err(|e| AppError::pipeline(e.to_string()))?;
 
     let status = response.status();
-    let body = response.text().await.map_err(|e| AppError::pipeline(e.to_string()))?;
+    let body = response
+        .text()
+        .await
+        .map_err(|e| AppError::pipeline(e.to_string()))?;
 
     if !status.is_success() {
-        return Err(AppError::pipeline(format!("API error {}: {}", status, body)));
+        return Err(AppError::pipeline(format!(
+            "API error {}: {}",
+            status, body
+        )));
     }
 
     Ok(body)
@@ -2927,11 +3284,7 @@ async fn ai_proxy_chat(
 /// Runs server-side so it isn't subject to browser CORS restrictions — the
 /// frontend used to `fetch()` these endpoints directly and got blocked.
 #[tauri::command]
-async fn ai_list_models(
-    provider: String,
-    api_url: String,
-    api_key: String,
-) -> Result<Vec<String>> {
+async fn ai_list_models(provider: String, api_url: String, api_key: String) -> Result<Vec<String>> {
     // Build the /models endpoint from whatever base URL the user configured.
     let trimmed = api_url.trim().trim_end_matches('/').to_string();
     let endpoint = if trimmed.contains("/models") {
@@ -2945,7 +3298,9 @@ async fn ai_list_models(
     };
 
     let client = reqwest::Client::new();
-    let mut req = client.get(&endpoint).header("Content-Type", "application/json");
+    let mut req = client
+        .get(&endpoint)
+        .header("Content-Type", "application/json");
     if provider == "anthropic" {
         req = req
             .header("x-api-key", &api_key)
@@ -2959,9 +3314,15 @@ async fn ai_list_models(
         .await
         .map_err(|e| AppError::pipeline(e.to_string()))?;
     let status = response.status();
-    let body = response.text().await.map_err(|e| AppError::pipeline(e.to_string()))?;
+    let body = response
+        .text()
+        .await
+        .map_err(|e| AppError::pipeline(e.to_string()))?;
     if !status.is_success() {
-        return Err(AppError::pipeline(format!("models API error {}: {}", status, body)));
+        return Err(AppError::pipeline(format!(
+            "models API error {}: {}",
+            status, body
+        )));
     }
 
     let v: serde_json::Value = serde_json::from_str(&body)

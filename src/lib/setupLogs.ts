@@ -17,10 +17,12 @@ const MAX_LOG_BYTES = 128 * 1024;
 
 let buffer = "";
 let started = false;
+const subscribers = new Set<(text: string) => void>();
 
 /** Append a line to the rolling buffer (kept bounded to MAX_LOG_BYTES). */
 function append(line: string) {
   buffer = (buffer + line).slice(-MAX_LOG_BYTES);
+  subscribers.forEach((fn) => fn(buffer));
 }
 
 /**
@@ -43,6 +45,23 @@ export function getSetupLogTail(maxLines = 300): string {
   if (!buffer) return "";
   const lines = buffer.split(/\r?\n/);
   return lines.slice(-maxLines).join("\n");
+}
+
+export function getSetupLogSnapshot(): string {
+  return buffer;
+}
+
+export function subscribeSetupLogs(handler: (text: string) => void): () => void {
+  subscribers.add(handler);
+  handler(buffer);
+  return () => {
+    subscribers.delete(handler);
+  };
+}
+
+export function clearSetupLogs() {
+  buffer = "";
+  subscribers.forEach((fn) => fn(buffer));
 }
 
 /** True when any setup log has been captured this session. */

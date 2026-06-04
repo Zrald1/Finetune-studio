@@ -20,18 +20,13 @@ I will provide you with source material (treat it as your open notes / RAG datab
   SKIP: off-topic
 - Do NOT copy the source material verbatim. Rephrase, change numbers if mathematical, or shift the angle (e.g. solve for a different variable).
 - The question must be answerable strictly using facts from the source material.
+- Do NOT repeat a question, fact pattern, or legal-provision angle that has already been used in this generation run.
 
-3. Explain how it should be solved step-by-step inside the <think></think> tags. Even if it involves logical reasoning, words, mathematics, formulas, functions, or identifications, explain them clearly so any student can easily follow and understand.
-
-4. Provide the final ANSWER along with a simplified explanation of WHY it is the correct answer.
+3. Provide the final ANSWER along with a concise explanation of WHY it is correct.
 
 Format your response EXACTLY like this, with no extra commentary before or after:
 
 QUESTION: <the new question>
-
-<think>
-<step-by-step simplified explanation of the reasoning, logic, functions, words, or mathematical steps needed to solve the question, written so any student can understand it>
-</think>
 
 ANSWER: <the final answer, followed by a simplified explanation of why it is the correct answer>
 
@@ -59,8 +54,8 @@ pub struct GeneratedPair {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeneratorConfig {
-    pub teacher_endpoint: String,    // OpenAI-compatible base, e.g. http://127.0.0.1:8000
-    pub teacher_model: String,       // value passed as `model:` to /v1/chat/completions
+    pub teacher_endpoint: String, // OpenAI-compatible base, e.g. http://127.0.0.1:8000
+    pub teacher_model: String,    // value passed as `model:` to /v1/chat/completions
     pub prompt_template: String,
     pub temperature: f32,
     pub top_p: f32,
@@ -84,10 +79,9 @@ impl GeneratorConfig {
             top_p: 0.9,
             // Stops reasoning chains from looping the same derivation line.
             repetition_penalty: 1.05,
-            // 4096 because reasoning teachers (DeepSeek-R1-Distill etc.) emit
-            // long free-form thinking *before* the QUESTION:/ANSWER: block.
-            // At 1024 the response was getting truncated mid-think and the
-            // QUESTION: marker never appeared, so every chunk was rejected.
+            // 4096 keeps room for board-exam style choices and explanations.
+            // Some reasoning teachers still leak hidden reasoning despite the
+            // prompt; parsing strips that output before the pair is persisted.
             max_tokens: 4096,
             max_pairs_per_chunk: 1,
             concurrency: 4,
@@ -98,16 +92,17 @@ impl GeneratorConfig {
 
 fn http() -> Client {
     static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| {
-        Client::builder()
-            // Reasoning teachers at ~15 tok/s can take 4+ minutes to emit 4096
-            // tokens; 180s was cutting them off mid-stream and surfacing as
-            // [teacher-err] http error in the UI.
-            .timeout(std::time::Duration::from_secs(600))
-            .build()
-            .unwrap()
-    })
-    .clone()
+    CLIENT
+        .get_or_init(|| {
+            Client::builder()
+                // Reasoning teachers at ~15 tok/s can take 4+ minutes to emit 4096
+                // tokens; 180s was cutting them off mid-stream and surfacing as
+                // [teacher-err] http error in the UI.
+                .timeout(std::time::Duration::from_secs(600))
+                .build()
+                .unwrap()
+        })
+        .clone()
 }
 
 pub async fn ask_teacher(cfg: &GeneratorConfig, prompt: &str) -> Result<String> {
@@ -121,7 +116,10 @@ pub async fn ask_teacher(cfg: &GeneratorConfig, prompt: &str) -> Result<String> 
                     || msg.to_ascii_lowercase().contains("too many requests")
                     || msg.contains("concurrency_limit_exceeded")
                     || msg.contains("503")
-                    || msg.contains("504");
+                    || msg.contains("504")
+                    || msg.to_ascii_lowercase().contains("error sending request")
+                    || msg.to_ascii_lowercase().contains("connection")
+                    || msg.to_ascii_lowercase().contains("timeout");
                 if !retryable || attempt == 5 {
                     return Err(e);
                 }
@@ -138,7 +136,10 @@ pub async fn ask_teacher(cfg: &GeneratorConfig, prompt: &str) -> Result<String> 
 }
 
 async fn ask_teacher_once(cfg: &GeneratorConfig, prompt: &str) -> Result<String> {
-    let url = format!("{}/v1/chat/completions", cfg.teacher_endpoint.trim_end_matches('/'));
+    let url = format!(
+        "{}/v1/chat/completions",
+        cfg.teacher_endpoint.trim_end_matches('/')
+    );
     let body = json!({
         "model": cfg.teacher_model,
         "messages": [
@@ -199,13 +200,10 @@ impl ParseReject {
 /// when the response can't be parsed so the caller can log *why*.
 ///
 /// Handles both:
-///   - the requested format (QUESTION →  thinking… response → ANSWER), and
-///   - the older Q1/A1 format (Q1: … A1: …) used by some fine-tuned teachers,
-///   - reasoning models like DeepSeek-R1 that emit ` thinking… response` at the
-///     start before the QUESTION/ANSWER block.
-/// ` thinking` is now optional — if the model omits it we still keep the pair
-/// (think defaults to empty); historically requiring it was the main reason
-/// every chunk got rejected.
+///   - the requested QUESTION:/ANSWER: format,
+///   - the older Q1/A1 format used by some fine-tuned teachers,
+///   - reasoning models that leak `<think>...</think>` or
+///     `thinking ... response` wrappers before the usable answer.
 pub fn parse_pair(raw: &str, chunk: &Chunk) -> std::result::Result<GeneratedPair, ParseReject> {
     let trimmed = raw.trim_start();
     if trimmed.to_ascii_uppercase().starts_with("SKIP:") {
@@ -220,8 +218,11 @@ pub fn parse_pair(raw: &str, chunk: &Chunk) -> std::result::Result<GeneratedPair
     }
 
     // Try the canonical QUESTION:/ANSWER: format first.
-    let q_re = Regex::new(r"(?is)QUESTION\s*:\s*(.*?)(?:\n\s* thinking|\nANSWER\s*:|\z)").unwrap();
-    let t_re = Regex::new(r"(?is) thinking\s*(.*?)\s* response").unwrap();
+    let q_re =
+        Regex::new(r"(?is)QUESTION\s*:\s*(.*?)(?:\n\s*(?:<?think>|thinking\b)|\nANSWER\s*:|\z)")
+            .unwrap();
+    let think_tag_re = Regex::new(r"(?is)<?think>\s*(.*?)\s*</think>").unwrap();
+    let thinking_re = Regex::new(r"(?is)\bthinking\s*(.*?)\s*response").unwrap();
     let a_re = Regex::new(r"(?is)ANSWER\s*:\s*(.*)\z").unwrap();
 
     // Fallback: some fine-tuned teachers emit Q1:/A1: format instead.
@@ -234,28 +235,43 @@ pub fn parse_pair(raw: &str, chunk: &Chunk) -> std::result::Result<GeneratedPair
     let (q, a) = if has_question_fmt || !has_q1_fmt {
         // Use canonical QUESTION: format
         let question = match q_re.captures(raw) {
-            Some(c) => c.get(1).map(|m| m.as_str().trim().to_string()).unwrap_or_default(),
+            Some(c) => c
+                .get(1)
+                .map(|m| m.as_str().trim().to_string())
+                .unwrap_or_default(),
             None => return Err(ParseReject::NoQuestion),
         };
         if question.is_empty() {
             return Err(ParseReject::NoQuestion);
         }
         let answer = match a_re.captures(raw) {
-            Some(c) => c.get(1).map(|m| m.as_str().trim().to_string()).unwrap_or_default(),
+            Some(c) => c
+                .get(1)
+                .map(|m| m.as_str().trim().to_string())
+                .unwrap_or_default(),
             None => return Err(ParseReject::NoAnswer),
         };
-        (question, answer)
+        (
+            strip_thinking_blocks(&question),
+            strip_thinking_blocks(&answer),
+        )
     } else {
         // Use Q1: / A1: fallback format
         let question = match q1_re.captures(raw) {
-            Some(c) => c.get(1).map(|m| m.as_str().trim().to_string()).unwrap_or_default(),
+            Some(c) => c
+                .get(1)
+                .map(|m| m.as_str().trim().to_string())
+                .unwrap_or_default(),
             None => return Err(ParseReject::NoQuestion),
         };
         if question.is_empty() {
             return Err(ParseReject::NoQuestion);
         }
         let answer = match a1_re.captures(raw) {
-            Some(c) => c.get(1).map(|m| m.as_str().trim().to_string()).unwrap_or_default(),
+            Some(c) => c
+                .get(1)
+                .map(|m| m.as_str().trim().to_string())
+                .unwrap_or_default(),
             None => {
                 // If A1: not found, try everything after the last Q1: block as the answer
                 raw.splitn(2, |c: char| c == '\n')
@@ -265,24 +281,29 @@ pub fn parse_pair(raw: &str, chunk: &Chunk) -> std::result::Result<GeneratedPair
                     .to_string()
             }
         };
-        (question, answer)
+        (
+            strip_thinking_blocks(&question),
+            strip_thinking_blocks(&answer),
+        )
     };
 
     if a.len() < 20 {
         return Err(ParseReject::AnswerTooShort(a.len()));
     }
 
-    // ` thinking` is optional. R1-style reasoning models emit it at the top of
-    // the message; the formatted spec puts it between QUESTION and ANSWER.
-    // Either way, grab the first match if present.
-    let t = t_re
+    let t = think_tag_re
         .captures(raw)
         .and_then(|c| c.get(1).map(|m| m.as_str().trim().to_string()))
+        .or_else(|| {
+            thinking_re
+                .captures(raw)
+                .and_then(|c| c.get(1).map(|m| m.as_str().trim().to_string()))
+        })
         .unwrap_or_default();
 
     let messages = vec![
         serde_json::json!({ "role": "user", "content": q }),
-        serde_json::json!({ "role": "assistant", "content": format!(" thinking\n{}\n response\n{}", t, a) }),
+        serde_json::json!({ "role": "assistant", "content": a }),
     ];
 
     Ok(GeneratedPair {
@@ -298,7 +319,102 @@ pub fn parse_pair(raw: &str, chunk: &Chunk) -> std::result::Result<GeneratedPair
         source_text: chunk.text.clone(),
         topic: String::new(),
         messages: Some(messages),
-})
+    })
+}
+
+pub fn strip_thinking_blocks(text: &str) -> String {
+    let mut out = text.to_string();
+    let patterns = [
+        r"(?is)<?think>\s*.*?\s*</think>",
+        r"(?is)<thinking>\s*.*?\s*</thinking>",
+        r"(?is)\bthinking\s+.*?\s+\bresponse\b",
+    ];
+    for pattern in patterns {
+        if let Ok(re) = Regex::new(pattern) {
+            out = re.replace_all(&out, "").to_string();
+        }
+    }
+    out.trim().to_string()
+}
+
+pub fn normalize_question_for_dedup(question: &str) -> String {
+    let stripped = strip_thinking_blocks(question);
+    let mut out = String::with_capacity(stripped.len());
+    let mut last_space = true;
+    for ch in stripped.chars().flat_map(|c| c.to_lowercase()) {
+        if ch.is_alphanumeric() {
+            out.push(ch);
+            last_space = false;
+        } else if !last_space {
+            out.push(' ');
+            last_space = true;
+        }
+    }
+    out.trim().to_string()
+}
+
+fn token_similarity(a: &str, b: &str) -> f32 {
+    let a_tokens: std::collections::HashSet<&str> =
+        a.split_whitespace().filter(|t| t.len() > 2).collect();
+    let b_tokens: std::collections::HashSet<&str> =
+        b.split_whitespace().filter(|t| t.len() > 2).collect();
+    if a_tokens.is_empty() || b_tokens.is_empty() {
+        return 0.0;
+    }
+    let intersection = a_tokens.intersection(&b_tokens).count() as f32;
+    let union = a_tokens.union(&b_tokens).count() as f32;
+    if union <= 0.0 {
+        0.0
+    } else {
+        intersection / union
+    }
+}
+
+fn same_opening_fact_pattern(a: &str, b: &str) -> bool {
+    let a_words: Vec<&str> = a
+        .split_whitespace()
+        .filter(|w| w.len() > 2)
+        .take(14)
+        .collect();
+    let b_words: Vec<&str> = b
+        .split_whitespace()
+        .filter(|w| w.len() > 2)
+        .take(14)
+        .collect();
+    if a_words.len() < 10 || b_words.len() < 10 {
+        return false;
+    }
+    let same = a_words
+        .iter()
+        .zip(b_words.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    same >= 10
+}
+
+pub fn duplicate_question_reason(
+    question: &str,
+    accepted_normalized: &[String],
+) -> Option<&'static str> {
+    let normalized = normalize_question_for_dedup(question);
+    if normalized.len() < 12 {
+        return None;
+    }
+    for existing in accepted_normalized {
+        if existing == &normalized {
+            return Some("duplicate question");
+        }
+        let len_ratio = (normalized.len().min(existing.len()) as f32)
+            / (normalized.len().max(existing.len()) as f32);
+        let similarity = token_similarity(&normalized, existing);
+        if (len_ratio > 0.72 && similarity >= 0.86)
+            || (len_ratio > 0.84 && similarity >= 0.80)
+            || same_opening_fact_pattern(&normalized, existing)
+        {
+            return Some("near-duplicate question");
+        }
+    }
+    None
 }
 
 /// Build the prompt for a chunk by substituting `{chunk_text}`.
@@ -372,8 +488,7 @@ where
         total += n as u64;
 
         // Process this page with `cc` workers in flight.
-        let mut s = stream::iter(page.chunks.into_iter().map(&on_chunk))
-            .buffer_unordered(cc);
+        let mut s = stream::iter(page.chunks.into_iter().map(&on_chunk)).buffer_unordered(cc);
         while let Some(res) = s.next().await {
             res?;
         }

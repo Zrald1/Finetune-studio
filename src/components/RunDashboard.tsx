@@ -16,6 +16,7 @@ import {
   Folder,
   RefreshCw,
   ChevronRight,
+  ChevronLeft,
   Play,
   BookOpen,
   Cpu,
@@ -329,6 +330,9 @@ function RunDetail({ run, onChanged, gpuStatus }: { run: Run; onChanged: () => v
     initial.metrics.length > 0 ? initial.metrics : run.trainLossHistory || [],
   );
   const [preview, setPreview] = useState<PreviewPair[]>([]);
+  const [previewTotal, setPreviewTotal] = useState(0);
+  const [previewOffset, setPreviewOffset] = useState(0);
+  const [previewLoading, setPreviewLoading] = useState(false);
   const [reloading, setReloading] = useState(false);
   const [testPrompt, setTestPrompt] = useState(
     "What is the composition of the Professional Regulatory Board of Real Estate Service, and who appoints its members?",
@@ -353,6 +357,7 @@ function RunDetail({ run, onChanged, gpuStatus }: { run: Run; onChanged: () => v
   const isActive = !["done", "failed", "cancelled"].includes(run.status);
 
 const prevStatusRef = useRef<RunStatus | null>(null);
+  const previewPageSize = 5;
 
   useEffect(() => {
     setLogs(getStream(run.id).logs);
@@ -429,15 +434,30 @@ useEffect(() => {
   };
 
   useEffect(() => {
+    setPreviewOffset(0);
+  }, [run.id]);
+
+  useEffect(() => {
+    let active = true;
+    setPreviewLoading(true);
     (async () => {
       try {
-        const rows = (await api.listLocalDataset(run.id, 20)) as PreviewPair[];
-        setPreview(rows);
+        const page = await api.listLocalDatasetPage(run.id, previewOffset, previewPageSize);
+        if (!active) return;
+        setPreview(page.rows as PreviewPair[]);
+        setPreviewTotal(page.total || 0);
       } catch {
-        // empty
+        if (!active) return;
+        setPreview([]);
+        setPreviewTotal(0);
+      } finally {
+        if (active) setPreviewLoading(false);
       }
     })();
-  }, [run.id, run.status, progress.kept]);
+    return () => {
+      active = false;
+    };
+  }, [run.id, run.status, progress.kept, previewOffset]);
 
   const cancel = async () => {
     await api.cancelRun(run.id);
@@ -896,6 +916,51 @@ const mergeAndUpload = async () => {
               </div>
             )}
           </div>
+        </div>
+      </div>
+
+      <div className="border-t theme-surface-soft bg-black/20 shrink-0 max-h-[300px] overflow-hidden">
+        <div className="px-4 py-2 border-b theme-surface-soft flex items-center justify-between gap-3">
+          <div>
+            <p className="text-[10px] uppercase tracking-[0.2em] theme-accent font-mono font-bold">
+              Generated Q&A Samples
+            </p>
+            <p className="text-[9px] theme-faint font-mono uppercase tracking-widest">
+              {previewTotal > 0
+                ? `${previewOffset + 1}-${Math.min(previewOffset + previewPageSize, previewTotal)} of ${previewTotal}`
+                : previewLoading
+                  ? "Loading samples"
+                  : "No accepted pairs yet"}
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setPreviewOffset((o) => Math.max(0, o - previewPageSize))}
+              disabled={previewOffset === 0 || previewLoading}
+              className="p-2 rounded theme-surface-soft border theme-faint hover:theme-text disabled:opacity-25 transition"
+              title="Previous samples"
+            >
+              <ChevronLeft className="w-3.5 h-3.5" />
+            </button>
+            <button
+              onClick={() => setPreviewOffset((o) => Math.min(Math.max(0, previewTotal - previewPageSize), o + previewPageSize))}
+              disabled={previewOffset + previewPageSize >= previewTotal || previewLoading}
+              className="p-2 rounded theme-surface-soft border theme-faint hover:theme-text disabled:opacity-25 transition"
+              title="Next samples"
+            >
+              <ChevronRight className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </div>
+        <div className="max-h-[238px] overflow-y-auto p-4 scrollbar-thin">
+          {previewLoading ? (
+            <div className="h-24 flex items-center justify-center theme-faint font-mono text-[10px] uppercase tracking-widest">
+              <Loader2 className="w-4 h-4 animate-spin mr-2" />
+              Loading generated samples
+            </div>
+          ) : (
+            <DatasetPreview pairs={preview} />
+          )}
         </div>
       </div>
 

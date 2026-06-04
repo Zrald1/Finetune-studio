@@ -19,6 +19,7 @@ import { DEFAULT_AI_AGENT, POPULAR_MODELS } from "../types";
 import { api } from "../lib/tauri";
 import { getStream as getRunStream, hydrateFromDisk as hydrateRunFromDisk } from "../lib/runStreams";
 import { getSetupLogTail, hasSetupLogs } from "../lib/setupLogs";
+import { stripModelThinking } from "../lib/textSanitize";
 
 interface Message {
   role: "user" | "assistant" | "system";
@@ -395,7 +396,6 @@ export default function AITerminalPanel({
       messageQueueRef.current.push(feedbackContent);
       setQueueLength(messageQueueRef.current.length);
     } else {
-      setMessages((prev) => [...prev, { role: "user", content: feedbackContent }]);
       processAIMessage(feedbackContent);
     }
   };
@@ -777,11 +777,18 @@ Be proactive, concise, and act like an operator who runs the command first and e
       if (lang === "sh" || lang === "bash") {
         commands.push(content);
       } else if (content.includes("{topic}") && content.includes("{chunk_text}")) {
-        prompts.push(content);
+        prompts.push(stripModelThinking(content));
       } else {
         if (content.includes("{topic}") && content.includes("{chunk_text}")) {
-          prompts.push(content);
+          prompts.push(stripModelThinking(content));
         }
+      }
+    }
+
+    if (prompts.length === 0) {
+      const sanitized = stripModelThinking(msg.content);
+      if (sanitized.includes("{topic}") && sanitized.includes("{chunk_text}")) {
+        prompts.push(sanitized);
       }
     }
 

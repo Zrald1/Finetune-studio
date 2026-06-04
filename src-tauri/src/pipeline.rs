@@ -611,8 +611,14 @@ async fn run_pipeline(
         //  • Always stop paddleocr-vl   (only the OCR container — always safe)
         //  • Only stop rocm-vllm if the teacher is NOT already serving on the
         //    expected port (the boot block below will handle it when needed)
-        let teacher_port = if let Some(ref cmd) = run_cfg.teacher.custom_serve_cmd.as_ref().filter(|s| !s.is_empty()) {
-            let (_, p) = extract_model_and_port(cmd, &run_cfg.teacher.repo_id, run_cfg.teacher.vllm_port);
+        let teacher_port = if let Some(ref cmd) = run_cfg
+            .teacher
+            .custom_serve_cmd
+            .as_ref()
+            .filter(|s| !s.is_empty())
+        {
+            let (_, p) =
+                extract_model_and_port(cmd, &run_cfg.teacher.repo_id, run_cfg.teacher.vllm_port);
             p
         } else {
             run_cfg.teacher.vllm_port
@@ -624,7 +630,9 @@ async fn run_pipeline(
                 "curl -s -o /dev/null -w '%{{http_code}}' http://127.0.0.1:{}/v1/models 2>/dev/null || echo 000",
                 teacher_port
             );
-            session.exec_blocking(&probe).await
+            session
+                .exec_blocking(&probe)
+                .await
                 .map(|r| r.stdout.trim() == "200")
                 .unwrap_or(false)
         } else {
@@ -719,7 +727,12 @@ async fn run_pipeline(
                             let _ = session.exec_blocking(&inner).await;
                         }
                     }
-                    emit_log(app, &run.id, "[GPU CLEANUP] non-persistent embedders stopped\n", "stage");
+                    emit_log(
+                        app,
+                        &run.id,
+                        "[GPU CLEANUP] non-persistent embedders stopped\n",
+                        "stage",
+                    );
                 }
             }
         }
@@ -752,15 +765,16 @@ async fn run_pipeline(
         // running (live probe on :6333). With no Qdrant there is nothing to search,
         // so deploying an embedder would just waste VRAM — skip it entirely.
         // Also skipped in train_only / resumed-dataset modes (no generation).
-        let needs_embedder = !run_cfg.hub_dataset.train_only
-            && !(resume && run.dataset_ready);
+        let needs_embedder = !run_cfg.hub_dataset.train_only && !(resume && run.dataset_ready);
         if needs_embedder {
             let session = session_opt.as_ref().unwrap();
 
             // Live Qdrant probe on the GPU server.
             let qdrant_up = {
                 let probe = "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:6333/collections 2>/dev/null || echo 000";
-                session.exec_blocking(probe).await
+                session
+                    .exec_blocking(probe)
+                    .await
                     .map(|r| r.stdout.trim() == "200")
                     .unwrap_or(false)
             };
@@ -871,13 +885,7 @@ async fn run_pipeline(
                 );
                 let embedder_ready = tokio::time::timeout(
                     std::time::Duration::from_secs(600),
-                    crate::serve::wait_for_embedder(
-                        session,
-                        &embedder_cfg,
-                        embedder,
-                        600,
-                        None,
-                    ),
+                    crate::serve::wait_for_embedder(session, &embedder_cfg, embedder, 600, None),
                 )
                 .await;
                 match embedder_ready {
@@ -979,14 +987,21 @@ async fn run_pipeline(
                         .filter(|s| !s.is_empty())
                         .collect();
                     for cname in &names {
-                        if cname != &container_name && (cname.contains("vllm") || cname.contains("sglang") || cname.contains("paddleocr")) {
+                        if cname != &container_name
+                            && (cname.contains("vllm")
+                                || cname.contains("sglang")
+                                || cname.contains("paddleocr"))
+                        {
                             emit_log(
                                 app,
                                 &run.id,
                                 &format!("[GPU CLEANUP] stopping and removing container '{}' to free VRAM...\n", cname),
                                 "stage",
                             );
-                            let stop_cmd = format!("docker stop {} 2>/dev/null; docker rm {} 2>/dev/null; true", cname, cname);
+                            let stop_cmd = format!(
+                                "docker stop {} 2>/dev/null; docker rm {} 2>/dev/null; true",
+                                cname, cname
+                            );
                             let _ = session.exec_blocking(&stop_cmd).await;
                         } else {
                             let inner = wrap_docker_cmd(pkill_body, cname);
@@ -1021,7 +1036,8 @@ async fn run_pipeline(
     if run.teacher_cfg.repo_id != effective_teacher.repo_id
         || run.teacher_cfg.max_model_len != effective_teacher.max_model_len
         || run.teacher_cfg.dtype != effective_teacher.dtype
-        || (run.teacher_cfg.gpu_memory_utilization - effective_teacher.gpu_memory_utilization).abs() > f32::EPSILON
+        || (run.teacher_cfg.gpu_memory_utilization - effective_teacher.gpu_memory_utilization).abs()
+            > f32::EPSILON
     {
         run.teacher_cfg = effective_teacher.clone();
         let _ = runs::save(run).await;
@@ -1115,7 +1131,9 @@ else: print('NOT_FOUND')\
             let mut already_running = false;
             if let Ok(probe_r) = session.exec_blocking(&check_probe).await {
                 let out = probe_r.stdout.trim();
-                let found_line = out.lines().find(|l| l.starts_with("FOUND_PORT::") || l.starts_with("FIRST_PORT::"));
+                let found_line = out
+                    .lines()
+                    .find(|l| l.starts_with("FOUND_PORT::") || l.starts_with("FIRST_PORT::"));
                 if let Some(line) = found_line {
                     let parts: Vec<&str> = line.splitn(3, "::").collect();
                     if parts.len() == 3 {
@@ -1535,7 +1553,10 @@ else: print('NOT_FOUND')\
                             || lower.contains("outofmemoryerror")
                         {
                             let engine_name = "vLLM";
-                            let err_msg = if lower.contains("out of memory") || lower.contains("hip out of memory") || lower.contains("outofmemoryerror") {
+                            let err_msg = if lower.contains("out of memory")
+                                || lower.contains("hip out of memory")
+                                || lower.contains("outofmemoryerror")
+                            {
                                 format!(
                                     "{} crashed during startup with an Out Of Memory (OOM) error. \
                                      Suggestions:\n\
@@ -1544,7 +1565,9 @@ else: print('NOT_FOUND')\
                                      3. Ensure other GPU processes are stopped to free up VRAM.",
                                     engine_name
                                 )
-                            } else if lower.contains("deepseek_v4") || lower.contains("does not recognize this architecture") {
+                            } else if lower.contains("deepseek_v4")
+                                || lower.contains("does not recognize this architecture")
+                            {
                                 format!(
                                     "{} crashed because the container runtime does not support this model architecture yet. The deploy command now installs a Transformers build with DeepSeek V4 support before launching; deploy again to apply it.",
                                     engine_name
@@ -1783,11 +1806,13 @@ else: print('NOT_FOUND')\
         // same chunk isn't asked twice.
         let seen_chunk_ids: Arc<parking_lot::Mutex<std::collections::HashSet<String>>> =
             Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
+        let seen_questions: Arc<parking_lot::Mutex<Vec<String>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
 
         let mut qd_cfg = cfg.qdrant.clone();
         let max_chunks = run_cfg.max_chunks;
 
-// Build a per-embedder EmbeddingConfig so run_pipeline can embed topics.
+        // Build a per-embedder EmbeddingConfig so run_pipeline can embed topics.
         // When no explicit embedder_index is set on any topic (i.e., we fall back
         // to the first/default embedder), the pipeline uses embedder_1 (port 8101)
         // which should search ALL collections so no reviewer knowledge is missed.
@@ -1876,6 +1901,11 @@ else: print('NOT_FOUND')\
                             for p in parsed {
                                 if !p.source_chunk_id.is_empty() {
                                     seen_lock.insert(p.source_chunk_id.clone());
+                                }
+                                let normalized_question =
+                                    generator::normalize_question_for_dedup(&p.question);
+                                if !normalized_question.is_empty() {
+                                    seen_questions.lock().push(normalized_question);
                                 }
                                 pairs_lock.push(p);
                             }
@@ -1976,7 +2006,8 @@ else: print('NOT_FOUND')\
 
                 if topic_tag.is_none() && !topic_label.is_empty() {
                     if let Some(first_word) = topic_label.split_whitespace().next() {
-                        let sanitized = first_word.chars()
+                        let sanitized = first_word
+                            .chars()
                             .filter(|c| c.is_alphanumeric())
                             .collect::<String>()
                             .to_lowercase();
@@ -2036,6 +2067,7 @@ else: print('NOT_FOUND')\
                 let scanned_w = scanned.clone();
                 let kept_w = kept.clone();
                 let rejected_w = rejected.clone();
+                let seen_questions_w = seen_questions.clone();
                 let kept_topic_for_stop = kept_this_topic.clone();
                 let scanned_for_stop = scanned.clone();
 
@@ -2240,6 +2272,7 @@ else: print('NOT_FOUND')\
                 let run_in = run_id.clone();
                 let path_in = local_jsonl_path.clone();
                 let seen_in = seen_for_skip.clone();
+                let seen_questions_in = seen_questions_w.clone();
                 let push_repo_in = push_repo.clone();
                 let push_lock_in = push_lock.clone();
                 let push_last_pushed_in = push_last_pushed.clone();
@@ -2267,6 +2300,36 @@ else: print('NOT_FOUND')\
                             match generator::parse_pair(&raw, &chunk) {
                             Ok(mut pair) => {
                                 pair.topic = topic_label_in.clone();
+                                let duplicate_reason = {
+                                    let mut question_lock = seen_questions_in.lock();
+                                    if let Some(reason) = generator::duplicate_question_reason(
+                                        &pair.question,
+                                        question_lock.as_slice(),
+                                    ) {
+                                        Some(reason)
+                                    } else {
+                                        let normalized = generator::normalize_question_for_dedup(
+                                            &pair.question,
+                                        );
+                                        if !normalized.is_empty() {
+                                            question_lock.push(normalized);
+                                        }
+                                        None
+                                    }
+                                };
+                                if let Some(reason) = duplicate_reason {
+                                    *rej_in.lock() += 1;
+                                    emit_log(
+                                        &app_in,
+                                        &run_in,
+                                        &format!(
+                                            "[reject] chunk {} — {}\n",
+                                            chunk.id, reason
+                                        ),
+                                        "reject",
+                                    );
+                                    return Ok(());
+                                }
                                 *kept_in.lock() += 1;
                                 *kept_topic_in.lock() += 1;
                                 // Append to local JSONL
@@ -2445,36 +2508,50 @@ else: print('NOT_FOUND')\
                         "[retrieve] no topic focus set — scrolling all chunks page-by-page from Qdrant\n",
                         "stage",
                     );
-                    
+
                     let mut offset: Option<serde_json::Value> = None;
                     let mut page_idx = 0;
-                    
+
                     loop {
                         if !should_continue_fn() {
                             break;
                         }
-                        
-                        let page = match crate::qdrant::scroll(&qd_cfg, 256, offset.take(), topic_tag.as_deref()).await {
+
+                        let page = match crate::qdrant::scroll(
+                            &qd_cfg,
+                            256,
+                            offset.take(),
+                            topic_tag.as_deref(),
+                        )
+                        .await
+                        {
                             Ok(p) => p,
                             Err(e) => {
-                                return Err(AppError::pipeline(format!("scroll all failed: {}", e)));
+                                return Err(AppError::pipeline(format!(
+                                    "scroll all failed: {}",
+                                    e
+                                )));
                             }
                         };
-                        
+
                         if page.chunks.is_empty() {
                             break;
                         }
-                        
+
                         page_idx += 1;
                         emit_log(
                             app,
                             &run.id,
-                            &format!("[retrieve] processing chunk page {} ({} chunks)\n", page_idx, page.chunks.len()),
+                            &format!(
+                                "[retrieve] processing chunk page {} ({} chunks)\n",
+                                page_idx,
+                                page.chunks.len()
+                            ),
                             "stage",
                         );
-                        
+
                         offset = page.next_offset;
-                        
+
                         generator::for_each_in(
                             page.chunks,
                             concurrency,
@@ -2486,6 +2563,7 @@ else: print('NOT_FOUND')\
                                 let kept_in = kept_w.clone();
                                 let kept_topic_in = kept_this_topic.clone();
                                 let rej_in = rejected_w.clone();
+                                let seen_questions_in = seen_questions_w.clone();
                                 let app_in = app_clone.clone();
                                 let run_in = run_id.clone();
                                 let path_in = local_jsonl_path.clone();
@@ -2513,6 +2591,36 @@ else: print('NOT_FOUND')\
                                             match generator::parse_pair(&raw, &chunk) {
                                                 Ok(mut pair) => {
                                                     pair.topic = topic_label_in.clone();
+                                                    let duplicate_reason = {
+                                                        let mut question_lock = seen_questions_in.lock();
+                                                        if let Some(reason) = generator::duplicate_question_reason(
+                                                            &pair.question,
+                                                            question_lock.as_slice(),
+                                                        ) {
+                                                            Some(reason)
+                                                        } else {
+                                                            let normalized = generator::normalize_question_for_dedup(
+                                                                &pair.question,
+                                                            );
+                                                            if !normalized.is_empty() {
+                                                                question_lock.push(normalized);
+                                                            }
+                                                            None
+                                                        }
+                                                    };
+                                                    if let Some(reason) = duplicate_reason {
+                                                        *rej_in.lock() += 1;
+                                                        emit_log(
+                                                            &app_in,
+                                                            &run_in,
+                                                            &format!(
+                                                                "[reject] chunk {} — {}\n",
+                                                                chunk.id, reason
+                                                            ),
+                                                            "reject",
+                                                        );
+                                                        return Ok(());
+                                                    }
                                                     *kept_in.lock() += 1;
                                                     *kept_topic_in.lock() += 1;
                                                     let row = serde_json::to_string(&pair).unwrap_or_default();
@@ -2621,7 +2729,7 @@ else: print('NOT_FOUND')\
                                 }
                             }
                         ).await?;
-                        
+
                         if offset.is_none() {
                             break;
                         }
@@ -2709,11 +2817,7 @@ else: print('NOT_FOUND')\
         }
 
         // ── 3. Teacher unload — free VRAM for Student ───────────────────────
-        let zrald_keeps_local_reward_teacher = run
-            .lora
-            .method
-            .trim()
-            .eq_ignore_ascii_case("zrald")
+        let zrald_keeps_local_reward_teacher = run.lora.method.trim().eq_ignore_ascii_case("zrald")
             && run.lora.zrald_reward_endpoint.trim().is_empty();
         if zrald_keeps_local_reward_teacher {
             emit_log(
@@ -2751,14 +2855,21 @@ else: print('NOT_FOUND')\
                         .filter(|s| !s.is_empty())
                         .collect();
                     for cname in &names {
-                        if cname != &container_name && (cname.contains("vllm") || cname.contains("sglang") || cname.contains("paddleocr")) {
+                        if cname != &container_name
+                            && (cname.contains("vllm")
+                                || cname.contains("sglang")
+                                || cname.contains("paddleocr"))
+                        {
                             emit_log(
                                 app,
                                 &run.id,
                                 &format!("[GPU CLEANUP] stopping and removing container '{}' to free VRAM...\n", cname),
                                 "stage",
                             );
-                            let stop_cmd = format!("docker stop {} 2>/dev/null; docker rm {} 2>/dev/null; true", cname, cname);
+                            let stop_cmd = format!(
+                                "docker stop {} 2>/dev/null; docker rm {} 2>/dev/null; true",
+                                cname, cname
+                            );
                             let _ = session.exec_blocking(&stop_cmd).await;
                         } else {
                             let inner = wrap_docker_cmd(pkill_body, cname);
@@ -3172,7 +3283,7 @@ else: print('NOT_FOUND')\
         } else {
             String::new()
         };
-format!(
+        format!(
         "set -o pipefail; \
          python3 -c \"import site, os, shutil; [shutil.rmtree(os.path.join(p, 'triton_kernels'), ignore_errors=True) for p in (getattr(site, 'getsitepackages', lambda: [])() + [getattr(site, 'getusersitepackages', lambda: None)()]) if p]\" 2>/dev/null || true; \
          rm -rf ~/.triton/cache 2>/dev/null || true; \
@@ -3213,7 +3324,7 @@ format!(
         preflight_gpu_health(&session, cfg.docker.enabled, &container_name, run, app).await;
     }
 
-emit_log(app, &run.id, "[stage] training started\n", "stage");
+    emit_log(app, &run.id, "[stage] training started\n", "stage");
 
     // Hook into the streaming output to parse metrics.
     let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
@@ -3268,7 +3379,8 @@ emit_log(app, &run.id, "[stage] training started\n", "stage");
         // Track which dataset-prep stage lines we've already announced so each
         // `[stage] getting datasets` / tokenizing message fires once even though
         // LLaMA-Factory's loader logs repeat per dataset and tqdm re-emits bars.
-        let mut announced_stages: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut announced_stages: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         loop {
             tick.tick().await;
             if poller_done_c.load(std::sync::atomic::Ordering::SeqCst)
@@ -3378,7 +3490,10 @@ emit_log(app, &run.id, "[stage] training started\n", "stage");
     };
 
     let cancel_for_stream = cancel.clone();
-    let (_exit, final_run) = tokio::join!(session.exec_stream(&train_cmd, tx, Some(cancel_for_stream)), collector);
+    let (_exit, final_run) = tokio::join!(
+        session.exec_stream(&train_cmd, tx, Some(cancel_for_stream)),
+        collector
+    );
     *run = final_run;
     watch_handle.abort();
     // Tell the remote-tail poller to stop, then await it so we don't leak
@@ -4169,14 +4284,17 @@ async fn preflight_gpu_health(
     // 1) Is a GPU visible? rocm-smi (or amd-smi) should list a device. We check
     //    for a real device row, not just exit code, because rocm-smi can exit 0
     //    while printing an empty SMI log.
-    let smi_cmd = wrap(
-        "(rocm-smi --showproductname 2>/dev/null || amd-smi list 2>/dev/null || true)",
-    );
+    let smi_cmd =
+        wrap("(rocm-smi --showproductname 2>/dev/null || amd-smi list 2>/dev/null || true)");
     let gpu_visible = match session.exec_blocking(&smi_cmd).await {
         Ok(r) => {
             let o = r.stdout.to_lowercase();
             // Heuristics for "a GPU is actually listed".
-            (o.contains("gpu") || o.contains("card") || o.contains("series") || o.contains("instinct") || o.contains("radeon"))
+            (o.contains("gpu")
+                || o.contains("card")
+                || o.contains("series")
+                || o.contains("instinct")
+                || o.contains("radeon"))
                 && !o.contains("no gpu")
         }
         Err(_) => true, // can't tell — don't block training on a probe failure
@@ -4213,7 +4331,12 @@ async fn preflight_gpu_health(
     };
 
     if hip_ok {
-        emit_log(app, &run.id, "[ok] pre-flight: GPU visible and PyTorch HIP runtime healthy\n", "stage");
+        emit_log(
+            app,
+            &run.id,
+            "[ok] pre-flight: GPU visible and PyTorch HIP runtime healthy\n",
+            "stage",
+        );
         return;
     }
 
@@ -4238,13 +4361,23 @@ async fn preflight_gpu_health(
                 Err(_) => false,
             };
             if ok {
-                emit_log(app, &run.id, "[ok] auto-repair: ROCm PyTorch reinstalled — HIP runtime now healthy\n", "stage");
+                emit_log(
+                    app,
+                    &run.id,
+                    "[ok] auto-repair: ROCm PyTorch reinstalled — HIP runtime now healthy\n",
+                    "stage",
+                );
             } else {
                 emit_log(app, &run.id, "[warn] auto-repair ran but HIP is still unusable; training may fail. See the diagnosis after the run if it does.\n", "warn");
             }
         }
         Err(e) => {
-            emit_log(app, &run.id, &format!("[warn] auto-repair failed to reinstall ROCm PyTorch: {e}\n"), "warn");
+            emit_log(
+                app,
+                &run.id,
+                &format!("[warn] auto-repair failed to reinstall ROCm PyTorch: {e}\n"),
+                "warn",
+            );
         }
     }
 }
@@ -4440,12 +4573,7 @@ async fn sync_training_logs(
         // print a plain-language cause + the fix steps, so a recurring error
         // always ships with its solution and the user needn't SSH in to debug.
         if let Some((diagnosis, fixes)) = diagnose_failure(&err_txt) {
-            emit_log(
-                app,
-                &run.id,
-                &format!("[diagnosis] {diagnosis}\n"),
-                "warn",
-            );
+            emit_log(app, &run.id, &format!("[diagnosis] {diagnosis}\n"), "warn");
             for fix in fixes {
                 emit_log(app, &run.id, &format!("[fix] {fix}\n"), "warn");
             }
@@ -4470,7 +4598,9 @@ fn diagnose_failure(log_text: &str) -> Option<(String, Vec<String>)> {
         && !lower.contains("gpu[0]")
         && !lower.contains("card series")
         && !lower.contains("vram");
-    if rocm_smi_empty || lower.contains("device: cpu") || lower.contains("no usable hip accelerator")
+    if rocm_smi_empty
+        || lower.contains("device: cpu")
+        || lower.contains("no usable hip accelerator")
     {
         // Distinguish "GPU invisible" from "torch is a CUDA wheel".
         if rocm_smi_empty || has("device: cpu") {
@@ -4509,9 +4639,7 @@ fn diagnose_failure(log_text: &str) -> Option<(String, Vec<String>)> {
     }
 
     // 3) peft too old for recent unsloth (LoraConfig.ensure_weight_tying).
-    if has("ensure_weight_tying")
-        || (has("loraconfig") && has("unexpected keyword"))
-    {
+    if has("ensure_weight_tying") || (has("loraconfig") && has("unexpected keyword")) {
         return Some((
             "peft is older than unsloth requires (missing LoraConfig.ensure_weight_tying — needs peft ≥0.19).".to_string(),
             vec![
@@ -4547,7 +4675,9 @@ fn diagnose_failure(log_text: &str) -> Option<(String, Vec<String>)> {
             None => "a required Python package failed to import.".to_string(),
         };
         let fix = match &module {
-            Some(m) => format!("`pip install --no-cache-dir {m}` (inside the training container), then re-run."),
+            Some(m) => format!(
+                "`pip install --no-cache-dir {m}` (inside the training container), then re-run."
+            ),
             None => "Reinstall the training dependencies and re-run.".to_string(),
         };
         return Some((diag, vec![fix]));
@@ -4700,7 +4830,9 @@ fn build_zrald_train_cmd(run: &Run, lora: &LoraConfig, hf_export: &str) -> Resul
     let train_questions = lora.zrald_train_questions.max(1);
     let benchmark_questions = lora.zrald_benchmark_questions.min(train_questions).max(1);
     let num_generations = lora.zrald_num_generations.clamp(2, 8);
-    let max_completion_tokens = lora.zrald_max_completion_tokens.clamp(64, lora.cutoff_len.max(64));
+    let max_completion_tokens = lora
+        .zrald_max_completion_tokens
+        .clamp(64, lora.cutoff_len.max(64));
 
     let mut py = r#"import hashlib
 import inspect
@@ -5103,26 +5235,54 @@ print("[zrald] LoRA saved to", OUTPUT_DIR, flush=True)
 "#.to_string();
 
     let replacements = [
-        ("__BASE_MODEL__", serde_json::to_string(&base_model).unwrap_or_else(|_| "\"\"".to_string())),
-        ("__DATA_DIR__", serde_json::to_string(&data_dir).unwrap_or_else(|_| "\"\"".to_string())),
-        ("__RUN_DIR__", serde_json::to_string(&run.remote_dir).unwrap_or_else(|_| "\"\"".to_string())),
-        ("__OUTPUT_DIR__", serde_json::to_string(&output_dir).unwrap_or_else(|_| "\"\"".to_string())),
-        ("__REWARD_ENDPOINT__", serde_json::to_string(&reward_endpoint).unwrap_or_else(|_| "\"\"".to_string())),
-        ("__REWARD_MODEL__", serde_json::to_string(&reward_model).unwrap_or_else(|_| "\"\"".to_string())),
+        (
+            "__BASE_MODEL__",
+            serde_json::to_string(&base_model).unwrap_or_else(|_| "\"\"".to_string()),
+        ),
+        (
+            "__DATA_DIR__",
+            serde_json::to_string(&data_dir).unwrap_or_else(|_| "\"\"".to_string()),
+        ),
+        (
+            "__RUN_DIR__",
+            serde_json::to_string(&run.remote_dir).unwrap_or_else(|_| "\"\"".to_string()),
+        ),
+        (
+            "__OUTPUT_DIR__",
+            serde_json::to_string(&output_dir).unwrap_or_else(|_| "\"\"".to_string()),
+        ),
+        (
+            "__REWARD_ENDPOINT__",
+            serde_json::to_string(&reward_endpoint).unwrap_or_else(|_| "\"\"".to_string()),
+        ),
+        (
+            "__REWARD_MODEL__",
+            serde_json::to_string(&reward_model).unwrap_or_else(|_| "\"\"".to_string()),
+        ),
         ("__MAX_SEQ__", lora.cutoff_len.to_string()),
         ("__LORA_R__", lora.r.to_string()),
         ("__LORA_ALPHA__", lora.alpha.to_string()),
         ("__LR__", lora.learning_rate.to_string()),
         ("__EPOCHS__", lora.epochs.to_string()),
         ("__BATCH_SIZE__", lora.batch_size.max(1).to_string()),
-        ("__GRAD_ACCUM__", lora.gradient_accumulation.max(1).to_string()),
+        (
+            "__GRAD_ACCUM__",
+            lora.gradient_accumulation.max(1).to_string(),
+        ),
         ("__SAVE_STEPS__", lora.save_steps.max(1).to_string()),
         ("__TRAIN_LIMIT__", train_questions.to_string()),
         ("__BENCHMARK_N__", benchmark_questions.to_string()),
         ("__NUM_GENERATIONS__", num_generations.to_string()),
         ("__REWARD_TEMP__", lora.zrald_reward_temperature.to_string()),
         ("__MAX_COMPLETION__", max_completion_tokens.to_string()),
-        ("__LOAD_IN_4BIT__", if load_in_4bit { "True".to_string() } else { "False".to_string() }),
+        (
+            "__LOAD_IN_4BIT__",
+            if load_in_4bit {
+                "True".to_string()
+            } else {
+                "False".to_string()
+            },
+        ),
     ];
     for (needle, value) in replacements {
         py = py.replace(needle, &value);
@@ -5320,7 +5480,11 @@ print("[grpo] training complete; LoRA saved to", OUTPUT_DIR, flush=True)
 
     // Write the Python script via a literal-marker heredoc so bash does no
     // expansion (single-quoted 'PYEOF'). The shell-side script then runs it.
-    let heredoc = format!("cat > {script} <<'PYEOF'\n{py}\nPYEOF", script = sh_quote(&script_path), py = py);
+    let heredoc = format!(
+        "cat > {script} <<'PYEOF'\n{py}\nPYEOF",
+        script = sh_quote(&script_path),
+        py = py
+    );
 
     // GRPO doesn't read train.yaml — the surrounding pipeline still writes it
     // for resume/inspect purposes, but the trainer ignores it.
@@ -5457,7 +5621,10 @@ pub async fn ensure_container(session: &SshSession, cfg: &DockerConfig) -> Resul
     // Check if exists but stopped
     let check_exists = "docker ps -a --format '{{.Names}}'";
     let r_exists = session.exec_blocking(check_exists).await?;
-    let exists = r_exists.stdout.lines().any(|l| l.trim() == cfg.container_name);
+    let exists = r_exists
+        .stdout
+        .lines()
+        .any(|l| l.trim() == cfg.container_name);
     if exists {
         let start_cmd = format!("docker start {}", cfg.container_name);
         let r_start = session.exec_blocking(&start_cmd).await?;

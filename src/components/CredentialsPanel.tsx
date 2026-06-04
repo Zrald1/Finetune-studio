@@ -3,6 +3,7 @@ import type { AppConfig, ConnectionStatus, PaddleOcrConfig, QdrantConfig, SSHCon
 import { DEFAULT_AI_AGENT, DEFAULT_DIGITAL_OCEAN, POPULAR_MODELS, DEFAULT_EMBEDDING, DEFAULT_EMBEDDER } from "../types";
 import { CheckCircle2, Cloud, Container, Database, Download, Eye, EyeOff, Key, Loader2, LockKeyhole, RefreshCw, Save, Upload, Sparkles, Plus, Trash2, Server, Circle, ScanText, X, ChevronLeft, ChevronRight, FileText } from "lucide-react";
 import { api, events } from "../lib/tauri";
+import { clearSetupLogs, getSetupLogSnapshot, subscribeSetupLogs } from "../lib/setupLogs";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 
 interface Props {
@@ -34,6 +35,7 @@ export default function CredentialsPanel({
   const fileRef = useRef<HTMLInputElement>(null);
   const [settingUpEmbedders, setSettingUpEmbedders] = useState(false);
   const [embedderStatuses, setEmbedderStatuses] = useState<Record<number, "idle" | "booting" | "running" | "error">>({});
+  const [setupLogs, setSetupLogs] = useState(getSetupLogSnapshot());
   const [bootingOcr, setBootingOcr] = useState(false);
   const [ocrStatus, setOcrStatus] = useState<"idle" | "booting" | "running" | "error">("idle");
   const [ocrLogs, setOcrLogs] = useState("");
@@ -62,6 +64,10 @@ export default function CredentialsPanel({
   const qd = config.qdrant;
   const docker = config.docker;
   const digitalOcean = { ...DEFAULT_DIGITAL_OCEAN, ...(config.digitalOcean ?? {}) };
+  const isQdrantOfflineError = (err: unknown) =>
+    /error sending request|failed to fetch|network|timeout|timed out|connection|refused|10060|unreachable|could not connect|tcp/i.test(
+      err instanceof Error ? err.message : String(err),
+    );
 
   const patchSsh = (p: Partial<SSHConfig>) =>
     onChange({ ssh: { ...ssh, ...p } });
@@ -124,6 +130,8 @@ export default function CredentialsPanel({
 
   const embedders: EmbedderConfig[] = config.embedders ?? [];
 
+  useEffect(() => subscribeSetupLogs(setSetupLogs), []);
+
   const addEmbedder = () => {
     const newIdx = embedders.length;
     onChange({
@@ -146,6 +154,7 @@ export default function CredentialsPanel({
 
   const setupAllEmbedders = async () => {
     if (embedders.length === 0) return;
+    clearSetupLogs();
     setSettingUpEmbedders(true);
     const statuses: Record<number, "booting" | "running" | "error"> = {};
     embedders.forEach((_, i) => { statuses[i] = "booting"; });
@@ -193,12 +202,19 @@ export default function CredentialsPanel({
   };
 
   const loadQdrantSnapshots = async (collection: string) => {
+    if (collection === "all") {
+      setQdrantSnapshots([]);
+      return;
+    }
     setLoadingSnapshots(true);
     try {
       const snaps = await api.qdrantListSnapshots(qd, collection);
       setQdrantSnapshots(snaps);
     } catch (e) {
-      console.error("list snapshots:", e);
+      setQdrantSnapshots([]);
+      if (!isQdrantOfflineError(e)) {
+        console.error("list snapshots:", e);
+      }
     } finally {
       setLoadingSnapshots(false);
     }
@@ -206,6 +222,12 @@ export default function CredentialsPanel({
 
   const loadChunks = async (offsetVal: any = null) => {
     if (!qd.endpoint || !selectedCollection) return;
+    if (selectedCollection === "all") {
+      setChunks([]);
+      setNextOffset(null);
+      setChunksError(null);
+      return;
+    }
     setLoadingChunks(true);
     setChunksError(null);
     try {
@@ -217,6 +239,10 @@ export default function CredentialsPanel({
       if (/doesn'?t exist|not found|404/i.test(msg)) {
         setChunks([]);
         setNextOffset(null);
+      } else if (isQdrantOfflineError(e)) {
+        setChunks([]);
+        setNextOffset(null);
+        setChunksError(null);
       } else {
         console.error("Failed to load chunks:", e);
         setChunksError(msg);
@@ -300,7 +326,7 @@ export default function CredentialsPanel({
   };
 
   const saveSnapshot = async () => {
-    if (!selectedCollection) return;
+    if (!selectedCollection || selectedCollection === "all") return;
     setSnapshotSaving(true);
     setSnapshotStatus(null);
     try {
@@ -310,15 +336,20 @@ export default function CredentialsPanel({
       await loadQdrantCollections();
       await reloadSelectedCollection();
     } catch (e: any) {
-      setSnapshotStatus(e.message || "Failed to save snapshot");
-      setSnapshotIsError(true);
+      if (isQdrantOfflineError(e)) {
+        setSnapshotStatus(null);
+        setSnapshotIsError(false);
+      } else {
+        setSnapshotStatus(e.message || "Failed to save snapshot");
+        setSnapshotIsError(true);
+      }
     } finally {
       setSnapshotSaving(false);
     }
   };
 
   const uploadSnapshotDb = async () => {
-    if (!selectedCollection) return;
+    if (!selectedCollection || selectedCollection === "all") return;
     try {
       const { open } = await import("@tauri-apps/plugin-dialog");
       const files = await open({
@@ -334,8 +365,13 @@ export default function CredentialsPanel({
       setSnapshotIsError(false);
       await reloadSelectedCollection();
     } catch (e: any) {
-      setSnapshotStatus(e.message || "Failed to upload snapshot");
-      setSnapshotIsError(true);
+      if (isQdrantOfflineError(e)) {
+        setSnapshotStatus(null);
+        setSnapshotIsError(false);
+      } else {
+        setSnapshotStatus(e.message || "Failed to upload snapshot");
+        setSnapshotIsError(true);
+      }
     } finally {
       setSnapshotUploading(false);
     }
@@ -365,8 +401,13 @@ export default function CredentialsPanel({
       }
       if (selectedCollection) await reloadSelectedCollection();
     } catch (e: any) {
-      setSnapshotStatus(e.message || "Failed to save all snapshots");
-      setSnapshotIsError(true);
+      if (isQdrantOfflineError(e)) {
+        setSnapshotStatus(null);
+        setSnapshotIsError(false);
+      } else {
+        setSnapshotStatus(e.message || "Failed to save all snapshots");
+        setSnapshotIsError(true);
+      }
     } finally {
       setSavingAll(false);
     }
@@ -384,8 +425,13 @@ export default function CredentialsPanel({
       setSnapshotStatus(`Downloaded ${paths.length} snapshots to ${dirPath}`);
       setSnapshotIsError(false);
     } catch (e: any) {
-      setSnapshotStatus(e.message || "Failed to download all snapshots");
-      setSnapshotIsError(true);
+      if (isQdrantOfflineError(e)) {
+        setSnapshotStatus(null);
+        setSnapshotIsError(false);
+      } else {
+        setSnapshotStatus(e.message || "Failed to download all snapshots");
+        setSnapshotIsError(true);
+      }
     } finally {
       setDownloadingAll(false);
     }
@@ -824,7 +870,7 @@ export default function CredentialsPanel({
               <div className="flex gap-2 flex-wrap">
                 <button
                   onClick={saveSnapshot}
-                  disabled={snapshotSaving || !selectedCollection}
+                  disabled={snapshotSaving || !selectedCollection || selectedCollection === "all"}
                   className="flex items-center gap-2 px-4 py-2 theme-accent-bg text-black text-[10px] uppercase tracking-widest font-black rounded-xl hover:brightness-125 disabled:opacity-20 shadow-lg premium-button transition-all"
                 >
                   <Save className="w-3.5 h-3.5" />
@@ -832,7 +878,7 @@ export default function CredentialsPanel({
                 </button>
                 <button
                   onClick={uploadSnapshotDb}
-                  disabled={snapshotUploading || !selectedCollection}
+                  disabled={snapshotUploading || !selectedCollection || selectedCollection === "all"}
                   className="flex items-center gap-2 px-4 py-2 bg-white/5 border border-white/10 text-white text-[10px] uppercase tracking-widest font-black rounded-xl hover:bg-white/10 disabled:opacity-20 transition-all"
                 >
                   {snapshotUploading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Upload className="w-3.5 h-3.5" />}
@@ -924,13 +970,19 @@ export default function CredentialsPanel({
                   </div>
                 ) : (
                   <div className="h-20 flex items-center justify-center border border-dashed border-white/10 rounded-xl">
-                    <p className="text-[10px] font-mono theme-muted italic opacity-35">No chunks found in this collection. Ingest some files first.</p>
+                    <p className="text-[10px] font-mono theme-muted italic opacity-35">
+                      {selectedCollection === "all" ? "Select a concrete collection to preview chunks." : "No chunks found in this collection. Ingest some files first."}
+                    </p>
                   </div>
                 )}
               </div>
 
               {/* Snapshots List */}
-              {qdrantSnapshots.length > 0 ? (
+              {selectedCollection === "all" ? (
+                <div className="h-16 flex items-center justify-center border border-dashed border-white/10 rounded-xl">
+                  <p className="text-[10px] font-mono theme-muted italic opacity-30">Select a concrete collection to manage snapshots.</p>
+                </div>
+              ) : qdrantSnapshots.length > 0 ? (
                 <div className="space-y-2">
                   <p className="text-[8px] uppercase tracking-widest theme-muted font-black opacity-40 flex items-center gap-2">
                     <Database className="w-3 h-3" /> Snapshots
@@ -958,7 +1010,15 @@ export default function CredentialsPanel({
                             await api.qdrantRestoreSnapshot(qd, selectedCollection, s.name);
                             setSnapshotStatus(`Restored: ${s.name}`);
                             await reloadSelectedCollection();
-                          } catch (e: any) { setSnapshotStatus(e.message); setSnapshotIsError(true); }
+                          } catch (e: any) {
+                            if (isQdrantOfflineError(e)) {
+                              setSnapshotStatus(null);
+                              setSnapshotIsError(false);
+                            } else {
+                              setSnapshotStatus(e.message);
+                              setSnapshotIsError(true);
+                            }
+                          }
                         }} className="px-3 py-1.5 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-[9px] font-black uppercase hover:bg-emerald-500 hover:text-black transition-all">
                           Restore
                         </button>
@@ -968,7 +1028,7 @@ export default function CredentialsPanel({
                 </div>
               ) : (
                 <div className="h-16 flex items-center justify-center border border-dashed border-white/10 rounded-xl">
-                  <p className="text-[10px] font-mono theme-muted italic opacity-30">No snapshots — click Save Snapshot to create one</p>
+                  <p className="text-[10px] font-mono theme-muted italic opacity-30">No snapshots for this collection.</p>
                 </div>
               )}
             </div>
@@ -1155,6 +1215,29 @@ export default function CredentialsPanel({
                   <Server className="w-3.5 h-3.5" />
                   {settingUpEmbedders ? "Installing on GPU Server..." : "Setup All Embedding Models"}
                 </button>
+              )}
+              {setupLogs.trim().length > 0 && (
+                <div className="mt-2 p-3 rounded-xl bg-black/60 border border-white/5 font-mono text-[10px] leading-relaxed max-h-48 overflow-y-auto whitespace-pre-wrap scrollbar-thin scrollbar-thumb-white/10">
+                  {setupLogs.split(/\r?\n/).filter(Boolean).map((line, idx) => (
+                    <div
+                      key={idx}
+                      className={
+                        line.startsWith("[error]")
+                          ? "text-red-400"
+                          : line.startsWith("[ok]")
+                            ? "text-emerald-400"
+                            : line.startsWith("[warn]")
+                              ? "text-amber-400"
+                              : line.startsWith("[stage]")
+                                ? "text-cyan-300"
+                                : "theme-text/70"
+                      }
+                    >
+                      {line}
+                    </div>
+                  ))}
+                  {settingUpEmbedders && <span className="inline-block w-1.5 h-3 bg-amber-400 ml-1 animate-pulse" />}
+                </div>
               )}
             </div>
           )}

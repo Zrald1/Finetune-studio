@@ -11,11 +11,10 @@ pub fn build_jsonl(pairs: &[GeneratedPair]) -> (String, String) {
     let mut train = String::new();
     let mut val = String::new();
     for (i, p) in pairs.iter().enumerate() {
-        let assistant = format!("<think>\n{}\n</think>\n{}", p.think, p.answer);
         let line = json!({
             "messages": [
                 { "role": "user",      "content": p.question },
-                { "role": "assistant", "content": assistant },
+                { "role": "assistant", "content": p.answer },
             ]
         });
         let row = line.to_string();

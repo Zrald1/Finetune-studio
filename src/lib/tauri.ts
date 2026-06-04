@@ -42,6 +42,8 @@ export const api = {
   loadConfig: () => invoke<AppConfig>("load_config"),
   saveConfig: (cfg: AppConfig) => invoke<void>("save_config", { cfg }),
   readLocalFileText: (path: string) => invoke<string>("read_local_file_text", { path }),
+  listIngestableFiles: (folderPath: string) =>
+    invoke<string[]>("list_ingestable_files", { folderPath }),
   saveIngestState: (stateJson: string) => invoke<void>("save_ingest_state", { stateJson }),
   loadIngestState: () => invoke<string>("load_ingest_state"),
 
@@ -147,6 +149,8 @@ export const api = {
   getRun: (runId: string) => invoke<Run>("get_run", { runId }),
   listLocalDataset: (runId: string, limit: number) =>
     invoke<unknown[]>("list_local_dataset", { runId, limit }),
+  listLocalDatasetPage: (runId: string, offset: number, limit: number) =>
+    invoke<{ rows: unknown[]; total: number }>("list_local_dataset_page", { runId, offset, limit }),
   openRunsFolder: () => invoke<string>("open_runs_folder"),
   readRunLog: (runId: string, maxBytes?: number) =>
     invoke<string>("read_run_log", { runId, maxBytes }),

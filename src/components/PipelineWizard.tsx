@@ -22,6 +22,8 @@ import {
   DEFAULT_TEACHER,
 } from "../types";
 import { api, events } from "../lib/tauri";
+import { clearSetupLogs, getSetupLogSnapshot, subscribeSetupLogs } from "../lib/setupLogs";
+import { stripModelThinking } from "../lib/textSanitize";
 import TrainingConfigForm, { type StudentModelOption } from "./TrainingConfigForm";
 import {
   CheckCircle2,
@@ -48,6 +50,7 @@ import {
   Save,
   Trash,
   HardDrive,
+  FolderOpen,
   Wifi,
   WifiOff,
 } from "lucide-react";
@@ -83,18 +86,13 @@ I will provide you with source material (treat it as your open notes / RAG datab
   SKIP: off-topic
 - Do NOT copy the source material verbatim. Rephrase, change numbers if mathematical, or shift the angle (e.g. solve for a different variable).
 - The question must be answerable strictly using facts from the source material.
+- Do NOT repeat a question, fact pattern, or legal-provision angle that has already been used in this generation run.
 
-3. Explain how it should be solved step-by-step inside the <think></think> tags. Even if it involves logical reasoning, words, mathematics, formulas, functions, or identifications, explain them clearly so any student can easily follow and understand.
-
-4. Provide the final ANSWER along with a simplified explanation of WHY it is the correct answer.
+3. Provide the final ANSWER along with a concise explanation of WHY it is correct.
 
 Format your response EXACTLY like this, with no extra commentary before or after:
 
 QUESTION: <the new question>
-
-<think>
-<step-by-step simplified explanation of the reasoning, logic, functions, words, or mathematical steps needed to solve the question, written so any student can understand it>
-</think>
 
 ANSWER: <the final answer, followed by a simplified explanation of why it is the correct answer>
 
@@ -420,6 +418,7 @@ function EmbedderCard({
   const [pointCount, setPointCount] = useState<number | null>(null);
   const [loadingPoints, setLoadingPoints] = useState(false);
   const [ingestLogs, setIngestLogs] = useState<string[]>([]);
+  const [scanningFolder, setScanningFolder] = useState(false);
   const logContainerRef = useRef<HTMLDivElement | null>(null);
   const [currentStage, setCurrentStage] = useState<{ file: string; stage: string; done: number; total: number } | null>(null);
   const activeStreamIdsRef = useRef<Set<string>>(new Set());
@@ -612,6 +611,31 @@ function EmbedderCard({
     setFiles(Array.isArray(sel) ? sel : [sel]);
   }
 
+  async function pickFolder() {
+    const sel = await openFileDialog({
+      multiple: false,
+      directory: true,
+    });
+    if (!sel) return;
+    const folderPath = Array.isArray(sel) ? sel[0] : sel;
+    if (!folderPath) return;
+    setScanningFolder(true);
+    try {
+      const found = await api.listIngestableFiles(folderPath);
+      setFiles(found);
+      const timestamp = new Date().toLocaleTimeString();
+      setIngestLogs(prev => [
+        ...prev,
+        `[${timestamp}] [Folder] Found ${found.length} supported files in ${folderPath}`,
+      ]);
+    } catch (e) {
+      const timestamp = new Date().toLocaleTimeString();
+      setIngestLogs(prev => [...prev, `[${timestamp}] [Error] Folder scan failed: ${e}`]);
+    } finally {
+      setScanningFolder(false);
+    }
+  }
+
   async function startIngest() {
     if (!ready || files.length === 0) return;
     const batchFiles = files; const batchTag = tag.trim();
@@ -706,21 +730,32 @@ function EmbedderCard({
       </div>
 
       <div className="border-t border-white/5 pt-4 space-y-3">
-        <div className="flex items-center gap-2">
-          <button
-            onClick={pickFiles}
-            disabled={!ready}
-            className="flex-1 flex items-center justify-center gap-2 px-4 py-3 premium-input rounded-xl text-[10px] uppercase tracking-widest font-black font-mono theme-text disabled:opacity-20 premium-button transition-all"
-          >
-            <Upload className="w-4 h-4" />
-            {files.length === 0 ? "Upload Files" : `${files.length} FILES`}
-          </button>
+        <div className="grid grid-cols-[minmax(0,1fr)_7rem] gap-2 items-stretch">
+          <div className="flex flex-col gap-2 min-w-0">
+            <button
+              onClick={pickFolder}
+              disabled={!ready || scanningFolder}
+              className="flex items-center justify-center gap-2 px-4 py-3 premium-input rounded-xl text-[10px] uppercase tracking-widest font-black font-mono theme-text disabled:opacity-20 premium-button transition-all whitespace-nowrap"
+              title="Select a folder and recursively ingest supported documents and images"
+            >
+              {scanningFolder ? <Loader2 className="w-4 h-4 animate-spin" /> : <FolderOpen className="w-4 h-4" />}
+              Upload Folder
+            </button>
+            <button
+              onClick={pickFiles}
+              disabled={!ready}
+              className="flex items-center justify-center gap-2 px-4 py-3 premium-input rounded-xl text-[10px] uppercase tracking-widest font-black font-mono theme-text disabled:opacity-20 premium-button transition-all"
+            >
+              <Upload className="w-4 h-4" />
+              {files.length === 0 ? "Upload Files" : `${files.length} FILES`}
+            </button>
+          </div>
           <input
             type="text"
             value={tag}
             onChange={e => setTag(e.target.value)}
             placeholder="TAG"
-            className="w-28 px-3 py-3 premium-input rounded-xl text-[10px] font-black font-mono text-white focus:outline-none uppercase"
+            className="w-full px-3 py-3 premium-input rounded-xl text-[10px] font-black font-mono text-white focus:outline-none uppercase"
           />
         </div>
 
@@ -927,6 +962,10 @@ function QdrantDbPanel({ config, onConfigChange }: { config: AppConfig; onConfig
 
   const qdrantEndpoint = config.qdrant.endpoint || (config.ssh.host ? `http://${config.ssh.host}:6333` : "");
   const qdCfg = { ...config.qdrant, endpoint: qdrantEndpoint };
+  const isQdrantOfflineError = (err: unknown) =>
+    /error sending request|failed to fetch|network|timeout|timed out|connection|refused|10060|unreachable|could not connect|tcp/i.test(
+      err instanceof Error ? err.message : String(err),
+    );
 
   // Update selected when allCollections changes
   useEffect(() => {
@@ -946,6 +985,11 @@ function QdrantDbPanel({ config, onConfigChange }: { config: AppConfig; onConfig
     if (!qdrantEndpoint) return;
     const col = coll || selectedCollection;
     if (!col) return;
+    if (col === "all") {
+      setSnapshots([]);
+      setStatus(null);
+      return;
+    }
     setLoading(true); setStatus(null);
     try {
       const list = await api.qdrantListSnapshots(qdCfg, col);
@@ -956,6 +1000,10 @@ function QdrantDbPanel({ config, onConfigChange }: { config: AppConfig; onConfig
         setSnapshots([]);
         setStatus(`Collection '${col}' doesn't exist yet — ingest some documents first.`);
         setIsError(false);
+      } else if (isQdrantOfflineError(e)) {
+        setSnapshots([]);
+        setStatus(null);
+        setIsError(false);
       } else {
         setStatus(msg); setIsError(true);
       }
@@ -964,6 +1012,12 @@ function QdrantDbPanel({ config, onConfigChange }: { config: AppConfig; onConfig
 
   const loadChunks = async (offsetVal: any = null) => {
     if (!qdrantEndpoint || !selectedCollection) return;
+    if (selectedCollection === "all") {
+      setChunks([]);
+      setNextOffset(null);
+      setChunksError(null);
+      return;
+    }
     setLoadingChunks(true); setChunksError(null);
     try {
       const res = await api.qdrantScrollInCollection(qdCfg, selectedCollection, 3, offsetVal);
@@ -974,6 +1028,10 @@ function QdrantDbPanel({ config, onConfigChange }: { config: AppConfig; onConfig
       if (/doesn'?t exist|not found|404/i.test(msg)) {
         setChunks([]);
         setNextOffset(null);
+      } else if (isQdrantOfflineError(e)) {
+        setChunks([]);
+        setNextOffset(null);
+        setChunksError(null);
       } else {
         setChunksError(msg);
         setChunks([]);
@@ -1022,7 +1080,7 @@ function QdrantDbPanel({ config, onConfigChange }: { config: AppConfig; onConfig
   }, [selectedCollection, qdrantEndpoint]);
 
   const saveSnapshot = async () => {
-    if (!selectedCollection) return;
+    if (!selectedCollection || selectedCollection === "all") return;
     setSaving(true); setStatus(null);
     try {
       const snap = await api.qdrantCreateSnapshot(qdCfg, selectedCollection);
@@ -1030,7 +1088,12 @@ function QdrantDbPanel({ config, onConfigChange }: { config: AppConfig; onConfig
       setIsError(false);
       await reloadSelectedCollection();
     } catch (e: any) {
-      setStatus(e.message || String(e)); setIsError(true);
+      if (isQdrantOfflineError(e)) {
+        setStatus(null);
+        setIsError(false);
+      } else {
+        setStatus(e.message || String(e)); setIsError(true);
+      }
     } finally { setSaving(false); }
   };
 
@@ -1049,12 +1112,17 @@ function QdrantDbPanel({ config, onConfigChange }: { config: AppConfig; onConfig
       }
       await reloadSelectedCollection();
     } catch (e: any) {
-      setStatus(e.message || "Failed to save all snapshots"); setIsError(true);
+      if (isQdrantOfflineError(e)) {
+        setStatus(null);
+        setIsError(false);
+      } else {
+        setStatus(e.message || "Failed to save all snapshots"); setIsError(true);
+      }
     } finally { setSavingAll(false); }
   };
 
   const uploadSnapshot = async () => {
-    if (!selectedCollection) return;
+    if (!selectedCollection || selectedCollection === "all") return;
     setStatus(null);
     try {
       const sel = await openFileDialog({
@@ -1074,8 +1142,13 @@ function QdrantDbPanel({ config, onConfigChange }: { config: AppConfig; onConfig
       setIsError(false);
       await reloadSelectedCollection();
     } catch (e: any) {
-      setStatus(e.message || String(e));
-      setIsError(true);
+      if (isQdrantOfflineError(e)) {
+        setStatus(null);
+        setIsError(false);
+      } else {
+        setStatus(e.message || String(e));
+        setIsError(true);
+      }
     } finally {
       setUploading(false);
     }
@@ -1096,8 +1169,13 @@ function QdrantDbPanel({ config, onConfigChange }: { config: AppConfig; onConfig
       setStatus(`Downloaded to ${savePath}`);
       setIsError(false);
     } catch (e: any) {
-      setStatus(e.message || String(e));
-      setIsError(true);
+      if (isQdrantOfflineError(e)) {
+        setStatus(null);
+        setIsError(false);
+      } else {
+        setStatus(e.message || String(e));
+        setIsError(true);
+      }
     } finally {
       setDownloading(null);
     }
@@ -1114,7 +1192,12 @@ function QdrantDbPanel({ config, onConfigChange }: { config: AppConfig; onConfig
       setStatus(`Downloaded ${paths.length} snapshots to ${dirPath}`);
       setIsError(false);
     } catch (e: any) {
-      setStatus(e.message || "Failed to download all snapshots"); setIsError(true);
+      if (isQdrantOfflineError(e)) {
+        setStatus(null);
+        setIsError(false);
+      } else {
+        setStatus(e.message || "Failed to download all snapshots"); setIsError(true);
+      }
     } finally { setDownloadingAll(false); }
   };
 
@@ -1165,7 +1248,7 @@ function QdrantDbPanel({ config, onConfigChange }: { config: AppConfig; onConfig
           </button>
           <button
             onClick={uploadSnapshot}
-            disabled={uploading || !qdrantEndpoint || !selectedCollection}
+            disabled={uploading || !qdrantEndpoint || !selectedCollection || selectedCollection === "all"}
             className="flex items-center gap-2 px-4 py-2 bg-white/5 border border-white/10 text-white text-[10px] uppercase tracking-widest font-black rounded-xl hover:bg-white/10 disabled:opacity-20 transition-all"
           >
             {uploading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Upload className="w-3.5 h-3.5" />}
@@ -1173,7 +1256,7 @@ function QdrantDbPanel({ config, onConfigChange }: { config: AppConfig; onConfig
           </button>
           <button
             onClick={saveSnapshot}
-            disabled={saving || !qdrantEndpoint || !selectedCollection}
+            disabled={saving || !qdrantEndpoint || !selectedCollection || selectedCollection === "all"}
             className="flex items-center gap-2 px-4 py-2 theme-accent-bg text-black text-[10px] uppercase tracking-widest font-black rounded-xl hover:brightness-125 disabled:opacity-20 shadow-lg premium-button transition-all"
           >
             <Save className="w-3.5 h-3.5" />
@@ -1189,7 +1272,11 @@ function QdrantDbPanel({ config, onConfigChange }: { config: AppConfig; onConfig
         </div>
       )}
 
-      {snapshots.length > 0 ? (
+      {selectedCollection === "all" ? (
+        <div className="h-20 flex items-center justify-center border border-dashed border-white/10 rounded-xl">
+          <p className="text-[10px] font-mono theme-muted italic opacity-30">Select a concrete collection to manage snapshots.</p>
+        </div>
+      ) : snapshots.length > 0 ? (
         <div className="space-y-2">
           <p className="text-[8px] uppercase tracking-widest theme-muted font-black opacity-40">Saved Snapshots · {selectedCollection}</p>
           {snapshots.map(s => (
@@ -1217,7 +1304,15 @@ function QdrantDbPanel({ config, onConfigChange }: { config: AppConfig; onConfig
                     await api.qdrantRestoreSnapshot(qdCfg, selectedCollection, s.name);
                     setStatus(`Restored: ${s.name}`);
                     await reloadSelectedCollection();
-                  } catch (e: any) { setStatus(e.message); setIsError(true); }
+                  } catch (e: any) {
+                    if (isQdrantOfflineError(e)) {
+                      setStatus(null);
+                      setIsError(false);
+                    } else {
+                      setStatus(e.message);
+                      setIsError(true);
+                    }
+                  }
                 }} className="px-3 py-1.5 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-[9px] font-black uppercase hover:bg-emerald-500 hover:text-black transition-all">
                   Restore
                 </button>
@@ -1227,7 +1322,7 @@ function QdrantDbPanel({ config, onConfigChange }: { config: AppConfig; onConfig
         </div>
       ) : (
         <div className="h-20 flex items-center justify-center border border-dashed border-white/10 rounded-xl">
-          <p className="text-[10px] font-mono theme-muted italic opacity-30">No snapshots for '{selectedCollection}' — click Save Snapshot to create one</p>
+          <p className="text-[10px] font-mono theme-muted italic opacity-30">No snapshots for this collection.</p>
         </div>
       )}
 
@@ -1292,7 +1387,9 @@ function QdrantDbPanel({ config, onConfigChange }: { config: AppConfig; onConfig
           </div>
         ) : (
           <div className="h-20 flex items-center justify-center border border-dashed border-white/10 rounded-xl">
-            <p className="text-[10px] font-mono theme-muted italic opacity-35">No chunks found in '{selectedCollection}'. Ingest some files first.</p>
+            <p className="text-[10px] font-mono theme-muted italic opacity-35">
+              {selectedCollection === "all" ? "Select a concrete collection to preview chunks." : `No chunks found in '${selectedCollection}'. Ingest some files first.`}
+            </p>
           </div>
         )}
       </div>
@@ -1320,7 +1417,7 @@ function KnowledgeBaseStep({
   const [gpuLoading, setGpuLoading] = useState(false);
   const [setupAllLoading, setSetupAllLoading] = useState(false);
   const [setupAllError, setSetupAllError] = useState<string | null>(null);
-  const [setupAllLog, setSetupAllLog] = useState<string[]>([]);
+  const [setupAllLog, setSetupAllLog] = useState(getSetupLogSnapshot());
   const [qdrantOnlyLoading, setQdrantOnlyLoading] = useState(false);
   const [qdrantOnlyLog, setQdrantOnlyLog] = useState<string[]>([]);
   const [qdrantOnlyError, setQdrantOnlyError] = useState<string | null>(null);
@@ -1329,6 +1426,8 @@ function KnowledgeBaseStep({
   const gpuStatus = localGpuStatus ?? propGpuStatus;
 
   const embedders = config.embedders ?? [];
+
+  useEffect(() => subscribeSetupLogs(setSetupAllLog), []);
 
   const detectGpu = async () => {
     if (!config.ssh.host) return;
@@ -1362,18 +1461,16 @@ function KnowledgeBaseStep({
 
   const setupAllEmbedders = async () => {
     if (embedders.length === 0) return;
-setSetupAllLoading(true); setSetupAllError(null); setSetupAllLog([]);
-    let unlisten: (() => void) | null = null;
+    clearSetupLogs();
+    setSetupAllLoading(true);
+    setSetupAllError(null);
     try {
-      unlisten = await events.onSetupLog((e: { line: string }) => {
-        setSetupAllLog(prev => [...prev, e.line]);
-      });
       const results = await api.serveSetupAllEmbedders(config.ssh, config.docker, embedders, config.hfToken ?? null, config.paddleOcr ?? null);
       const updatedEmbedders = embedders.map((e, i) => ({ ...e, enabled: results[i]?.status !== "error" }));
       onConfigChange({ embedders: updatedEmbedders });
       await refreshAllEmbedderCounts();
     } catch (e: any) { setSetupAllError(e.message || String(e)); }
-    finally { setSetupAllLoading(false); unlisten?.(); }
+    finally { setSetupAllLoading(false); }
   };
 
   const installQdrantOnly = async () => {
@@ -1489,9 +1586,9 @@ const removeEmbedder = (idx: number) => {
             <span className="font-black uppercase">Setup Error: </span>{setupAllError}
           </div>
         )}
-        {setupAllLog.length > 0 && (
+        {setupAllLog.trim().length > 0 && (
           <div className="bg-black/60 border border-white/10 rounded-xl p-4 max-h-48 overflow-y-auto font-mono text-[10px] leading-relaxed space-y-0.5 scrollbar-thin scrollbar-thumb-white/10">
-            {setupAllLog.map((line, i) => (
+            {setupAllLog.split(/\r?\n/).filter(Boolean).map((line, i) => (
               <div key={i} className={`${line.startsWith("[error]") ? "text-red-400" : line.startsWith("[ok]") ? "text-emerald-400" : line.startsWith("[stage]") ? "text-cyan-300" : "theme-text/60"}`}>
                 {line}
               </div>
@@ -2065,7 +2162,9 @@ The template prompt MUST be written as an instruction system prompt for the teac
 
 Tailor the wording, examples, and rules specifically to "${topicText}" — assume the teacher will only ever generate questions about this single topic.
 
-Provide ONLY the final generated instruction system prompt text. Do not include markdown code fence formatting (like \`\`\`), conversational intros, or explanations.`;
+The generated template must explicitly forbid hidden reasoning, chain-of-thought, <think> blocks, markdown, and conversational introductions. It must instruct the teacher to output only QUESTION and ANSWER fields for each generated pair.
+
+Provide ONLY the final generated instruction system prompt text. Do not include markdown code fence formatting (like \`\`\`), <think> blocks, analysis, conversational intros, or explanations.`;
       const bodyData: any = provider === "anthropic"
         ? { model: modelId, messages: [{ role: "user", content: userPrompt }], max_tokens: 2048, temperature: 0.3 }
         : { model: modelId, messages: [{ role: "user", content: userPrompt }], temperature: 0.3 };
@@ -2075,7 +2174,7 @@ Provide ONLY the final generated instruction system prompt text. Do not include 
       const answer = provider === "anthropic"
         ? (data.content?.[0]?.text || "")
         : (data.choices?.[0]?.message?.content || "");
-      const cleaned = answer.replace(/^```[a-zA-Z]*\n/g, "").replace(/```$/g, "").trim();
+      const cleaned = stripModelThinking(answer);
       if (cleaned) {
         setRow(idx, { promptTemplate: cleaned });
       } else {
