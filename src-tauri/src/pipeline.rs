@@ -525,6 +525,10 @@ async fn run_pipeline(
     run_cfg: &RunConfig,
     resume: bool,
 ) -> Result<()> {
+    let mut effective_cfg = cfg.clone();
+    crate::config::normalize_runtime_defaults(&mut effective_cfg);
+    let cfg = &effective_cfg;
+
     // ── 0. Sanity checks ────────────────────────────────────────────────
     let training_only = run_cfg.hub_dataset.train_only;
     let needs_ssh = true;

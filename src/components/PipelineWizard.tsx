@@ -16,6 +16,7 @@ import type {
   TopicTarget,
 } from "../types";
 import {
+  DEFAULT_EMBEDDER,
   DEFAULT_HUB,
   DEFAULT_HUB_DATASET,
   DEFAULT_LORA,
@@ -927,7 +928,7 @@ function EmbedderCard({
 }
 
 function QdrantDbPanel({ config, onConfigChange }: { config: AppConfig; onConfigChange?: (patch: Partial<AppConfig>) => void }) {
-  const embedders = config.embedders ?? [];
+  const embedders = config.embedders && config.embedders.length > 0 ? config.embedders : [DEFAULT_EMBEDDER];
   // Build collection list from all embedders + default
   const allCollections = useMemo(() => {
     const cols: string[] = [];
@@ -1425,7 +1426,7 @@ function KnowledgeBaseStep({
   const [localGpuStatus, setLocalGpuStatus] = useState<GPUState | null>(null);
   const gpuStatus = localGpuStatus ?? propGpuStatus;
 
-  const embedders = config.embedders ?? [];
+  const embedders = config.embedders && config.embedders.length > 0 ? config.embedders : [DEFAULT_EMBEDDER];
 
   useEffect(() => subscribeSetupLogs(setSetupAllLog), []);
 
@@ -1504,7 +1505,7 @@ function KnowledgeBaseStep({
     const newEmbedders = [...embedders, {
       name: `embedder_${embedders.length + 1}`,
       modelId: "Qwen/Qwen3-Embedding-8B",
-      port: 8100 + embedders.length,
+      port: DEFAULT_EMBEDDER.port + embedders.length,
       collection: "",
       concurrency: 2,
       vectorDim: undefined,
@@ -2055,7 +2056,7 @@ function DatasetStep(props: {
   sshHostSet: boolean;
   onConfigChange?: (patch: Partial<AppConfig>) => void;
 }) {
-  const embedders = props.config.embedders ?? [];
+  const embedders = props.config.embedders && props.config.embedders.length > 0 ? props.config.embedders : [DEFAULT_EMBEDDER];
   const collections = useMemo(() => {
     const cols = ["all"];
     for (const emb of embedders) {
@@ -2328,7 +2329,7 @@ Provide ONLY the final generated instruction system prompt text. Do not include 
               <label className="text-[10px] uppercase tracking-[0.2em] theme-accent font-black ml-1 font-mono tracking-widest">Source Collection</label>
               <div className="relative">
                 <select
-                  value={props.config.qdrant.collection}
+                  value={props.config.qdrant.collection || "all"}
                   onChange={(e) => {
                     if (e.target.value === "__custom__") {
                       setShowCustomCollection(true);
@@ -2357,7 +2358,7 @@ Provide ONLY the final generated instruction system prompt text. Do not include 
               <label className="text-[10px] uppercase tracking-widest theme-muted font-black ml-1 font-mono tracking-widest">Custom Collection Name</label>
               <input
                 type="text"
-                value={props.config.qdrant.collection}
+                value={props.config.qdrant.collection || "all"}
                 onChange={(e) => handleCollectionChange(e.target.value)}
                 placeholder="Enter Qdrant collection name"
                 className="w-full px-5 py-3.5 premium-input rounded-xl text-sm-fluid font-mono focus:outline-none bg-black/40 border border-white/10"
@@ -2822,8 +2823,9 @@ const [pipelineMode, setPipelineMode] = useState<PipelineMode>("rag");
     }
     setGeneratingDataset(true); setDatasetGenerated(false); setGenerationError(null); setGenerationLogs(""); setGenerationProgress(null);
     try {
-      const mergedConfig = { ...config, teacher };
-      onConfigChange({ teacher });
+      const effectiveQdrant = { ...config.qdrant, endpoint: qdrantEndpoint, collection: config.qdrant.collection || "all" };
+      const mergedConfig = { ...config, qdrant: effectiveQdrant, teacher };
+      onConfigChange({ qdrant: effectiveQdrant, teacher });
       const legacyTopic = cleanedTopics.length === 1 ? cleanedTopics[0].topic : undefined;
       const legacyTotal = cleanedTopics.length === 1 ? cleanedTopics[0].totalQuestions : undefined;
       const rc: RunConfig = { name: `gen-${new Date().toISOString().slice(0, 19).replace(/:/g, "-")}`, teacher, studentModel, lora, promptTemplate: prompt, maxPairsPerChunk, concurrency, maxChunks: maxChunks === "all" ? undefined : (maxChunks as number), topic: legacyTopic, totalQuestions: legacyTotal, topics: cleanedTopics.length > 0 ? cleanedTopics : undefined, hub, hubDataset, generateOnly: true };
@@ -2836,7 +2838,7 @@ const [pipelineMode, setPipelineMode] = useState<PipelineMode>("rag");
 
   const [topics, setTopics] = useState<TopicTarget[]>([{ topic: "", totalQuestions: undefined }]);
   const [maxPairsPerChunk, setMaxPairsPerChunk] = useState(1);
-  const [concurrency, setConcurrency] = useState(4);
+  const [concurrency, setConcurrency] = useState(100);
   const [maxChunks, setMaxChunks] = useState<number | "all">("all");
   const [prompt, setPrompt] = useState(() => config.promptTemplate || DEFAULT_PROMPT);
 
@@ -3012,17 +3014,18 @@ const [pipelineMode, setPipelineMode] = useState<PipelineMode>("rag");
   }, [step, isTrainingOnly, datasetsValidated, trainingOnlyDatasets]);
 
   const qdrantEndpoint = config.qdrant.endpoint || (config.ssh.host ? `http://${config.ssh.host}:6333` : "");
-  const canLaunch = !!(config.ssh.host && studentModel && (isTrainingOnly ? hubDataset.enabled && trainingOnlyDatasets.length > 0 && datasetsValidated : qdrantEndpoint && config.qdrant.collection && teacher.repoId && allTopicsHavePrompt));
+  const canLaunch = !!(config.ssh.host && studentModel && (isTrainingOnly ? hubDataset.enabled && trainingOnlyDatasets.length > 0 && datasetsValidated : qdrantEndpoint && (config.qdrant.collection || "all") && teacher.repoId && allTopicsHavePrompt));
 
   const launch = async () => {
     setLaunching(true); setLaunchError(null);
     try {
       const mergedConfig = {
         ...config,
+        qdrant: { ...config.qdrant, endpoint: qdrantEndpoint, collection: config.qdrant.collection || "all" },
         teacher,
         student: { ...config.student, repoId: studentModel },
       };
-      onConfigChange({ teacher, student: { ...config.student, repoId: studentModel } });
+      onConfigChange({ qdrant: mergedConfig.qdrant, teacher, student: { ...config.student, repoId: studentModel } });
       if (completedRunId) { await api.updateRunConfig(completedRunId, studentModel, lora, hub); await api.resumeRun(completedRunId); onPipelineLaunched(completedRunId); }
       else {
         const legacyTopic = cleanedTopics.length === 1 ? cleanedTopics[0].topic : undefined;

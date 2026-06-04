@@ -23,6 +23,9 @@ fn default_ssh_port() -> u16 {
 fn default_gpu_memory_utilization() -> f32 {
     0.084
 }
+fn default_embedder_port() -> u16 {
+    8101
+}
 fn default_teacher_gpu_memory_utilization() -> f32 {
     0.80
 }
@@ -80,18 +83,60 @@ pub struct EmbedderConfig {
 
 impl Default for EmbedderConfig {
     fn default() -> Self {
-        Self {
-            name: String::new(),
-            model_id: "Qwen/Qwen3-Embedding-8B".to_string(),
-            port: 8100,
-            collection: String::new(),
-            concurrency: 2,
-            vector_dim: None,
-            enabled: true,
-            persistent: false,
-            gpu_memory_utilization: 0.084,
+        default_semantic_embedder()
+    }
+}
+
+pub fn default_semantic_embedder() -> EmbedderConfig {
+    EmbedderConfig {
+        name: "embedder_1".to_string(),
+        model_id: "Qwen/Qwen3-Embedding-8B".to_string(),
+        port: default_embedder_port(),
+        collection: String::new(),
+        concurrency: 2,
+        vector_dim: None,
+        enabled: true,
+        persistent: true,
+        gpu_memory_utilization: default_gpu_memory_utilization(),
+    }
+}
+
+pub fn normalize_embedders(embedders: &mut Vec<EmbedderConfig>) {
+    if embedders.is_empty() {
+        embedders.push(default_semantic_embedder());
+    }
+
+    for (idx, embedder) in embedders.iter_mut().enumerate() {
+        if embedder.name.trim().is_empty() {
+            embedder.name = format!("embedder_{}", idx + 1);
+        }
+        if embedder.model_id.trim().is_empty() {
+            embedder.model_id = "Qwen/Qwen3-Embedding-8B".to_string();
+        }
+        if embedder.port == 0 {
+            embedder.port = default_embedder_port() + idx as u16;
+        }
+        if idx == 0 && embedder.port == 8100 && embedder.name.trim() == "embedder_1" {
+            embedder.port = default_embedder_port();
+        }
+        if embedder.concurrency == 0 {
+            embedder.concurrency = 2;
+        }
+        if embedder.gpu_memory_utilization <= 0.0 {
+            embedder.gpu_memory_utilization = default_gpu_memory_utilization();
+        }
+        if idx == 0 {
+            embedder.enabled = true;
+            embedder.persistent = true;
         }
     }
+}
+
+pub fn normalize_runtime_defaults(cfg: &mut AppConfig) {
+    if cfg.qdrant.collection.trim().is_empty() {
+        cfg.qdrant.collection = "all".to_string();
+    }
+    normalize_embedders(&mut cfg.embedders);
 }
 
 impl EmbedderConfig {
@@ -440,7 +485,9 @@ pub async fn load() -> Result<AppConfig> {
     ensure_dirs().await?;
     let path = config_path()?;
     if !path.exists() {
-        return Ok(AppConfig::default());
+        let mut cfg = AppConfig::default();
+        normalize_runtime_defaults(&mut cfg);
+        return Ok(cfg);
     }
     let txt = fs::read_to_string(&path).await?;
     let mut cfg: AppConfig = serde_json::from_str(&txt)
@@ -459,12 +506,15 @@ pub async fn load() -> Result<AppConfig> {
     if cfg.paddle_ocr.model_name != default_pocr.model_name {
         cfg.paddle_ocr.model_name = default_pocr.model_name.clone();
     }
+    normalize_runtime_defaults(&mut cfg);
     Ok(cfg)
 }
 
 pub async fn save(cfg: &AppConfig) -> Result<()> {
     ensure_dirs().await?;
-    let txt = serde_json::to_string_pretty(cfg)?;
+    let mut cfg = cfg.clone();
+    normalize_runtime_defaults(&mut cfg);
+    let txt = serde_json::to_string_pretty(&cfg)?;
     fs::write(config_path()?, txt).await?;
     Ok(())
 }

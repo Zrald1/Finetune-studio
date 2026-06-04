@@ -188,14 +188,14 @@ export interface PaddleOcrConfig {
 }
 
 export const DEFAULT_EMBEDDER: EmbedderConfig = {
-  name: "",
+  name: "embedder_1",
   modelId: "Qwen/Qwen3-Embedding-8B",
   port: 8101,
   collection: "",
   concurrency: 2,
   vectorDim: undefined,
   enabled: true,
-  persistent: false,
+  persistent: true,
   gpuMemoryUtilization: 0.084,
 };
 

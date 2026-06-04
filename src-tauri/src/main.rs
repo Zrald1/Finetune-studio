@@ -662,11 +662,12 @@ async fn serve_setup_all_embedders(
     app: AppHandle,
     ssh: SshConfig,
     docker: DockerConfig,
-    embedders: Vec<EmbedderConfig>,
+    mut embedders: Vec<EmbedderConfig>,
     hf_token: Option<String>,
     paddle_ocr: Option<config::PaddleOcrConfig>,
 ) -> Result<Vec<serde_json::Value>> {
     let session = connect_ssh_with_setup_logs(&app, &ssh).await?;
+    config::normalize_embedders(&mut embedders);
 
     let mut resolved_docker = docker.clone();
     if docker.enabled {
@@ -771,40 +772,39 @@ async fn serve_setup_all_embedders(
             _ => None,
         };
 
-        let status = if let Some(c) = has_points {
-            let _ = app.emit("setup://log", serde_json::json!({"line": format!("[ok] embeddings already exist ({} points) in collection '{}' for '{}'. Skipping deployment of embedder model.\n", c, collection_name, embedder.name)}));
-            "existing_embeddings".to_string()
-        } else {
-            match serve::health_check_embedder(&session, &embedder_cfg, "127.0.0.1", embedder.port)
+        if let Some(c) = has_points {
+            let _ = app.emit("setup://log", serde_json::json!({"line": format!("[ok] embeddings already exist ({} points) in collection '{}' for '{}'; ensuring model is live for semantic search.\n", c, collection_name, embedder.name)}));
+        }
+
+        let status = match serve::health_check_embedder(&session, &embedder_cfg, "127.0.0.1", embedder.port)
+            .await
+        {
+            Ok(Some(_)) => {
+                let _ = app.emit("setup://log", serde_json::json!({"line": format!("[ok] '{}' already running\n", embedder.name)}));
+                "already_running".to_string()
+            }
+            _ => {
+                let _ = app.emit("setup://log", serde_json::json!({"line": format!("[stage] booting '{}' with {}\n", embedder.name, embedder.model_id)}));
+                let app_c = app.clone();
+                match serve::boot_embedder(
+                    &session,
+                    &embedder_cfg,
+                    embedder,
+                    hf_token.as_deref(),
+                    embedder.gpu_memory_utilization,
+                    Some(&move |line| {
+                        let _ = app_c.emit("setup://log", serde_json::json!({ "line": line }));
+                    }),
+                )
                 .await
-            {
-                Ok(Some(_)) => {
-                    let _ = app.emit("setup://log", serde_json::json!({"line": format!("[ok] '{}' already running\n", embedder.name)}));
-                    "already_running".to_string()
-                }
-                _ => {
-                    let _ = app.emit("setup://log", serde_json::json!({"line": format!("[stage] booting '{}' with {}\n", embedder.name, embedder.model_id)}));
-                    let app_c = app.clone();
-                    match serve::boot_embedder(
-                        &session,
-                        &embedder_cfg,
-                        embedder,
-                        hf_token.as_deref(),
-                        embedder.gpu_memory_utilization,
-                        Some(&move |line| {
-                            let _ = app_c.emit("setup://log", serde_json::json!({ "line": line }));
-                        }),
-                    )
-                    .await
-                    {
-                        Ok(_) => {
-                            let _ = app.emit("setup://log", serde_json::json!({"line": format!("[ok] '{}' ready on port {}\n", embedder.name, embedder.port)}));
-                            "booted".to_string()
-                        }
-                        Err(e) => {
-                            let _ = app.emit("setup://log", serde_json::json!({"line": format!("[error] '{}' boot failed: {e}\n", embedder.name)}));
-                            format!("error: {}", e)
-                        }
+                {
+                    Ok(_) => {
+                        let _ = app.emit("setup://log", serde_json::json!({"line": format!("[ok] '{}' ready on port {}\n", embedder.name, embedder.port)}));
+                        "booted".to_string()
+                    }
+                    Err(e) => {
+                        let _ = app.emit("setup://log", serde_json::json!({"line": format!("[error] '{}' boot failed: {e}\n", embedder.name)}));
+                        format!("error: {}", e)
                     }
                 }
             }
@@ -856,7 +856,8 @@ async fn ingest_documents(
     let app_for_progress = app.clone();
     let id_for_progress = stream_id.clone();
 
-    let app_cfg = config::load().await.unwrap_or_default();
+    let mut app_cfg = config::load().await.unwrap_or_default();
+    config::normalize_runtime_defaults(&mut app_cfg);
     let ocr_opts = match paddle_ocr {
         Some(ref p) => ingest::PaddleOcrOptions {
             enabled: true,
@@ -1349,7 +1350,8 @@ async fn run_deploy_teacher_task(
         );
     }
 
-    let app_cfg = config::load().await.unwrap_or_default();
+    let mut app_cfg = config::load().await.unwrap_or_default();
+    config::normalize_runtime_defaults(&mut app_cfg);
     let has_protected_embedder = app_cfg
         .embedders
         .iter()
@@ -2133,6 +2135,112 @@ async fn run_deploy_teacher_task(
         }
 
         tokio::time::sleep(std::time::Duration::from_secs(poll_interval_secs)).await;
+    }
+
+    if let Some((embedder_index, embedder)) = app_cfg
+        .embedders
+        .iter()
+        .enumerate()
+        .find(|(idx, e)| e.enabled && pipeline::is_protected_semantic_embedder(*idx, e))
+    {
+        let qdrant_up = session
+            .exec_blocking("curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:6333/collections 2>/dev/null || echo 000")
+            .await
+            .map(|r| r.stdout.trim() == "200")
+            .unwrap_or(false);
+
+        if qdrant_up {
+            let mut embedder_docker = docker_cfg.clone();
+            embedder_docker.container_name = container_name.clone();
+            let embedder_cfg = if pipeline::is_protected_semantic_embedder(embedder_index, embedder)
+            {
+                DockerConfig {
+                    enabled: false,
+                    ..embedder_docker
+                }
+            } else {
+                embedder_docker
+            };
+
+            let already_up =
+                serve::health_check_embedder(&session, &embedder_cfg, "127.0.0.1", embedder.port)
+                    .await
+                    .map(|o| o.is_some())
+                    .unwrap_or(false);
+
+            if already_up {
+                let _ = app.emit("deploy://log", serde_json::json!({
+                    "streamId": id,
+                    "kind": "ok",
+                    "line": format!("[embedder] '{}' already serving on port {} — semantic search ready\n", embedder.name, embedder.port)
+                }));
+            } else {
+                let _ = app.emit("deploy://log", serde_json::json!({
+                    "streamId": id,
+                    "kind": "info",
+                    "line": format!("[embedder] Qdrant is running — starting semantic embedder '{}' ({}) on port {}\n", embedder.name, embedder.model_id, embedder.port)
+                }));
+
+                match serve::launch_embedder(
+                    &session,
+                    &embedder_cfg,
+                    embedder,
+                    hf_token,
+                    Some(embedder.gpu_memory_utilization as f64),
+                )
+                .await
+                {
+                    Ok(_) => {
+                        let _ = app.emit("deploy://log", serde_json::json!({
+                            "streamId": id,
+                            "kind": "info",
+                            "line": format!("[embedder] waiting up to 600s for '{}' to become ready...\n", embedder.name)
+                        }));
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(600),
+                            serve::wait_for_embedder(&session, &embedder_cfg, embedder, 600, None),
+                        )
+                        .await
+                        {
+                            Ok(Ok(ip)) => {
+                                let _ = app.emit("deploy://log", serde_json::json!({
+                                    "streamId": id,
+                                    "kind": "ok",
+                                    "line": format!("[embedder] '{}' ready at {}:{} — semantic search ready\n", embedder.name, ip, embedder.port)
+                                }));
+                            }
+                            Ok(Err(e)) => {
+                                let _ = app.emit("deploy://log", serde_json::json!({
+                                    "streamId": id,
+                                    "kind": "warn",
+                                    "line": format!("[embedder] '{}' did not become ready: {}\n", embedder.name, e)
+                                }));
+                            }
+                            Err(_) => {
+                                let _ = app.emit("deploy://log", serde_json::json!({
+                                    "streamId": id,
+                                    "kind": "warn",
+                                    "line": format!("[embedder] '{}' wait timed out after 600s\n", embedder.name)
+                                }));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = app.emit("deploy://log", serde_json::json!({
+                            "streamId": id,
+                            "kind": "warn",
+                            "line": format!("[embedder] launch failed after teacher deploy: {}\n", e)
+                        }));
+                    }
+                }
+            }
+        } else {
+            let _ = app.emit("deploy://log", serde_json::json!({
+                "streamId": id,
+                "kind": "warn",
+                "line": "[embedder] Qdrant is not running on :6333 — semantic embedder was not started\n"
+            }));
+        }
     }
 
     session.disconnect().await;

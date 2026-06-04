@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import type { AppConfig, GPUState, ShellDoneEvent, ShellLogEvent } from "./types";
-import { DEFAULT_AI_AGENT, DEFAULT_DIGITAL_OCEAN, DEFAULT_EMBEDDING, DEFAULT_LORA, DEFAULT_TEACHER } from "./types";
+import { DEFAULT_AI_AGENT, DEFAULT_DIGITAL_OCEAN, DEFAULT_EMBEDDER, DEFAULT_EMBEDDING, DEFAULT_LORA, DEFAULT_TEACHER } from "./types";
 import { api, events } from "./lib/tauri";
 import { startGlobalSubscription } from "./lib/runStreams";
 import { startSetupLogSubscription } from "./lib/setupLogs";
@@ -25,7 +25,7 @@ type Tab = "pipeline" | "gpu" | "credentials" | "terminal" | "runs";
 
 const DEFAULT_CONFIG: AppConfig = {
   ssh: { host: "", port: 22, username: "root" },
-  qdrant: { endpoint: "", apiKey: "", collection: "" },
+  qdrant: { endpoint: "", apiKey: "", collection: "all" },
   digitalOcean: DEFAULT_DIGITAL_OCEAN,
   hfToken: "",
   teacher: DEFAULT_TEACHER,
@@ -39,7 +39,31 @@ const DEFAULT_CONFIG: AppConfig = {
   },
   aiAgent: DEFAULT_AI_AGENT,
   embedding: DEFAULT_EMBEDDING,
+  embedders: [DEFAULT_EMBEDDER],
 };
+
+function normalizeEmbedders(embedders?: AppConfig["embedders"]): AppConfig["embedders"] {
+  const source = embedders && embedders.length > 0 ? embedders : [DEFAULT_EMBEDDER];
+  return source.map((embedder, idx) => {
+    const basePort = DEFAULT_EMBEDDER.port + idx;
+    const name = embedder.name?.trim() || `embedder_${idx + 1}`;
+    const port =
+      idx === 0 && embedder.port === 8100 && name === "embedder_1"
+        ? DEFAULT_EMBEDDER.port
+        : embedder.port || basePort;
+    return {
+      ...DEFAULT_EMBEDDER,
+      ...embedder,
+      name,
+      modelId: embedder.modelId?.trim() || DEFAULT_EMBEDDER.modelId,
+      port,
+      concurrency: embedder.concurrency || DEFAULT_EMBEDDER.concurrency,
+      enabled: idx === 0 ? true : embedder.enabled ?? true,
+      persistent: idx === 0 ? true : embedder.persistent ?? false,
+      gpuMemoryUtilization: embedder.gpuMemoryUtilization || DEFAULT_EMBEDDER.gpuMemoryUtilization,
+    };
+  });
+}
 
 export default function App() {
   const [config, setConfig] = useState<AppConfig>(DEFAULT_CONFIG);
@@ -70,7 +94,7 @@ export default function App() {
           ...DEFAULT_CONFIG,
           ...loaded,
           ssh: { ...DEFAULT_CONFIG.ssh, ...(loaded.ssh ?? {}) },
-          qdrant: { ...DEFAULT_CONFIG.qdrant, ...(loaded.qdrant ?? {}) },
+          qdrant: { ...DEFAULT_CONFIG.qdrant, ...(loaded.qdrant ?? {}), collection: loaded.qdrant?.collection || DEFAULT_CONFIG.qdrant.collection },
           digitalOcean: { ...DEFAULT_DIGITAL_OCEAN, ...(loaded.digitalOcean ?? {}) },
           teacher: { ...DEFAULT_TEACHER, ...(loaded.teacher ?? {}), servingEngine: "vllm" as const },
           student: { ...DEFAULT_CONFIG.student, ...(loaded.student ?? {}) },
@@ -83,6 +107,7 @@ export default function App() {
             ...(loaded.embedding ?? {}),
             apiKey: loaded.embedding?.apiKey || "",
           },
+          embedders: normalizeEmbedders(loaded.embedders),
         };
         // Auto-align Qdrant endpoint to SSH host to ensure they use the correct GPU server Qdrant instance
         if (merged.ssh.host && (!merged.qdrant.endpoint || !merged.qdrant.endpoint.includes(merged.ssh.host))) {
