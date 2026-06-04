@@ -1028,6 +1028,39 @@ async fn run_pipeline(
             );
         }
     }
+    if !skip_dataset
+        && effective_teacher
+            .custom_serve_cmd
+            .as_ref()
+            .map(|cmd| cmd.trim().is_empty())
+            .unwrap_or(true)
+    {
+        if let Some(session) = session_opt.as_ref() {
+            if let Some((limit, source)) = probe_model_context_limit(
+                session,
+                docker_cfg.enabled,
+                &container_name,
+                &effective_teacher.repo_id,
+                cfg.hf_token.as_deref(),
+            )
+            .await
+            {
+                if effective_teacher.max_model_len > limit {
+                    let old = effective_teacher.max_model_len;
+                    effective_teacher.max_model_len = limit;
+                    emit_log(
+                        app,
+                        &run.id,
+                        &format!(
+                            "[context] model config reports {}={}; capping --max-model-len from {} to {}\n",
+                            source, limit, old, limit
+                        ),
+                        "stage",
+                    );
+                }
+            }
+        }
+    }
     if run.teacher_cfg.repo_id != effective_teacher.repo_id
         || run.teacher_cfg.max_model_len != effective_teacher.max_model_len
         || run.teacher_cfg.dtype != effective_teacher.dtype
@@ -4708,6 +4741,89 @@ pub fn wrap_docker_cmd_detached(cmd: &str, container_name: &str) -> String {
         container_name,
         sh_quote(cmd)
     )
+}
+
+pub async fn probe_model_context_limit(
+    session: &SshSession,
+    docker_enabled: bool,
+    container_name: &str,
+    repo_id: &str,
+    hf_token: Option<&str>,
+) -> Option<(u32, String)> {
+    let token_export = hf_token
+        .filter(|token| !token.trim().is_empty())
+        .map(|token| {
+            format!(
+                "export HF_TOKEN={token} HUGGING_FACE_HUB_TOKEN={token}; ",
+                token = sh_quote(token)
+            )
+        })
+        .unwrap_or_default();
+    let script = format!(
+        r#"set +e
+{token_export}python3 - <<'PY'
+import os
+
+MODEL = {model}
+TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
+
+def collect(cfg):
+    values = []
+    for name in [
+        "max_position_embeddings",
+        "n_positions",
+        "seq_length",
+        "max_seq_len",
+        "max_sequence_length",
+        "max_context_length",
+    ]:
+        value = getattr(cfg, name, None)
+        if isinstance(value, bool):
+            continue
+        try:
+            parsed = int(value)
+        except Exception:
+            continue
+        if 0 < parsed < 10_000_000:
+            values.append((name, parsed))
+    return values
+
+try:
+    from transformers import AutoConfig
+    kwargs = {{"trust_remote_code": True}}
+    if TOKEN:
+        kwargs["token"] = TOKEN
+    cfg = AutoConfig.from_pretrained(MODEL, **kwargs)
+    values = collect(cfg)
+    text_cfg = getattr(cfg, "text_config", None)
+    if text_cfg is not None:
+        values.extend(collect(text_cfg))
+    if values:
+        source, limit = max(values, key=lambda item: item[1])
+        print(f"MAX_LEN::{{limit}}::{{source}}")
+    else:
+        print("MAX_LEN_UNKNOWN")
+except Exception as exc:
+    print("MAX_LEN_ERROR::" + repr(exc))
+PY"#,
+        token_export = token_export,
+        model = serde_json::to_string(repo_id).unwrap_or_else(|_| "\"\"".to_string()),
+    );
+    let cmd = if docker_enabled {
+        wrap_docker_cmd(&script, container_name)
+    } else {
+        script
+    };
+    let result = session.exec_blocking(&cmd).await.ok()?;
+    for line in result.stdout.lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix("MAX_LEN::") {
+            let mut parts = rest.splitn(2, "::");
+            let limit = parts.next()?.parse::<u32>().ok()?;
+            let source = parts.next().unwrap_or("model config").to_string();
+            return Some((limit, source));
+        }
+    }
+    None
 }
 
 /// Per-port kill body: frees each given TCP port by `fuser`/`ss`. Safe to run on

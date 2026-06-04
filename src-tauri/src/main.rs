@@ -1454,6 +1454,42 @@ async fn run_deploy_teacher_task(
         }
     }
 
+    if teacher
+        .custom_serve_cmd
+        .as_ref()
+        .map(|cmd| cmd.trim().is_empty())
+        .unwrap_or(true)
+    {
+        if let Some((limit, source)) = pipeline::probe_model_context_limit(
+            &session,
+            docker_cfg.enabled,
+            &container_name,
+            &teacher.repo_id,
+            hf_token,
+        )
+        .await
+        {
+            if teacher.max_model_len > limit {
+                let old = teacher.max_model_len;
+                teacher.max_model_len = limit;
+                let _ = app.emit("deploy://log", serde_json::json!({
+                    "streamId": id,
+                    "kind": "info",
+                    "line": format!(
+                        "[context] model config reports {}={}; capping --max-model-len from {} to {}\n",
+                        source, limit, old, limit
+                    )
+                }));
+                if let Ok(mut app_cfg) = config::load().await {
+                    if app_cfg.teacher.repo_id.trim() == teacher.repo_id.trim() {
+                        app_cfg.teacher.max_model_len = limit;
+                        let _ = config::save(&app_cfg).await;
+                    }
+                }
+            }
+        }
+    }
+
     let (_model_to_check, _port_to_check) =
         if let Some(ref cmd) = teacher.custom_serve_cmd.as_ref().filter(|s| !s.is_empty()) {
             pipeline::extract_model_and_port(cmd, &teacher.repo_id, teacher.vllm_port)
