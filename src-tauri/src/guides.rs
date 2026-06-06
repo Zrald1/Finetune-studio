@@ -219,6 +219,7 @@ mod tests {
             zrald_num_generations: 4,
             zrald_reward_temperature: 0.0,
             zrald_max_completion_tokens: 768,
+            zrald_dataset_source: "generate".to_string(),
             r: 8,
             alpha: 16,
             dropout: 0.0,

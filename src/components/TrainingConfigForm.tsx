@@ -18,6 +18,7 @@ interface Props {
   hfLoading?: boolean;
   hfTokenSet?: boolean;
   onRefreshModels?: () => void;
+  directTraining?: boolean;
 }
 
 export default function TrainingConfigForm({
@@ -29,11 +30,12 @@ export default function TrainingConfigForm({
   hfLoading = false,
   hfTokenSet = false,
   onRefreshModels,
+  directTraining = false,
 }: Props) {
   const set = <K extends keyof LoraConfig>(k: K, v: LoraConfig[K]) =>
     onChange({ ...value, [k]: v });
   const method = value.method || "lora";
-  const methodCopy: Record<"lora" | "qlora" | "unsloth" | "full" | "freeze" | "dora" | "loraplus" | "pissa" | "galore" | "badam" | "grpo" | "zrald" | "custom", {
+  const methodCopy: Record<"lora" | "qlora" | "unsloth" | "full" | "freeze" | "dora" | "loraplus" | "pissa" | "galore" | "badam" | "grpo" | "zrald" | "zrald_offline" | "custom", {
     title: string;
     detail: string;
     rankLabel: string;
@@ -201,6 +203,19 @@ export default function TrainingConfigForm({
       cutoffLabel: "ZRALD Max Seq Length",
       saveLabel: "ZRALD Save Steps",
       note: "Uses the generated RAG question pool, fixed before/after benchmarks, four sampled completions per prompt, and reward-teacher scores clamped from -1 to 1.",
+    },
+    zrald_offline: {
+      title: "ZRALD Offline preference distillation",
+      detail: "Low-VRAM ZRALD. The teacher generates RAG Q&A, unloads, the student writes four answers per question, unloads, then the teacher reloads to score saved answers before student-only adapter training.",
+      rankLabel: "Offline ZRALD LoRA Rank (r)",
+      alphaLabel: "Offline ZRALD LoRA Alpha",
+      dropoutLabel: "Offline ZRALD Dropout",
+      learningLabel: "Offline ZRALD Learning Rate",
+      batchLabel: "Offline ZRALD Batch",
+      accumLabel: "Offline ZRALD Grad Accum",
+      cutoffLabel: "Offline ZRALD Max Seq Length",
+      saveLabel: "Offline ZRALD Save Steps",
+      note: "Teacher and student are never intentionally kept in VRAM together. The student does not see Qdrant/RAG context while answering; the teacher scores saved answers against stored RAG context.",
     },
     custom: {
       title: value.customMethodName?.trim() || "Custom command method",
@@ -377,6 +392,7 @@ export default function TrainingConfigForm({
             ["badam", "BAdam", "Block-wise Adam"],
             ["grpo", "GRPO", "Reinforcement RL"],
             ["zrald", "ZRALD", "RAG reward RL"],
+            ["zrald_offline", "ZRALD Offline", "Low-VRAM reward"],
             ["custom", "Add +", "Command chain"],
           ].map(([key, label, desc]) => {
             const active = method === key;
@@ -470,7 +486,7 @@ export default function TrainingConfigForm({
           </div>
         )}
 
-        {method === "zrald" && (
+        {(method === "zrald" || method === "zrald_offline") && (
           <div className="rounded-2xl border border-white/5 theme-surface-soft p-5 glass-panel space-y-5">
             <div className="rounded-xl border border-theme-accent/20 bg-theme-accent/10 p-4">
               <p className="text-[10px] uppercase tracking-widest font-black font-mono theme-accent">
@@ -478,6 +494,34 @@ export default function TrainingConfigForm({
               </p>
               <p className="mt-2 text-[11px] theme-muted font-mono leading-relaxed">
                 The GPU teacher generates the prompt/answer pool first, the current student is benchmarked on the configured sample, then ZRALD trains with reward-teacher scoring.
+              </p>
+            </div>
+            <div className="space-y-2">
+              <label className="text-[10px] uppercase tracking-widest theme-muted font-black ml-1">
+                Dataset Source
+              </label>
+              <div className="grid grid-cols-2 gap-3">
+                {([
+                  ["generate", "Generate with teacher (Qdrant)"],
+                  ["huggingface", "Use existing HF dataset"],
+                ] as const).map(([key, label]) => {
+                  const active = (value.zraldDatasetSource || "generate") === key;
+                  return (
+                    <button
+                      type="button"
+                      key={key}
+                      onClick={() => set("zraldDatasetSource", key)}
+                      className={`text-left rounded-xl border p-4 transition-all premium-button ${active ? "theme-accent-soft theme-accent border-theme-accent/40" : "border-white/5 bg-white/[0.02] theme-muted hover:theme-text hover:bg-white/[0.04]"}`}
+                    >
+                      <span className="text-[11px] font-mono font-black uppercase tracking-widest">{label}</span>
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="text-[10px] theme-muted font-mono italic opacity-70 ml-1 leading-relaxed">
+                {(value.zraldDatasetSource || "generate") === "huggingface"
+                  ? "ZRALD loads the question pool from the configured Hugging Face dataset repo(s); teacher generation is skipped. The student still only sees the question."
+                  : "The teacher reads Qdrant/RAG to write the Q + reference answer, then ZRALD trains. The student is shown the question only — never the RAG context or the reference answer."}
               </p>
             </div>
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
@@ -489,7 +533,7 @@ export default function TrainingConfigForm({
                   type="text"
                   value={value.zraldRewardEndpoint || ""}
                   onChange={(e) => set("zraldRewardEndpoint", e.target.value)}
-                  placeholder="Blank = use detected/deployed GPU teacher"
+                  placeholder={directTraining ? "Blank = auto-detect deployed teacher endpoint" : "Blank = use detected/deployed GPU teacher"}
                   className="w-full px-4 py-3 premium-input rounded-xl text-sm-fluid font-mono text-white focus:outline-none shadow-inner"
                 />
               </div>
@@ -501,7 +545,7 @@ export default function TrainingConfigForm({
                   type="text"
                   value={value.zraldRewardModel || ""}
                   onChange={(e) => set("zraldRewardModel", e.target.value)}
-                  placeholder="Hugging Face model id or served model name"
+                  placeholder="Blank = auto-detect served teacher model"
                   className="w-full px-4 py-3 premium-input rounded-xl text-sm-fluid font-mono text-white focus:outline-none shadow-inner"
                 />
               </div>

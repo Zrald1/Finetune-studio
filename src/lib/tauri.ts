@@ -18,12 +18,14 @@ import type {
   PaddleOcrConfig,
   QdrantConfig,
   Run,
+  TopicTarget,
   RunConfig,
   SSHConfig,
   ShellDoneEvent,
   ShellLogEvent,
   LoraConfig,
   HubConfig,
+  HubDatasetConfig,
   MatchedGuideInfo,
   DigitalOceanConfig,
   DigitalOceanAccount,
@@ -126,8 +128,8 @@ export const api = {
     invoke<string>("serve_boot_embedder", { ssh, docker, embedder, hfToken }),
   serveCheckEmbedder: (ssh: SSHConfig, docker: AppConfig["docker"], host: string, port: number) =>
     invoke<string | null>("serve_check_embedder", { ssh, docker, host, port }),
-  serveSetupAllEmbedders: (ssh: SSHConfig, docker: AppConfig["docker"], embedders: EmbedderConfig[], hfToken?: string | null, paddleOcr?: PaddleOcrConfig | null) =>
-    invoke<{ name: string; model_id: string; port: number; status: string }[]>("serve_setup_all_embedders", { ssh, docker, embedders, hfToken, paddleOcr }),
+  serveSetupAllEmbedders: (ssh: SSHConfig, docker: AppConfig["docker"], embedders: EmbedderConfig[], hfToken?: string | null) =>
+    invoke<{ name: string; model_id: string; port: number; status: string }[]>("serve_setup_all_embedders", { ssh, docker, embedders, hfToken }),
   serveBootPaddleocr: (ssh: SSHConfig, docker: AppConfig["docker"], paddleOcr: PaddleOcrConfig) =>
     invoke<string>("serve_boot_paddleocr", { ssh, docker, paddleOcr }),
   // knowledge-base ingestion. Returns a streamId the caller correlates with
@@ -183,8 +185,8 @@ export const api = {
     invoke<TeacherDeploymentStatus | null>("check_teacher_deployed", { ssh, docker, teacher }),
   deployTeacher: (ssh: SSHConfig, docker: AppConfig["docker"], teacher: AppConfig["teacher"], hfToken?: string | null) =>
     invoke<string>("deploy_teacher", { ssh, docker, teacher, hfToken }),
-  updateRunConfig: (runId: string, studentModel: string, lora: LoraConfig, hub: HubConfig) =>
-    invoke<void>("update_run_config", { runId, studentModel, lora, hub }),
+  updateRunConfig: (runId: string, studentModel: string, lora: LoraConfig, hub: HubConfig, hubDataset?: HubDatasetConfig, promptTemplate?: string | null, topics?: TopicTarget[]) =>
+    invoke<void>("update_run_config", { runId, studentModel, lora, hub, hubDataset, promptTemplate, topics }),
   cleanupVram: (cfg: SSHConfig, docker: AppConfig["docker"]) =>
     invoke<string>("cleanup_vram", { cfg, docker }),
   matchModelGuide: (studentModel: string) =>

@@ -187,6 +187,13 @@ export interface PaddleOcrConfig {
   dockerImage: string;
 }
 
+export const DEFAULT_PADDLE_OCR: PaddleOcrConfig = {
+  enabled: false,
+  port: 8118,
+  modelName: "PaddleOCR-VL-1.6-0.9B",
+  dockerImage: "ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-vllm-server:latest-amd-gpu",
+};
+
 export const DEFAULT_EMBEDDER: EmbedderConfig = {
   name: "embedder_1",
   modelId: "Qwen/Qwen3-Embedding-8B",
@@ -429,6 +436,7 @@ export interface LoraConfig {
       | "badam"
       | "grpo"
       | "zrald"
+      | "zrald_offline"
       | "custom";
   customMethodName?: string;
   customCommands?: string[];
@@ -439,6 +447,9 @@ export interface LoraConfig {
   zraldNumGenerations?: number;
   zraldRewardTemperature?: number;
   zraldMaxCompletionTokens?: number;
+  /** ZRALD dataset source: "generate" = teacher builds Q&A from Qdrant first;
+   *  "huggingface" = load the question pool from an existing HF dataset. */
+  zraldDatasetSource?: "generate" | "huggingface";
   r: number;
   alpha: number;
   dropout: number;
@@ -751,6 +762,7 @@ export const DEFAULT_LORA: LoraConfig = {
   zraldNumGenerations: 4,
   zraldRewardTemperature: 0,
   zraldMaxCompletionTokens: 768,
+  zraldDatasetSource: "generate",
 };
 
 export const DEFAULT_HUB: HubConfig = {

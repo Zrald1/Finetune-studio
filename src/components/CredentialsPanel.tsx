@@ -1,6 +1,6 @@
 import React, { useRef, useState, useEffect } from "react";
 import type { AppConfig, ConnectionStatus, PaddleOcrConfig, QdrantConfig, SSHConfig, AIAgentConfig, EmbeddingConfig, EmbedderConfig } from "../types";
-import { DEFAULT_AI_AGENT, DEFAULT_DIGITAL_OCEAN, POPULAR_MODELS, DEFAULT_EMBEDDING, DEFAULT_EMBEDDER } from "../types";
+import { DEFAULT_AI_AGENT, DEFAULT_DIGITAL_OCEAN, POPULAR_MODELS, DEFAULT_EMBEDDING, DEFAULT_EMBEDDER, DEFAULT_PADDLE_OCR } from "../types";
 import { CheckCircle2, Cloud, Container, Database, Download, Eye, EyeOff, Key, Loader2, LockKeyhole, RefreshCw, Save, Upload, Sparkles, Plus, Trash2, Server, Circle, ScanText, X, ChevronLeft, ChevronRight, FileText } from "lucide-react";
 import { api, events } from "../lib/tauri";
 import { clearSetupLogs, getSetupLogSnapshot, subscribeSetupLogs } from "../lib/setupLogs";
@@ -68,6 +68,8 @@ export default function CredentialsPanel({
     /error sending request|failed to fetch|network|timeout|timed out|connection|refused|10060|unreachable|could not connect|tcp/i.test(
       err instanceof Error ? err.message : String(err),
     );
+  const isQdrantMissingCollectionError = (err: unknown) =>
+    /doesn'?t exist|not found|404/i.test(err instanceof Error ? err.message : String(err));
 
   const patchSsh = (p: Partial<SSHConfig>) =>
     onChange({ ssh: { ...ssh, ...p } });
@@ -76,7 +78,7 @@ export default function CredentialsPanel({
   const patchDocker = (p: Partial<typeof docker>) =>
     onChange({ docker: { ...docker, ...p } });
 
-  const paddleOcr: PaddleOcrConfig = { enabled: false, port: 8118, modelName: "PaddleOCR-VL-1.6-0.9B", dockerImage: "ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-vllm-server:latest-amd-gpu", ...config.paddleOcr };
+  const paddleOcr: PaddleOcrConfig = { ...DEFAULT_PADDLE_OCR, ...config.paddleOcr };
   const patchPaddleOcr = (p: Partial<PaddleOcrConfig>) =>
     onChange({ paddleOcr: { ...paddleOcr, ...p } });
 
@@ -161,7 +163,7 @@ export default function CredentialsPanel({
     setEmbedderStatuses(statuses);
     try {
       const results = await api.serveSetupAllEmbedders(
-        config.ssh, config.docker, embedders, config.hfToken ?? null, config.paddleOcr ?? null
+        config.ssh, config.docker, embedders, config.hfToken ?? null
       );
       const final: Record<number, "running" | "error"> = {};
       results.forEach((r, i) => {
@@ -187,8 +189,8 @@ export default function CredentialsPanel({
           ? selectedCollection
           : qd.collection && names.includes(qd.collection)
             ? qd.collection
-            : names[0] || qd.collection || "";
-      if (nextCollection && nextCollection !== selectedCollection) {
+            : names[0] || "all";
+      if (nextCollection !== selectedCollection) {
         setSelectedCollection(nextCollection);
         if (nextCollection !== qd.collection) {
           patchQd({ collection: nextCollection });
@@ -204,6 +206,7 @@ export default function CredentialsPanel({
   const loadQdrantSnapshots = async (collection: string) => {
     if (collection === "all") {
       setQdrantSnapshots([]);
+      setSnapshotStatus(null);
       return;
     }
     setLoadingSnapshots(true);
@@ -212,7 +215,10 @@ export default function CredentialsPanel({
       setQdrantSnapshots(snaps);
     } catch (e) {
       setQdrantSnapshots([]);
-      if (!isQdrantOfflineError(e)) {
+      if (isQdrantMissingCollectionError(e)) {
+        setSnapshotStatus(`Collection '${collection}' does not exist yet.`);
+        setSnapshotIsError(false);
+      } else if (!isQdrantOfflineError(e)) {
         console.error("list snapshots:", e);
       }
     } finally {
@@ -353,15 +359,21 @@ export default function CredentialsPanel({
     try {
       const { open } = await import("@tauri-apps/plugin-dialog");
       const files = await open({
-        multiple: false,
+        multiple: true,
         filters: [{ name: "Snapshot", extensions: ["tar", "snapshot"] }],
       });
       if (!files) return;
-      const filePath = files as string;
+      const filePaths = (Array.isArray(files) ? files : [files]).filter(Boolean);
+      if (filePaths.length === 0) return;
       setSnapshotUploading(true);
       setSnapshotStatus(null);
-      await api.qdrantUploadSnapshot(qd, selectedCollection, filePath);
-      setSnapshotStatus(`Snapshot uploaded to ${selectedCollection}`);
+      for (let i = 0; i < filePaths.length; i++) {
+        const filePath = filePaths[i];
+        setSnapshotStatus(`Uploading snapshot ${i + 1}/${filePaths.length}: ${filePath.split(/[\\/]/).pop()}...`);
+        setSnapshotIsError(false);
+        await api.qdrantUploadSnapshot(qd, selectedCollection, filePath);
+      }
+      setSnapshotStatus(`Uploaded ${filePaths.length} snapshot${filePaths.length === 1 ? "" : "s"} to ${selectedCollection}`);
       setSnapshotIsError(false);
       await reloadSelectedCollection();
     } catch (e: any) {
@@ -882,7 +894,7 @@ export default function CredentialsPanel({
                   className="flex items-center justify-center gap-2 px-4 py-2 bg-white/5 border border-white/10 text-white text-[10px] uppercase tracking-widest font-black rounded-xl hover:bg-white/10 disabled:opacity-20 transition-all"
                 >
                   {snapshotUploading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Upload className="w-3.5 h-3.5" />}
-                  {snapshotUploading ? "Uploading..." : "Upload Snapshot"}
+                  {snapshotUploading ? "Uploading..." : "Upload Snapshots"}
                 </button>
                 <button
                   onClick={saveAllSnapshots}

@@ -10,6 +10,7 @@ import type {
   HubDatasetConfig,
   IngestStream,
   LoraConfig,
+  PaddleOcrConfig,
   Run,
   RunConfig,
   TeacherConfig,
@@ -20,6 +21,7 @@ import {
   DEFAULT_HUB,
   DEFAULT_HUB_DATASET,
   DEFAULT_LORA,
+  DEFAULT_PADDLE_OCR,
   DEFAULT_TEACHER,
 } from "../types";
 import { api, events } from "../lib/tauri";
@@ -54,6 +56,7 @@ import {
   FolderOpen,
   Wifi,
   WifiOff,
+  ScanText,
 } from "lucide-react";
 import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import type { IngestDoneEvent, IngestProgressEvent } from "../types";
@@ -1127,19 +1130,22 @@ function QdrantDbPanel({ config, onConfigChange }: { config: AppConfig; onConfig
     setStatus(null);
     try {
       const sel = await openFileDialog({
-        multiple: false,
+        multiple: true,
         filters: [{ name: "Qdrant Snapshot", extensions: ["snapshot", "tar"] }]
       });
       if (!sel) return;
-      const snapshotPath = Array.isArray(sel) ? sel[0] : sel;
-      if (!snapshotPath) return;
+      const snapshotPaths = (Array.isArray(sel) ? sel : [sel]).filter(Boolean);
+      if (snapshotPaths.length === 0) return;
 
       setUploading(true);
-      setStatus(`Uploading and recovering snapshot: ${snapshotPath.split(/[\\/]/).pop()}...`);
       setIsError(false);
 
-      await api.qdrantUploadSnapshot(qdCfg, selectedCollection, snapshotPath);
-      setStatus(`Successfully uploaded and restored database from snapshot.`);
+      for (let i = 0; i < snapshotPaths.length; i++) {
+        const snapshotPath = snapshotPaths[i];
+        setStatus(`Uploading and recovering snapshot ${i + 1}/${snapshotPaths.length}: ${snapshotPath.split(/[\\/]/).pop()}...`);
+        await api.qdrantUploadSnapshot(qdCfg, selectedCollection, snapshotPath);
+      }
+      setStatus(`Successfully uploaded and restored ${snapshotPaths.length} snapshot${snapshotPaths.length === 1 ? "" : "s"}.`);
       setIsError(false);
       await reloadSelectedCollection();
     } catch (e: any) {
@@ -1253,7 +1259,7 @@ function QdrantDbPanel({ config, onConfigChange }: { config: AppConfig; onConfig
             className="flex items-center gap-2 px-4 py-2 bg-white/5 border border-white/10 text-white text-[10px] uppercase tracking-widest font-black rounded-xl hover:bg-white/10 disabled:opacity-20 transition-all"
           >
             {uploading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Upload className="w-3.5 h-3.5" />}
-            {uploading ? "Uploading..." : "Upload Snapshot"}
+            {uploading ? "Uploading..." : "Upload Snapshots"}
           </button>
           <button
             onClick={saveSnapshot}
@@ -1418,6 +1424,8 @@ function KnowledgeBaseStep({
   const [gpuLoading, setGpuLoading] = useState(false);
   const [setupAllLoading, setSetupAllLoading] = useState(false);
   const [setupAllError, setSetupAllError] = useState<string | null>(null);
+  const [setupOcrLoading, setSetupOcrLoading] = useState(false);
+  const [setupOcrError, setSetupOcrError] = useState<string | null>(null);
   const [setupAllLog, setSetupAllLog] = useState(getSetupLogSnapshot());
   const [qdrantOnlyLoading, setQdrantOnlyLoading] = useState(false);
   const [qdrantOnlyLog, setQdrantOnlyLog] = useState<string[]>([]);
@@ -1427,6 +1435,7 @@ function KnowledgeBaseStep({
   const gpuStatus = localGpuStatus ?? propGpuStatus;
 
   const embedders = config.embedders && config.embedders.length > 0 ? config.embedders : [DEFAULT_EMBEDDER];
+  const paddleOcr: PaddleOcrConfig = { ...DEFAULT_PADDLE_OCR, ...config.paddleOcr };
 
   useEffect(() => subscribeSetupLogs(setSetupAllLog), []);
 
@@ -1465,13 +1474,33 @@ function KnowledgeBaseStep({
     clearSetupLogs();
     setSetupAllLoading(true);
     setSetupAllError(null);
+    setSetupOcrError(null);
     try {
-      const results = await api.serveSetupAllEmbedders(config.ssh, config.docker, embedders, config.hfToken ?? null, config.paddleOcr ?? null);
+      const results = await api.serveSetupAllEmbedders(config.ssh, config.docker, embedders, config.hfToken ?? null);
       const updatedEmbedders = embedders.map((e, i) => ({ ...e, enabled: results[i]?.status !== "error" }));
       onConfigChange({ embedders: updatedEmbedders });
       await refreshAllEmbedderCounts();
     } catch (e: any) { setSetupAllError(e.message || String(e)); }
     finally { setSetupAllLoading(false); }
+  };
+
+  const setupPaddleOcr = async () => {
+    if (!config.ssh.host) return;
+    clearSetupLogs();
+    setSetupOcrLoading(true);
+    setSetupOcrError(null);
+    setSetupAllError(null);
+    const nextPaddleOcr = { ...paddleOcr, enabled: true };
+    if (!paddleOcr.enabled) {
+      onConfigChange({ paddleOcr: nextPaddleOcr });
+    }
+    try {
+      await api.serveBootPaddleocr(config.ssh, config.docker, nextPaddleOcr);
+    } catch (e: any) {
+      setSetupOcrError(e.message || String(e));
+    } finally {
+      setSetupOcrLoading(false);
+    }
   };
 
   const installQdrantOnly = async () => {
@@ -1556,10 +1585,20 @@ const removeEmbedder = (idx: number) => {
             </button>
             <button
               onClick={setupAllEmbedders}
-              disabled={setupAllLoading || embedders.length === 0 || !config.ssh.host}
+              disabled={setupAllLoading || setupOcrLoading || embedders.length === 0 || !config.ssh.host}
               className="px-4 py-3 rounded-xl theme-accent-bg text-black text-[10px] uppercase tracking-widest font-black hover:brightness-125 disabled:opacity-20 shadow-lg shadow-theme-accent/10 transition-all flex items-center justify-center gap-2"
             >
               {setupAllLoading ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Installing...</> : <><Server className="w-3.5 h-3.5" /> Setup All Embedders</>}
+            </button>
+            <button
+              onClick={setupPaddleOcr}
+              disabled={setupOcrLoading || setupAllLoading || !config.ssh.host}
+              className="px-4 py-3 rounded-xl bg-orange-500/10 border border-orange-500/20 text-orange-300 text-[10px] uppercase tracking-widest font-black hover:bg-orange-500/20 hover:border-orange-400/40 disabled:opacity-20 transition-all flex items-center justify-center gap-2"
+              title="Deploy PaddleOCR-VL separately from the embedding models."
+            >
+              {setupOcrLoading
+                ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Setting up OCR...</>
+                : <><ScanText className="w-3.5 h-3.5" /> Setup Paddle OCR</>}
             </button>
             {/* Install Qdrant Only — for users with a pre-existing database */}
             <button
@@ -1587,6 +1626,11 @@ const removeEmbedder = (idx: number) => {
             <span className="font-black uppercase">Setup Error: </span>{setupAllError}
           </div>
         )}
+        {setupOcrError && (
+          <div className="p-3 rounded-lg border border-red-500/20 bg-red-500/5 text-red-300 text-[10px] font-mono">
+            <span className="font-black uppercase">Paddle OCR Error: </span>{setupOcrError}
+          </div>
+        )}
         {setupAllLog.trim().length > 0 && (
           <div className="bg-black/60 border border-white/10 rounded-xl p-4 max-h-48 overflow-y-auto font-mono text-[10px] leading-relaxed space-y-0.5 scrollbar-thin scrollbar-thumb-white/10">
             {setupAllLog.split(/\r?\n/).filter(Boolean).map((line, i) => (
@@ -1594,7 +1638,7 @@ const removeEmbedder = (idx: number) => {
                 {line}
               </div>
             ))}
-            {setupAllLoading && <span className="animate-pulse text-white/30">▊</span>}
+            {(setupAllLoading || setupOcrLoading) && <span className="animate-pulse text-white/30">▊</span>}
           </div>
         )}
         {/* Qdrant-only install log */}
@@ -2070,7 +2114,9 @@ function DatasetStep(props: {
   onCancel: () => void;
   sshHostSet: boolean;
   onConfigChange?: (patch: Partial<AppConfig>) => void;
+  method?: string;
 }) {
+  const isZraldOffline = props.method === "zrald_offline";
   const embedders = props.config.embedders && props.config.embedders.length > 0 ? props.config.embedders : [DEFAULT_EMBEDDER];
   const collections = useMemo(() => {
     const cols = ["all"];
@@ -2442,45 +2488,64 @@ Provide ONLY the final generated instruction system prompt text. Do not include 
         )}
       </div>
 
-      {!props.trainingOnly && <div className="space-y-6 pt-4">
-        <div className="premium-card rounded-2xl overflow-hidden glass-panel border border-white/5 shadow-2xl relative">
-          <div className="px-8 py-5 border-b border-white/5 bg-white/[0.02] flex items-center justify-between">
-             <div className="flex items-center gap-4">
-              <div className={`w-3.5 h-3.5 rounded-full shadow-[0_0_12px_currentColor] transition-all duration-500 ${props.generating ? "bg-amber-500 animate-pulse text-amber-400" : props.generated ? "bg-emerald-500 text-emerald-400" : "bg-red-500 text-red-400"}`} />
-              <div className="flex flex-col">
-                 <span className="text-[11px] uppercase tracking-[0.3em] font-black font-mono theme-text/80">PIPELINE STATUS: {props.generating ? "EXECUTING_PASS" : props.generated ? "BUFFER_SYNCED" : "AWAITING_HANDSHAKE"}</span>
-                 <span className="text-[9px] theme-faint font-mono uppercase mt-1">Telemetry Generation Context active</span>
+      {!props.trainingOnly && (
+        isZraldOffline ? (
+          <div className="pt-4 animate-premium">
+            <div className="rounded-2xl border border-theme-accent/30 bg-theme-accent/5 p-6 space-y-4">
+              <div className="flex items-center gap-3">
+                <Sparkles className="w-5 h-5 theme-accent animate-pulse" />
+                <h4 className="text-xs-fluid uppercase tracking-[0.2em] font-black font-mono theme-accent">ZRALD Offline Workflow Active</h4>
               </div>
+              <p className="text-sm-fluid theme-muted font-medium leading-relaxed opacity-95">
+                For ZRALD Offline, dataset generation and model training are executed together in a single pipeline run on the remote node. You do not need to generate the dataset beforehand.
+              </p>
+              <p className="text-[10px] theme-muted font-mono italic opacity-70">
+                Proceed directly to the "Train" phase (Step 4) to specify training parameters and launch the combined pipeline.
+              </p>
             </div>
-            <div className="flex gap-3">
-               {props.generating ? (
-                <button onClick={props.onCancel} className="px-6 py-2.5 bg-red-500/10 border border-red-500/20 text-red-400 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all hover:bg-red-500 hover:text-white shadow-lg shadow-red-500/10">Abort Sequence</button>
-              ) : (
-                <button onClick={props.onGenerate} disabled={!props.sshHostSet} className="px-8 py-2.5 theme-accent-bg text-black rounded-xl text-[10px] font-black uppercase tracking-widest transition-all hover:brightness-125 disabled:opacity-20 shadow-xl shadow-theme-accent/20 premium-button">Initiate Synthesis Pass</button>
+          </div>
+        ) : (
+          <div className="space-y-6 pt-4">
+            <div className="premium-card rounded-2xl overflow-hidden glass-panel border border-white/5 shadow-2xl relative">
+              <div className="px-8 py-5 border-b border-white/5 bg-white/[0.02] flex items-center justify-between">
+                 <div className="flex items-center gap-4">
+                  <div className={`w-3.5 h-3.5 rounded-full shadow-[0_0_12px_currentColor] transition-all duration-500 ${props.generating ? "bg-amber-500 animate-pulse text-amber-400" : props.generated ? "bg-emerald-500 text-emerald-400" : "bg-red-500 text-red-400"}`} />
+                  <div className="flex flex-col">
+                     <span className="text-[11px] uppercase tracking-[0.3em] font-black font-mono theme-text/80">PIPELINE STATUS: {props.generating ? "EXECUTING_PASS" : props.generated ? "BUFFER_SYNCED" : "AWAITING_HANDSHAKE"}</span>
+                     <span className="text-[9px] theme-faint font-mono uppercase mt-1">Telemetry Generation Context active</span>
+                  </div>
+                </div>
+                <div className="flex gap-3">
+                   {props.generating ? (
+                    <button onClick={props.onCancel} className="px-6 py-2.5 bg-red-500/10 border border-red-500/20 text-red-400 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all hover:bg-red-500 hover:text-white shadow-lg shadow-red-500/10">Abort Sequence</button>
+                  ) : (
+                    <button onClick={props.onGenerate} disabled={!props.sshHostSet} className="px-8 py-2.5 theme-accent-bg text-black rounded-xl text-[10px] font-black uppercase tracking-widest transition-all hover:brightness-125 disabled:opacity-20 shadow-xl shadow-theme-accent/20 premium-button">Initiate Synthesis Pass</button>
+                  )}
+                </div>
+              </div>
+
+              {(props.generating || props.progress) && (
+                <div className="grid grid-cols-3 divide-x divide-white/10 bg-black/30 text-center animate-premium shadow-inner">
+                  <div className="py-8 px-6 group transition-colors hover:bg-white/[0.01]"><p className="text-[10px] uppercase tracking-[0.2em] theme-faint font-black font-mono mb-2 opacity-50">Ingested Fragments</p><p className="text-3xl font-black font-mono text-white tabular-nums tracking-tighter">{props.progress?.scanned || 0}</p></div>
+                  <div className="py-8 px-6 group transition-colors hover:bg-white/[0.01]"><p className="text-[10px] uppercase tracking-[0.2em] theme-accent font-black font-mono mb-2">Accepted Contexts</p><p className="text-3xl font-black font-mono text-white tabular-nums tracking-tighter">{props.progress?.kept || 0}</p></div>
+                  <div className="py-8 px-6 group transition-colors hover:bg-white/[0.01]"><p className="text-[10px] uppercase tracking-[0.2em] theme-faint font-black font-mono mb-2 opacity-50">Rejected Noise</p><p className="text-3xl font-black font-mono text-red-500/40 tabular-nums tracking-tighter">{props.progress?.rejected || 0}</p></div>
+                </div>
+              )}
+
+              {(props.generating || props.logs || props.error) && (
+                 <div className="animate-premium">
+                   <div className="bg-black/60 p-8 h-80 overflow-y-auto font-mono text-[12px] leading-relaxed selection:bg-theme-selection scrollbar-thin scrollbar-thumb-white/10 tracking-tight">
+                     {props.logs || <span className="theme-faint italic opacity-50">Establishing semantic handshake with remote node...</span>}
+                     {props.error && <div className="mt-6 p-4 rounded-xl border border-red-500/30 bg-red-500/5 text-red-400 font-bold uppercase text-[11px] tracking-[0.15em] shadow-xl animate-premium">✕ CRITICAL CONTEXT FAULT: {props.error}</div>}
+                     {props.generating && <span className="inline-block w-2.5 h-4.5 theme-accent-bg ml-3 animate-pulse align-middle shadow-[0_0_10px_currentColor]" />}
+                   </div>
+                   <div className="px-8 py-2 border-t border-white/5 bg-white/[0.01]"><p className="text-[9px] theme-faint font-mono uppercase tracking-[0.3em] text-center opacity-40">Direct pass telemetry stream</p></div>
+                 </div>
               )}
             </div>
           </div>
-
-          {(props.generating || props.progress) && (
-            <div className="grid grid-cols-3 divide-x divide-white/10 bg-black/30 text-center animate-premium shadow-inner">
-              <div className="py-8 px-6 group transition-colors hover:bg-white/[0.01]"><p className="text-[10px] uppercase tracking-[0.2em] theme-faint font-black font-mono mb-2 opacity-50">Ingested Fragments</p><p className="text-3xl font-black font-mono text-white tabular-nums tracking-tighter">{props.progress?.scanned || 0}</p></div>
-              <div className="py-8 px-6 group transition-colors hover:bg-white/[0.01]"><p className="text-[10px] uppercase tracking-[0.2em] theme-accent font-black font-mono mb-2">Accepted Contexts</p><p className="text-3xl font-black font-mono text-white tabular-nums tracking-tighter">{props.progress?.kept || 0}</p></div>
-              <div className="py-8 px-6 group transition-colors hover:bg-white/[0.01]"><p className="text-[10px] uppercase tracking-[0.2em] theme-faint font-black font-mono mb-2 opacity-50">Rejected Noise</p><p className="text-3xl font-black font-mono text-red-500/40 tabular-nums tracking-tighter">{props.progress?.rejected || 0}</p></div>
-            </div>
-          )}
-
-          {(props.generating || props.logs || props.error) && (
-             <div className="animate-premium">
-               <div className="bg-black/60 p-8 h-80 overflow-y-auto font-mono text-[12px] leading-relaxed selection:bg-theme-selection scrollbar-thin scrollbar-thumb-white/10 tracking-tight">
-                 {props.logs || <span className="theme-faint italic opacity-50">Establishing semantic handshake with remote node...</span>}
-                 {props.error && <div className="mt-6 p-4 rounded-xl border border-red-500/30 bg-red-500/5 text-red-400 font-bold uppercase text-[11px] tracking-[0.15em] shadow-xl animate-premium">✕ CRITICAL CONTEXT FAULT: {props.error}</div>}
-                 {props.generating && <span className="inline-block w-2.5 h-4.5 theme-accent-bg ml-3 animate-pulse align-middle shadow-[0_0_10px_currentColor]" />}
-               </div>
-               <div className="px-8 py-2 border-t border-white/5 bg-white/[0.01]"><p className="text-[9px] theme-faint font-mono uppercase tracking-[0.3em] text-center opacity-40">Direct pass telemetry stream</p></div>
-             </div>
-          )}
-        </div>
-      </div>}
+        )
+      )}
     </div>
   );
 }
@@ -2513,6 +2578,8 @@ function TrainStep(props: {
   hubDatasetValidation: Record<string, { valid: boolean; sampleCount?: number; error?: string; validatedAt?: number }>;
   onValidateDatasets: () => void;
   validateButtonRef?: React.RefObject<HTMLButtonElement | null>;
+  requiresCloudTrainingDataset?: boolean;
+  zraldUsesHf?: boolean;
 }) {
   const hub = props.hub;
   const setHub = <K extends keyof HubConfig>(k: K, v: HubConfig[K]) => props.onHubChange({ ...hub, [k]: v });
@@ -2527,10 +2594,10 @@ function TrainStep(props: {
 
       {props.trainingOnly && props.trainingDataset}
 
-<div className="space-y-4">
+      <div className="space-y-4">
         <div className="flex items-center justify-between ml-1">
           <label className="text-[11px] uppercase tracking-[0.3em] theme-muted font-black font-mono leading-none">Session Identifier</label>
-          {props.trainingOnly ? (
+          {props.requiresCloudTrainingDataset ? (
             <button type="button" ref={props.validateButtonRef} onClick={props.onValidateDatasets} disabled={props.validatingDataset || props.datasetsValidated || props.trainingOnlyDatasets.length === 0} className={`flex items-center gap-3 px-5 py-2 rounded-xl text-[10px] uppercase tracking-[0.2em] font-black font-mono transition-all group shadow-sm ${props.datasetsValidated ? "bg-emerald-500/10 border border-emerald-500/20 text-emerald-400" : "theme-accent-soft theme-accent border-theme-accent/40 hover:bg-theme-accent hover:text-black"}`}>
               {props.validatingDataset ? <><Loader2 className="w-4 h-4 animate-spin" />VALIDATING...</> : props.datasetsValidated ? <><CheckCircle2 className="w-4 h-4" />VALIDATED</> : <><ShieldAlert className="w-4 h-4" />VALIDATE DATASETS</>}
             </button>
@@ -2554,6 +2621,7 @@ function TrainStep(props: {
           hfLoading={props.hfLoading}
           hfTokenSet={props.hfTokenSet}
           onRefreshModels={props.onRefreshModels}
+          directTraining={props.trainingOnly}
         />
       </div>
 
@@ -2884,7 +2952,7 @@ const [pipelineMode, setPipelineMode] = useState<PipelineMode>("rag");
 
   const [studentModel, setStudentModel] = useState(config.student?.repoId || "Qwen/Qwen2.5-7B-Instruct");
   const [lora, setLora] = useState<LoraConfig>(DEFAULT_LORA);
-  const isZraldMethod = (lora.method || "lora") === "zrald";
+  const isZraldMethod = (lora.method || "lora") === "zrald" || (lora.method || "lora") === "zrald_offline";
   const [hub, setHub] = useState<HubConfig>(DEFAULT_HUB);
   const [runName, setRunName] = useState("");
   const [launching, setLaunching] = useState(false);
@@ -2892,13 +2960,13 @@ const [pipelineMode, setPipelineMode] = useState<PipelineMode>("rag");
   const [cleaningVram, setCleaningVram] = useState(false);
 
   useEffect(() => {
-    if (!isZraldMethod || !isTrainingOnly) return;
+    if (lora.method !== "zrald" || !isTrainingOnly) return;
     setPipelineMode("rag");
     setHubDataset((current) => ({ ...current, enabled: false, trainOnly: false }));
     if (step === 3 && !datasetGenerated) {
       setStep(teacherDeployed ? 2 : 1);
     }
-  }, [isZraldMethod, isTrainingOnly, step, datasetGenerated, teacherDeployed]);
+  }, [lora.method, isTrainingOnly, step, datasetGenerated, teacherDeployed]);
 
   const handleCleanupVram = async () => { if (!config.ssh.host) return; setCleaningVram(true); try { const msg = await api.cleanupVram(config.ssh, config.docker); alert(msg); } catch (e: any) { alert(`Cleanup failed: ${e}`); } finally { setCleaningVram(false); } };
 
@@ -3058,9 +3126,12 @@ const [pipelineMode, setPipelineMode] = useState<PipelineMode>("rag");
   }, [step, isTrainingOnly, datasetsValidated, trainingOnlyDatasets]);
 
   const qdrantEndpoint = config.qdrant.endpoint || (config.ssh.host ? `http://${config.ssh.host}:6333` : "");
-  const requiresCloudTrainingDataset = isTrainingOnly && !isZraldMethod;
+  const requiresCloudTrainingDataset = isTrainingOnly && (!isZraldMethod || lora.zraldDatasetSource === "huggingface");
+  const zraldUsesHf = isZraldMethod && lora.zraldDatasetSource === "huggingface";
   const teacherModelReady = !!((teacher.repoId || "").trim() || (teacher.customServeCmd || "").trim());
-  const canLaunch = !!(config.ssh.host && studentModel && (requiresCloudTrainingDataset ? hubDataset.enabled && trainingOnlyDatasets.length > 0 && datasetsValidated : qdrantEndpoint && (config.qdrant.collection || "all") && teacherModelReady && allTopicsHavePrompt));
+  const zraldHfSourceReady = zraldUsesHf && hubDataset.enabled && trainingOnlyDatasets.length > 0 && datasetsValidated && teacherModelReady;
+  const generationSourceReady = qdrantEndpoint && (config.qdrant.collection || "all") && teacherModelReady && allTopicsHavePrompt;
+  const canLaunch = !!(config.ssh.host && studentModel && (requiresCloudTrainingDataset ? hubDataset.enabled && trainingOnlyDatasets.length > 0 && datasetsValidated : zraldUsesHf ? zraldHfSourceReady : generationSourceReady));
 
   const launch = async () => {
     setLaunching(true); setLaunchError(null);
@@ -3072,11 +3143,25 @@ const [pipelineMode, setPipelineMode] = useState<PipelineMode>("rag");
         student: { ...config.student, repoId: studentModel },
       };
       onConfigChange({ qdrant: mergedConfig.qdrant, teacher, student: { ...config.student, repoId: studentModel } });
-      if (completedRunId) { await api.updateRunConfig(completedRunId, studentModel, lora, hub); await api.resumeRun(completedRunId); onPipelineLaunched(completedRunId); }
+      const hubDatasetOut: HubDatasetConfig = requiresCloudTrainingDataset
+        ? { ...hubDataset, enabled: true, trainOnly: true, repoId: trainingOnlyDatasets[0] || "", repoIds: trainingOnlyDatasets }
+        : isZraldMethod
+          ? {
+              ...hubDataset,
+              enabled: zraldUsesHf,
+              trainOnly: false,
+              repoId: zraldUsesHf ? (trainingOnlyDatasets[0] || "") : "",
+              repoIds: zraldUsesHf ? trainingOnlyDatasets : [],
+            }
+          : { ...hubDataset, enabled: hubDataset.enabled, trainOnly: false };
+      if (completedRunId) {
+        await api.updateRunConfig(completedRunId, studentModel, lora, hub, hubDatasetOut, prompt, runTopics);
+        await api.resumeRun(completedRunId);
+        onPipelineLaunched(completedRunId);
+      }
       else {
         const legacyTopic = runTopics.length === 1 ? runTopics[0].topic : undefined;
         const legacyTotal = runTopics.length === 1 ? runTopics[0].totalQuestions : undefined;
-        const hubDatasetOut: HubDatasetConfig = requiresCloudTrainingDataset ? { ...hubDataset, enabled: true, trainOnly: true, repoId: trainingOnlyDatasets[0] || "", repoIds: trainingOnlyDatasets } : { ...hubDataset, trainOnly: false };
         const rc: RunConfig = { name: runName || `run-${new Date().toISOString().slice(0, 19)}`, teacher, studentModel, lora, promptTemplate: prompt, maxPairsPerChunk, concurrency, maxChunks: maxChunks === "all" ? undefined : (maxChunks as number), topic: legacyTopic, totalQuestions: legacyTotal, topics: runTopics.length > 0 ? runTopics : undefined, hub, hubDataset: hubDatasetOut };
         const runId = await api.startPipeline(mergedConfig, rc); onPipelineLaunched(runId);
       }
@@ -3103,7 +3188,7 @@ const [pipelineMode, setPipelineMode] = useState<PipelineMode>("rag");
           if (isTrainingOnly && i !== 3) return null;
           const Icon = s.icon; const active = step === i; const done = i < step;
           return (
-            <button key={s.key} onClick={() => { if (!isTrainingOnly) { if (i === 2 && !teacherDeployed) return; if (i === 3 && (!teacherDeployed || !datasetGenerated)) return; } setStep(i); }} className={`flex-1 px-6 py-4 flex items-center justify-center gap-3 transition-all duration-300 border-r border-white/5 relative group ${active ? "bg-white/[0.03] theme-accent" : done ? "text-emerald-400 hover:bg-white/[0.02]" : "theme-muted hover:bg-white/[0.02]"}`}>
+            <button key={s.key} onClick={() => { if (!isTrainingOnly) { if (i === 2 && !teacherDeployed) return; if (i === 3 && (!teacherDeployed || (!datasetGenerated && lora.method !== "zrald_offline"))) return; } setStep(i); }} className={`flex-1 px-6 py-4 flex items-center justify-center gap-3 transition-all duration-300 border-r border-white/5 relative group ${active ? "bg-white/[0.03] theme-accent" : done ? "text-emerald-400 hover:bg-white/[0.02]" : "theme-muted hover:bg-white/[0.02]"}`}>
               <div className={`w-8 h-8 rounded-lg flex items-center justify-center transition-all duration-300 ${active ? "theme-accent-bg text-black shadow-lg shadow-theme-accent/20 scale-110" : done ? "bg-emerald-500/10 text-emerald-400" : "bg-white/5 text-white/20"}`}>{done ? <CheckCircle2 className="w-4 h-4" /> : <Icon className="w-4 h-4" />}</div>
               <div className="flex flex-col items-start min-w-0"><span className="text-[8px] uppercase tracking-widest font-black opacity-30 leading-none mb-1">Step 0{i + 1}</span><span className="text-xs font-black uppercase tracking-widest font-mono truncate">{s.label}</span></div>
               {active && <div className="absolute bottom-0 left-0 w-full h-0.5 theme-accent-bg shadow-[0_0_10px_currentColor]" />}
@@ -3115,8 +3200,8 @@ const [pipelineMode, setPipelineMode] = useState<PipelineMode>("rag");
       <div className="p-8 space-y-8 min-h-[520px]">
         {step === 0 && <KnowledgeBaseStep gpuStatus={gpuStatus ?? null} samples={samples} loading={loadingKb} error={kbError} config={config} onConfigChange={onConfigChange} onSkip={() => setStep(1)} />}
         {step === 1 && <TeacherStep value={teacher} onChange={(t) => { setTeacher(t); onConfigChange({ teacher: t }); }} gpuStatus={gpuStatus} hfToken={config.hfToken || ""} checkingTeacher={checkingTeacher} teacherDeployed={teacherDeployed} deployedTeacherModel={deployedTeacherModel} deploying={deploying} deployLogs={deployLogs} deployError={deployError} onCheckStatus={() => checkDeployment(teacher)} onDeploy={startDeployment} onCancelDeploy={cancelDeployment} />}
-        {step === 2 && !isTrainingOnly && <DatasetStep config={config} onConfigChange={onConfigChange} trainingOnly={isTrainingOnly} onSwitchToGenerateDataset={() => { setPipelineMode("rag"); setStep(0); }} topics={topics} onTopicsChange={setTopics} prompt={prompt} onPromptChange={handlePromptChange} maxPairsPerChunk={maxPairsPerChunk} onMaxPairsChange={setMaxPairsPerChunk} concurrency={concurrency} onConcurrencyChange={setConcurrency} maxChunks={maxChunks} onMaxChunksChange={setMaxChunks} hubDataset={hubDataset} onHubDatasetChange={setHubDataset} hfTokenSet={!!config.hfToken} hfUsername={hfUsername} hfDatasets={hfDatasets} hfLoading={hfLoading} hfError={hfError} onRefreshHf={refreshHf} generating={generatingDataset} generated={datasetGenerated} progress={generationProgress} logs={generationLogs} error={generationError} onGenerate={startDatasetGeneration} onCancel={cancelDatasetGeneration} sshHostSet={!!config.ssh.host} />}
-        {step === 3 && <TrainStep trainingOnly={isTrainingOnly} trainingDataset={isTrainingOnly ? <DatasetStep config={config} onConfigChange={onConfigChange} trainingOnly onSwitchToGenerateDataset={() => { setPipelineMode("rag"); setStep(0); }} topics={topics} onTopicsChange={setTopics} prompt={prompt} onPromptChange={handlePromptChange} maxPairsPerChunk={maxPairsPerChunk} onMaxPairsChange={setMaxPairsPerChunk} concurrency={concurrency} onConcurrencyChange={setConcurrency} maxChunks={maxChunks} onMaxChunksChange={setMaxChunks} hubDataset={hubDataset} onHubDatasetChange={setHubDataset} hfTokenSet={!!config.hfToken} hfUsername={hfUsername} hfDatasets={hfDatasets} hfLoading={hfLoading} hfError={hfError} onRefreshHf={refreshHf} generating={generatingDataset} generated={datasetGenerated} progress={generationProgress} logs={generationLogs} error={generationError} onGenerate={startDatasetGeneration} onCancel={cancelDatasetGeneration} sshHostSet={!!config.ssh.host} /> : null} runName={runName} onRunNameChange={setRunName} lora={lora} onLoraChange={setLora} studentModel={studentModel} onStudentChange={setStudentModel} studentModelOptions={studentModelOptions} hfLoading={hfLoading} hfTokenSet={!!config.hfToken} onRefreshModels={refreshModelPickers} hub={hub} onHubChange={setHub} hfUsername={hfUsername} canLaunch={!!canLaunch} launching={launching} launchError={launchError} onLaunch={launch} validatingDataset={validatingDataset} datasetsValidated={datasetsValidated} trainingOnlyDatasets={trainingOnlyDatasets} hubDatasetValidation={hubDataset.validationResult || {}} onValidateDatasets={validateDatasets} validateButtonRef={validateButtonRef} />}
+        {step === 2 && !isTrainingOnly && <DatasetStep config={config} onConfigChange={onConfigChange} trainingOnly={isTrainingOnly} onSwitchToGenerateDataset={() => { setPipelineMode("rag"); setStep(0); }} topics={topics} onTopicsChange={setTopics} prompt={prompt} onPromptChange={handlePromptChange} maxPairsPerChunk={maxPairsPerChunk} onMaxPairsChange={setMaxPairsPerChunk} concurrency={concurrency} onConcurrencyChange={setConcurrency} maxChunks={maxChunks} onMaxChunksChange={setMaxChunks} hubDataset={hubDataset} onHubDatasetChange={setHubDataset} hfTokenSet={!!config.hfToken} hfUsername={hfUsername} hfDatasets={hfDatasets} hfLoading={hfLoading} hfError={hfError} onRefreshHf={refreshHf} generating={generatingDataset} generated={datasetGenerated} progress={generationProgress} logs={generationLogs} error={generationError} onGenerate={startDatasetGeneration} onCancel={cancelDatasetGeneration} sshHostSet={!!config.ssh.host} method={lora.method} />}
+        {step === 3 && <TrainStep trainingOnly={isTrainingOnly} requiresCloudTrainingDataset={requiresCloudTrainingDataset} zraldUsesHf={zraldUsesHf} trainingDataset={(isTrainingOnly || zraldUsesHf) ? <DatasetStep config={config} onConfigChange={onConfigChange} trainingOnly={requiresCloudTrainingDataset} onSwitchToGenerateDataset={() => { setPipelineMode("rag"); setStep(0); }} topics={topics} onTopicsChange={setTopics} prompt={prompt} onPromptChange={handlePromptChange} maxPairsPerChunk={maxPairsPerChunk} onMaxPairsChange={setMaxPairsPerChunk} concurrency={concurrency} onConcurrencyChange={setConcurrency} maxChunks={maxChunks} onMaxChunksChange={setMaxChunks} hubDataset={hubDataset} onHubDatasetChange={setHubDataset} hfTokenSet={!!config.hfToken} hfUsername={hfUsername} hfDatasets={hfDatasets} hfLoading={hfLoading} hfError={hfError} onRefreshHf={refreshHf} generating={generatingDataset} generated={datasetGenerated} progress={generationProgress} logs={generationLogs} error={generationError} onGenerate={startDatasetGeneration} onCancel={cancelDatasetGeneration} sshHostSet={!!config.ssh.host} method={lora.method} /> : null} runName={runName} onRunNameChange={setRunName} lora={lora} onLoraChange={setLora} studentModel={studentModel} onStudentChange={setStudentModel} studentModelOptions={studentModelOptions} hfLoading={hfLoading} hfTokenSet={!!config.hfToken} onRefreshModels={refreshModelPickers} hub={hub} onHubChange={setHub} hfUsername={hfUsername} canLaunch={!!canLaunch} launching={launching} launchError={launchError} onLaunch={launch} validatingDataset={validatingDataset} datasetsValidated={datasetsValidated} trainingOnlyDatasets={trainingOnlyDatasets} hubDatasetValidation={hubDataset.validationResult || {}} onValidateDatasets={validateDatasets} validateButtonRef={validateButtonRef} />}
       </div>
 
       <div className="border-t border-white/5 px-8 py-5 flex items-center justify-between bg-white/[0.01] rounded-b-2xl">
@@ -3126,7 +3211,7 @@ const [pipelineMode, setPipelineMode] = useState<PipelineMode>("rag");
           <div className="w-32 h-1.5 bg-white/5 rounded-full overflow-hidden border border-white/5"><div className="h-full theme-accent-bg transition-all duration-500 shadow-[0_0_8px_currentColor]" style={{ width: `${((step + 1) / STEPS.length) * 100}%` }} /></div>
         </div>
         {!isTrainingOnly && step < STEPS.length - 1 ? (
-          <button disabled={(step === 1 && !teacherDeployed && !isTrainingOnly) || (step === 2 && !datasetGenerated && !isTrainingOnly)} onClick={() => setStep(step + 1)} className="flex items-center gap-2 px-8 py-2.5 rounded-xl theme-accent-bg text-black font-black uppercase tracking-widest hover:brightness-110 disabled:opacity-20 transition-all shadow-xl shadow-theme-accent/10 premium-button"><span className="text-sm-fluid">Next Phase</span><ChevronRight className="w-5 h-5" /></button>
+          <button disabled={(step === 1 && !teacherDeployed && !isTrainingOnly) || (step === 2 && (!datasetGenerated && lora.method !== "zrald_offline") && !isTrainingOnly)} onClick={() => setStep(step + 1)} className="flex items-center gap-2 px-8 py-2.5 rounded-xl theme-accent-bg text-black font-black uppercase tracking-widest hover:brightness-110 disabled:opacity-20 transition-all shadow-xl shadow-theme-accent/10 premium-button"><span className="text-sm-fluid">Next Phase</span><ChevronRight className="w-5 h-5" /></button>
         ) : (<div className="w-[140px]" />)}
       </div>
     </div>

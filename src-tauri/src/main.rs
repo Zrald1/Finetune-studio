@@ -660,7 +660,6 @@ async fn serve_setup_all_embedders(
     docker: DockerConfig,
     mut embedders: Vec<EmbedderConfig>,
     hf_token: Option<String>,
-    paddle_ocr: Option<config::PaddleOcrConfig>,
 ) -> Result<Vec<serde_json::Value>> {
     let session = connect_ssh_with_setup_logs(&app, &ssh).await?;
     config::normalize_embedders(&mut embedders);
@@ -703,48 +702,6 @@ async fn serve_setup_all_embedders(
         }
     }
 
-    if let Some(ref pocr) = paddle_ocr.filter(|p| p.enabled) {
-        let _ = app.emit(
-            "setup://log",
-            serde_json::json!({"line": "[stage] checking PaddleOCR-VL\n"}),
-        );
-        match serve::health_check_paddleocr(&session, &resolved_docker, pocr.port).await {
-            Ok(true) => {
-                let _ = app.emit(
-                    "setup://log",
-                    serde_json::json!({"line": "[ok] PaddleOCR-VL already running\n"}),
-                );
-            }
-            _ => {
-                let _ = app.emit(
-                    "setup://log",
-                    serde_json::json!({"line": "[stage] booting PaddleOCR-VL\n"}),
-                );
-                let app_c = app.clone();
-                match serve::boot_paddleocr(
-                    &session,
-                    &resolved_docker,
-                    pocr,
-                    Some(&move |line| {
-                        let _ = app_c.emit("setup://log", serde_json::json!({ "line": line }));
-                    }),
-                )
-                .await
-                {
-                    Ok(_) => {
-                        let _ = app.emit(
-                            "setup://log",
-                            serde_json::json!({"line": "[ok] PaddleOCR-VL ready\n"}),
-                        );
-                    }
-                    Err(e) => {
-                        let _ = app.emit("setup://log", serde_json::json!({"line": format!("[warn] PaddleOCR boot failed (non-fatal): {e}\n")}));
-                    }
-                }
-            }
-        }
-    }
-
     let mut results = vec![];
     for embedder in embedders.iter() {
         let embedder_cfg = resolved_docker.clone();
@@ -765,8 +722,13 @@ async fn serve_setup_all_embedders(
             let _ = app.emit("setup://log", serde_json::json!({"line": format!("[ok] embeddings already exist ({} points) in collection '{}' for '{}'; ensuring model is live for semantic search.\n", c, collection_name, embedder.name)}));
         }
 
-        let status = match serve::health_check_embedder(&session, &embedder_cfg, "127.0.0.1", embedder.port)
-            .await
+        let status = match serve::health_check_embedder(
+            &session,
+            &embedder_cfg,
+            "127.0.0.1",
+            embedder.port,
+        )
+        .await
         {
             Ok(Some(_)) => {
                 let _ = app.emit("setup://log", serde_json::json!({"line": format!("[ok] '{}' already running\n", embedder.name)}));
@@ -980,11 +942,23 @@ async fn update_run_config(
     student_model: String,
     lora: runs::LoraConfig,
     hub: runs::HubConfig,
+    hub_dataset: Option<runs::HubDatasetConfig>,
+    prompt_template: Option<String>,
+    topics: Option<Vec<runs::TopicTarget>>,
 ) -> Result<()> {
     let mut run = runs::load(&run_id).await?;
     run.student_model = student_model;
     run.lora = lora;
     run.hub = hub;
+    if let Some(hub_dataset) = hub_dataset {
+        run.hub_dataset = hub_dataset;
+    }
+    if let Some(prompt_template) = prompt_template {
+        run.prompt_template = Some(prompt_template);
+    }
+    if let Some(topics) = topics {
+        run.topics = topics;
+    }
     runs::save(&run).await?;
     Ok(())
 }
@@ -1228,6 +1202,8 @@ for p in ports:
                 if m:
                     mid = m[0].get('id', '')
                     cid = mid.lower().replace('.gguf', '').split(':')[0]
+                    if any(k in cid for k in ['embedding', 'embed', 'bge', 'e5-', 'e5_', '/e5', 'gte-', 'gte_', 'jina-embeddings']):
+                        continue
                     if m_cfg and cid == m_cfg:
                         exact = (p, mid)
                         break
@@ -1416,7 +1392,9 @@ async fn run_deploy_teacher_task(
 
     let gpu_state = ssh::nvidia_smi(&session).await.ok();
     let gpu_memory_total_mb = gpu_state.as_ref().map(|gpu| gpu.memory_total);
+    let requested_max_model_len = teacher.max_model_len;
     let mut teacher = teacher.resolved_for_gpu(gpu_memory_total_mb);
+    let mut allow_long_max_model_len = false;
     if has_protected_embedder {
         if let Some((old, new)) = pipeline::cap_teacher_vram_for_semantic_embedder(&mut teacher) {
             let _ = app.emit("deploy://log", serde_json::json!({
@@ -1471,19 +1449,31 @@ async fn run_deploy_teacher_task(
         {
             if teacher.max_model_len > limit {
                 let old = teacher.max_model_len;
-                teacher.max_model_len = limit;
-                let _ = app.emit("deploy://log", serde_json::json!({
-                    "streamId": id,
-                    "kind": "info",
-                    "line": format!(
-                        "[context] model config reports {}={}; capping --max-model-len from {} to {}\n",
-                        source, limit, old, limit
-                    )
-                }));
-                if let Ok(mut app_cfg) = config::load().await {
-                    if app_cfg.teacher.repo_id.trim() == teacher.repo_id.trim() {
-                        app_cfg.teacher.max_model_len = limit;
-                        let _ = config::save(&app_cfg).await;
+                if requested_max_model_len > limit {
+                    allow_long_max_model_len = true;
+                    let _ = app.emit("deploy://log", serde_json::json!({
+                        "streamId": id,
+                        "kind": "warn",
+                        "line": format!(
+                            "[context] table max-model-len {} is above model config {}={}; honoring it with VLLM_ALLOW_LONG_MAX_MODEL_LEN=1\n",
+                            old, source, limit
+                        )
+                    }));
+                } else {
+                    teacher.max_model_len = limit;
+                    let _ = app.emit("deploy://log", serde_json::json!({
+                        "streamId": id,
+                        "kind": "info",
+                        "line": format!(
+                            "[context] auto-tuned max-model-len {} is above model config {}={}; capping to {}\n",
+                            old, source, limit, limit
+                        )
+                    }));
+                    if let Ok(mut app_cfg) = config::load().await {
+                        if app_cfg.teacher.repo_id.trim() == teacher.repo_id.trim() {
+                            app_cfg.teacher.max_model_len = limit;
+                            let _ = config::save(&app_cfg).await;
+                        }
                     }
                 }
             }
@@ -1806,6 +1796,9 @@ async fn run_deploy_teacher_task(
                  export HIP_FORCE_DEV_KERNARG=1; \
                  export OMP_NUM_THREADS=4; "
             );
+            if allow_long_max_model_len {
+                envs.push_str("export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1; ");
+            }
             if let Some(tok) = hf_token {
                 envs.push_str(&format!(
                     "export HF_TOKEN={} HUGGING_FACE_HUB_TOKEN={}; ",
@@ -2089,6 +2082,8 @@ async fn run_deploy_teacher_task(
                 let engine_name = "vLLM";
                 if lower.contains("traceback")
                     || lower.contains("validationerror")
+                    || lower.contains("valueerror")
+                    || lower.contains("desired gpu memory utilization")
                     || lower.contains("does not recognize this architecture")
                     || lower.contains("vllm_failed")
                     || lower.contains("out of memory")
@@ -2105,6 +2100,16 @@ async fn run_deploy_teacher_task(
                              1. If you are deploying a massive model (like DeepSeek-V3 or R1) on a single GPU, it will not fit. Use a smaller model (e.g. DeepSeek-R1-Distill-Qwen-32B) or increase Tensor Parallelism in Settings -> Teacher.\n\
                              2. If the model should fit, lower your 'GPU Memory Utilization' (gpuMemoryUtilization / --mem-fraction-static) in Settings to 0.85 or 0.80 to leave enough headroom for loading.\n\
                              3. Ensure other GPU processes are stopped to free up VRAM.",
+                            engine_name
+                        )
+                    } else if lower.contains("desired gpu memory utilization")
+                        || lower.contains("free memory on device")
+                    {
+                        format!(
+                            "{} failed to start because the free VRAM on the GPU is less than the requested 'GPU Memory Utilization'. \
+                             Suggestions:\n\
+                             1. Go to Settings -> Teacher and lower 'GPU Memory Utilization' (e.g. to 0.70 or 0.60 or lower) to fit in the available VRAM.\n\
+                             2. Ensure other GPU processes or containers (e.g. embedders) are stopped to free up VRAM.",
                             engine_name
                         )
                     } else if lower.contains("deepseek_v4")
@@ -3338,7 +3343,9 @@ async fn robot_list_manifests() -> Result<manifest::ManifestStore> {
 
 /// Publish a new model manifest and make it the version the robot pulls.
 #[tauri::command]
-async fn robot_publish_manifest(manifest: manifest::ModelManifest) -> Result<manifest::ManifestStore> {
+async fn robot_publish_manifest(
+    manifest: manifest::ModelManifest,
+) -> Result<manifest::ManifestStore> {
     crate::manifest::publish(manifest).await
 }
 

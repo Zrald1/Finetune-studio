@@ -355,6 +355,10 @@ export default function App() {
     await runCommand(`kill -9 ${pid} && (rocm-smi -i 2>/dev/null || amd-smi list 2>/dev/null || true)`, `Kill PID ${pid}`);
   };
 
+  const handleWizardStepChange = useCallback((step: number) => {
+    setWizardStep((current) => (current === step ? current : step));
+  }, []);
+
   // ----------------------------------------------------------------- UI
   return (
     <div className="h-screen overflow-hidden theme-app-bg flex flex-col font-sans theme-selection antialiased theme-text selection:bg-theme-accent/30 selection:text-white">
@@ -411,6 +415,7 @@ export default function App() {
       </div>
 
       <main className="flex-1 p-6 lg:overflow-hidden overflow-y-auto theme-app-main min-h-0">
+        {/* Main layout grid splitting workspace (left 8/12) and copilot sidebar (right 4/12) */}
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch lg:h-full">
           {/* Main Content Pane */}
           <section className="lg:col-span-8 flex flex-col lg:h-full lg:overflow-hidden">
@@ -424,7 +429,7 @@ export default function App() {
                   setRunsTick((t) => t + 1);
                   setTab("runs");
                 }}
-                onStepChange={(step) => setWizardStep(step)}
+                onStepChange={handleWizardStepChange}
               />
             </div>
             <div style={{ display: tab === "credentials" ? "" : "none" }} className="max-w-7xl w-full mx-auto grid grid-cols-1 gap-6 items-start lg:h-full lg:overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-white/10">

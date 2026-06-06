@@ -51,6 +51,8 @@ pub struct LoraConfig {
     pub zrald_reward_temperature: f32,
     #[serde(default = "default_zrald_max_completion_tokens")]
     pub zrald_max_completion_tokens: u32,
+    #[serde(default = "default_zrald_dataset_source")]
+    pub zrald_dataset_source: String, // "generate" | "huggingface"
     pub r: u32,
     pub alpha: u32,
     pub dropout: f32,
@@ -89,6 +91,10 @@ fn default_zrald_num_generations() -> u32 {
 
 fn default_zrald_max_completion_tokens() -> u32 {
     768
+}
+
+fn default_zrald_dataset_source() -> String {
+    "generate".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -193,6 +199,7 @@ impl LoraConfig {
             zrald_num_generations: default_zrald_num_generations(),
             zrald_reward_temperature: 0.0,
             zrald_max_completion_tokens: default_zrald_max_completion_tokens(),
+            zrald_dataset_source: default_zrald_dataset_source(),
             r: 16,
             alpha: 32,
             dropout: 0.05,
@@ -204,6 +211,20 @@ impl LoraConfig {
             save_steps: 100,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TopicTarget {
+    pub topic: String,
+    #[serde(default)]
+    pub total_questions: Option<u32>,
+    #[serde(default)]
+    pub tag: Option<String>,
+    #[serde(default)]
+    pub prompt_template: Option<String>,
+    #[serde(default)]
+    pub embedder_index: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,6 +266,10 @@ pub struct Run {
     /// Auto-destroy droplet after training completes (merge + upload).
     #[serde(default)]
     pub auto_destroy: bool,
+    #[serde(default)]
+    pub prompt_template: Option<String>,
+    #[serde(default)]
+    pub topics: Vec<TopicTarget>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -294,6 +319,8 @@ impl Run {
             last_train_step: 0,
             topic_stats: HashMap::new(),
             auto_destroy: false,
+            prompt_template: None,
+            topics: vec![],
         }
     }
 }

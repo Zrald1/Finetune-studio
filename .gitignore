@@ -9,7 +9,7 @@ coverage/
 # Rust / Tauri build artifacts
 src-tauri/target/
 src-tauri/gen/
-
+src-tauri/target_check/
 # Logs
 *.log
 vite.dev.out.log
