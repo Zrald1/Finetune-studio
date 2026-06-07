@@ -3115,7 +3115,35 @@ PY"#,
     }))
 }
 
-// ── main ───────────────────────────────────────────────────────────────────
+#[tauri::command]
+async fn stop_teacher(
+    cfg: SshConfig,
+    docker: DockerConfig,
+    port: u16,
+) -> Result<String> {
+    let session = SshSession::connect(&cfg).await?;
+
+    let pkill_body = format!(
+        "pkill -f '[v]llm.*--port {port}' 2>/dev/null; \
+         pkill -f 'sglang.*--port {port}' 2>/dev/null; \
+         sleep 1; \
+         pkill -9 -f '[v]llm.*--port {port}' 2>/dev/null; \
+         pkill -9 -f 'sglang.*--port {port}' 2>/dev/null; \
+         (command -v fuser >/dev/null 2>&1 && fuser -k {port}/tcp 2>/dev/null) || true; \
+         true",
+        port = port
+    );
+
+    if docker.enabled {
+        let cmd = pipeline::wrap_docker_cmd(&pkill_body, &docker.container_name);
+        let _ = session.exec_blocking(&cmd).await;
+    } else {
+        let _ = session.exec_blocking(&pkill_body).await;
+    }
+
+    session.disconnect().await;
+    Ok(format!("Stopped teacher model on port {}", port))
+}
 
 #[tauri::command]
 async fn cleanup_vram(cfg: SshConfig, docker: DockerConfig) -> Result<String> {
@@ -3279,6 +3307,7 @@ ping_teacher,
             update_run_config,
             match_model_guide,
             cleanup_vram,
+            stop_teacher,
             ai_get_app_state,
             ai_get_runs_summary,
             ai_get_run_details,

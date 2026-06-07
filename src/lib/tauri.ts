@@ -185,6 +185,8 @@ export const api = {
     invoke<TeacherDeploymentStatus | null>("check_teacher_deployed", { ssh, docker, teacher }),
   deployTeacher: (ssh: SSHConfig, docker: AppConfig["docker"], teacher: AppConfig["teacher"], hfToken?: string | null) =>
     invoke<string>("deploy_teacher", { ssh, docker, teacher, hfToken }),
+  stopTeacher: (cfg: SSHConfig, docker: AppConfig["docker"], port: number) =>
+    invoke<string>("stop_teacher", { cfg, docker, port }),
   updateRunConfig: (runId: string, studentModel: string, lora: LoraConfig, hub: HubConfig, hubDataset?: HubDatasetConfig, promptTemplate?: string | null, topics?: TopicTarget[]) =>
     invoke<void>("update_run_config", { runId, studentModel, lora, hub, hubDataset, promptTemplate, topics }),
   cleanupVram: (cfg: SSHConfig, docker: AppConfig["docker"]) =>

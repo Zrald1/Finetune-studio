@@ -52,6 +52,7 @@ export default function DeployPanel({ config }: Props) {
   const [deployError, setDeployError] = useState<string | null>(null);
   const [activePort, setActivePort] = useState<number | null>(null);
   const [checking, setChecking] = useState(false);
+  const [stopping, setStopping] = useState(false);
 
   // --- Chat --------------------------------------------------------------
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
@@ -241,6 +242,23 @@ export default function DeployPanel({ config }: Props) {
     } finally {
       setDeploying(false);
       setDeployStreamId(null);
+    }
+  };
+
+  const stopDeployment = async () => {
+    if (activePort == null || !config.ssh.host) return;
+    setStopping(true);
+    setDeployError(null);
+    try {
+      await api.stopTeacher(config.ssh, config.docker, activePort);
+      setActivePort(null);
+      setChatMessages([]);
+      setChatError(null);
+    } catch (e: unknown) {
+      setDeployError(errorMessage(e));
+    } finally {
+      setStopping(false);
+      void checkDeployment();
     }
   };
 
@@ -455,6 +473,20 @@ export default function DeployPanel({ config }: Props) {
               <CircleSlash className="w-3 h-3" /> Cancel
             </button>
           )}
+          {activePort != null && !deploying && (
+            <button
+              onClick={stopDeployment}
+              disabled={stopping}
+              className="flex items-center gap-1.5 px-3 py-2 bg-red-950/30 border border-red-500/30 text-red-300 rounded text-[10px] uppercase tracking-widest font-mono font-bold hover:bg-red-950 disabled:opacity-50 transition"
+            >
+              {stopping ? (
+                <Loader2 className="w-3 h-3 animate-spin" />
+              ) : (
+                <CircleSlash className="w-3 h-3" />
+              )}
+              {stopping ? "Stopping…" : "Stop Deploy"}
+            </button>
+          )}
           {checking && (
             <span className="flex items-center gap-1.5 text-[9px] uppercase tracking-widest theme-faint font-mono">
               <Loader2 className="w-3 h-3 animate-spin" /> Probing server…
@@ -479,7 +511,7 @@ export default function DeployPanel({ config }: Props) {
           </div>
           <div
             ref={logBoxRef}
-            className="bg-black/30 p-4 text-[11px] font-mono leading-relaxed text-white/70 max-h-64 overflow-y-auto whitespace-pre-wrap scrollbar-thin"
+            className="bg-black/30 p-4 text-[11px] font-mono leading-relaxed text-white/70 h-72 overflow-y-auto whitespace-pre-wrap scrollbar-thin"
           >
             {deployLogs || (
               <span className="theme-faint italic">Awaiting deployment output…</span>

@@ -303,12 +303,13 @@ impl TeacherConfig {
     }
 
     pub fn vllm_runtime_prepare_cmd(&self) -> String {
-        let repo = self.repo_id.to_lowercase();
-        if !(repo.contains("deepseek-v4") || repo.contains("deepseek_v4")) {
-            return String::new();
-        }
+        let mut prepare = "python3 -c 'import torchvision' 2>&1 | grep -E -q 'nms|operator' && python3 -m pip uninstall -y torchvision || true; ".to_string();
 
-        "python3 -c \"from transformers.models.auto.configuration_auto import CONFIG_MAPPING; import sys; sys.exit(0 if \\\"deepseek_v4\\\" in CONFIG_MAPPING else 1)\" || { echo [compat] installing Transformers with DeepSeek V4 support; python3 -m pip install --no-cache-dir --upgrade git+https://github.com/huggingface/transformers.git || exit 42; }; ".to_string()
+        let repo = self.repo_id.to_lowercase();
+        if repo.contains("deepseek-v4") || repo.contains("deepseek_v4") {
+            prepare.push_str("python3 -c \"from transformers.models.auto.configuration_auto import CONFIG_MAPPING; import sys; sys.exit(0 if \\\"deepseek_v4\\\" in CONFIG_MAPPING else 1)\" || { echo [compat] installing Transformers with DeepSeek V4 support; python3 -m pip install --no-cache-dir --upgrade git+https://github.com/huggingface/transformers.git || exit 42; }; ");
+        }
+        prepare
     }
 
 }
@@ -594,14 +595,9 @@ pub async fn load() -> Result<AppConfig> {
         cfg.qdrant.endpoint = format!("http://{}:6333", cfg.ssh.host);
     }
 
-    // Migrate old PaddleOCR config values
+    // Migrate old PaddleOCR config values: only fill in blank model_name.
     let default_pocr = PaddleOcrConfig::default();
-    if !cfg.paddle_ocr.docker_image.is_empty()
-        && cfg.paddle_ocr.docker_image != default_pocr.docker_image
-    {
-        cfg.paddle_ocr.docker_image = default_pocr.docker_image.clone();
-    }
-    if cfg.paddle_ocr.model_name != default_pocr.model_name {
+    if cfg.paddle_ocr.model_name.trim().is_empty() {
         cfg.paddle_ocr.model_name = default_pocr.model_name.clone();
     }
     normalize_runtime_defaults(&mut cfg);

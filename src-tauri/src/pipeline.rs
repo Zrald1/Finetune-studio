@@ -1103,9 +1103,34 @@ async fn run_pipeline(
         emit_log(app, &run.id, &r.stdout, "stage");
     }
 
+    // Auto-detect existing dataset on the remote server even for non-resume starts.
+    // Probes the most common dataset files; sets dataset_ready so re-running training
+    // on a run that already has a generated dataset never triggers re-generation.
+    if !run.dataset_ready && !training_only && !zrald_hf_source {
+        if let Some(ref session) = session_opt {
+            let probe_cmd = format!(
+                "test -s {data}/qa_dataset.jsonl || test -s {data}/train.jsonl || test -s {run}/qa_dataset.jsonl",
+                data = remote_data,
+                run = run.remote_dir,
+            );
+            if let Ok(r) = session.exec_blocking(&probe_cmd).await {
+                if r.exit_code == 0 {
+                    emit_log(
+                        app,
+                        &run.id,
+                        "[auto-detect] existing dataset found on GPU server — skipping dataset generation\n",
+                        "stage",
+                    );
+                    run.dataset_ready = true;
+                    runs::save(run).await?;
+                }
+            }
+        }
+    }
+
     // Resume short-circuit: if dataset already prepared on disk or if train_only is enabled,
     // skip teacher boot and generation, jump straight to training.
-    let skip_dataset = (resume && run.dataset_ready) || training_only || zrald_hf_source;
+    let skip_dataset = run.dataset_ready || training_only || zrald_hf_source;
     if skip_dataset {
         let session = session_opt
             .as_ref()
@@ -3812,6 +3837,18 @@ else: print('NOT_FOUND')\
             kill_cmd = wrap_docker_cmd(&kill_cmd, &container_name);
         }
         let _ = session.exec_blocking(&kill_cmd).await;
+        // For ZRALD Offline: the runner was launched as a detached setsid/nohup
+        // background process. Kill it via the PID file so it doesn't keep running
+        // in the background after the user cancels.
+        if zrald_offline_method {
+            let pid_file = format!("{}/zrald_offline_runner.pid", run.remote_dir);
+            let kill_offline = format!(
+                "if [ -f {pf} ]; then kill -TERM $(cat {pf}) 2>/dev/null || true; sleep 2; kill -KILL $(cat {pf}) 2>/dev/null || true; rm -f {pf}; fi; \
+                 pkill -f '[z]rald_offline' || true; pkill -f '[v]llm serve' || true; pkill -f '[v]llm.entrypoints' || true",
+                pf = sh_quote(&pid_file),
+            );
+            let _ = session.exec_blocking(&kill_offline).await;
+        }
         sync_training_logs(&session, cfg.docker.enabled, &container_name, run, app).await;
         return Err(AppError::Cancelled);
     }
@@ -3880,8 +3917,21 @@ else: print('NOT_FOUND')\
                     || lower.contains("importerror")
                     || lower.contains("runtimeerror")
                     || lower.contains("cuda out of memory")
+                    || lower.contains("out of memory")
                     || lower.contains("oserror")
                     || lower.contains("valueerror")
+                    // ZRALD/GRPO/custom runner diagnostics. These lines carry the
+                    // real cause (which stage died, OOM/SIGTERM, teacher boot
+                    // timeout) but contain none of the generic keywords above, so
+                    // without these matches the user gets a bare "no output files
+                    // were found" with the actual reason hidden in errorlog.txt.
+                    || lower.contains("stage failed")
+                    || lower.contains("sigterm received")
+                    || lower.contains("runner exiting with code")
+                    || lower.contains("reward teacher boot timeout")
+                    || lower.contains("no usable hip accelerator")
+                    || lower.contains("no scored examples available")
+                    || lower.contains("killed")
             });
             if let Some(idx) = notable_idx {
                 let start = idx.saturating_sub(2);
@@ -6172,9 +6222,17 @@ from pathlib import Path
 
 import requests
 import torch
-from datasets import load_dataset
+from datasets import load_dataset, Dataset as HFDataset
 from torch.utils.data import DataLoader, Dataset
 from unsloth import FastLanguageModel
+# SFTTrainer is the correct training API for unsloth — handles gradient
+# checkpointing, packing, and memory management properly on AMD ROCm.
+try:
+    from trl import SFTTrainer, SFTConfig
+except ImportError:
+    from trl import SFTTrainer
+    from transformers import TrainingArguments as SFTConfig
+from transformers import TrainingArguments
 
 BASE_MODEL = __BASE_MODEL__
 DATA_DIR = Path(__DATA_DIR__)
@@ -6202,6 +6260,16 @@ HF_DATASET_REPOS = __HF_DATASET_REPOS__
 HF_DATASET_COLUMNS = __HF_DATASET_COLUMNS__
 GLOBAL_PROMPT_TEMPLATE = __GLOBAL_PROMPT_TEMPLATE__
 TOPIC_PROMPTS = __TOPIC_PROMPTS__
+
+# AMD ROCm: bitsandbytes 4-bit is unreliable on ROCm and causes SIGTERM (OOM).
+# Use float16 instead — stable on all AMD GPUs (RDNA3 gfx1100, CDNA gfx942).
+# On ROCm, torch.cuda is aliased to torch.hip, so cuda calls work fine.
+IS_ROCM = getattr(torch.version, "hip", None) is not None
+TRAINING_DTYPE = torch.float16
+# Override 4-bit on AMD — bnb 4-bit kernels are CUDA-specific and crash on ROCm.
+_LOAD_IN_4BIT = LOAD_IN_4BIT and not IS_ROCM
+if IS_ROCM and LOAD_IN_4BIT:
+    print("[zrald-offline] AMD ROCm detected: overriding load_in_4bit=True -> False, using float16 instead", flush=True)
 
 SYSTEM_PROMPT = (
     "You are the ZRALD student model. Answer with exactly two XML-style blocks: "
@@ -6377,13 +6445,37 @@ def read_jsonl(path):
                 rows.append(json.loads(line))
     return rows
 
-def cleanup_model(model=None, tokenizer=None):
-    del model
-    del tokenizer
+def vram_flush():
+    """Aggressively free GPU memory — call before every model load on AMD."""
     gc.collect()
-    if torch.cuda.is_available():
+    try:
+        # On ROCm, torch.cuda is aliased to torch.hip — both work.
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
+    except Exception:
+        pass
+    try:
+        torch.cuda.synchronize()
+    except Exception:
+        pass
+    gc.collect()
+    if IS_ROCM:
+        try:
+            reserved = torch.cuda.memory_reserved(0) / 1024**3
+            print(f"[zrald-offline] VRAM reserved after flush: {reserved:.2f} GB", flush=True)
+        except Exception:
+            pass
+
+def cleanup_model(model=None, tokenizer=None):
+    """Unload model from GPU and flush VRAM — critical on AMD to prevent OOM."""
+    if model is not None:
+        try:
+            model.cpu()
+        except Exception:
+            pass
+    del model
+    del tokenizer
+    vram_flush()
 
 def prompt_to_text(messages, tokenizer):
     if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
@@ -6391,12 +6483,17 @@ def prompt_to_text(messages, tokenizer):
     return "\n".join(f"{m.get('role', 'user').upper()}: {m.get('content', '')}" for m in messages) + "\nASSISTANT:"
 
 def load_student(train_adapter=False):
-    print(f"[zrald-offline] loading student: {BASE_MODEL} train_adapter={train_adapter} 4bit={LOAD_IN_4BIT}", flush=True)
-    model, tokenizer = FastLanguageModel.from_pretrained(
+    vram_flush()  # flush before every model load
+    print(f"[zrald-offline] loading student: {BASE_MODEL} train_adapter={train_adapter} 4bit={_LOAD_IN_4BIT} dtype={'float16' if IS_ROCM else 'auto'}", flush=True)
+    kwargs = dict(
         model_name=BASE_MODEL,
         max_seq_length=MAX_SEQ,
-        load_in_4bit=LOAD_IN_4BIT,
+        load_in_4bit=_LOAD_IN_4BIT,
     )
+    if IS_ROCM:
+        # On AMD: always use float16 — avoids bitsandbytes 4-bit kernel crashes
+        kwargs["dtype"] = TRAINING_DTYPE
+    model, tokenizer = FastLanguageModel.from_pretrained(**kwargs)
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token = tokenizer.eos_token
     if train_adapter:
@@ -6406,7 +6503,7 @@ def load_student(train_adapter=False):
             target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
             lora_alpha=LORA_ALPHA,
             lora_dropout=LORA_DROPOUT,
-            use_gradient_checkpointing="unsloth",
+            use_gradient_checkpointing="unsloth",  # unsloth's smart gradient checkpointing
             random_state=3407,
         )
     return model, tokenizer
@@ -6464,7 +6561,7 @@ def prepare():
                 print(f"[zrald-offline] student candidates: {done}/{total}", flush=True)
     dump_jsonl(RUN_DIR / "zrald_offline_student_candidates.jsonl", candidates)
     cleanup_model(model, tokenizer)
-    print("[zrald-offline] student removed after candidate generation", flush=True)
+    print("[zrald-offline] student unloaded; VRAM freed for teacher scoring", flush=True)
 
 def reward_url():
     if REWARD_ENDPOINT.endswith("/v1"):
@@ -6622,82 +6719,108 @@ def best_training_examples():
     dump_jsonl(RUN_DIR / "zrald_offline_sft_train.jsonl", examples)
     return examples
 
-class SupervisedDataset(Dataset):
-    def __init__(self, examples, tokenizer):
-        self.items = []
-        eos = tokenizer.eos_token or ""
-        for ex in examples:
-            prompt = prompt_to_text(ex["prompt"], tokenizer)
-            answer = str(ex["answer"]).strip()
-            prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
-            answer_ids = tokenizer(answer + eos, add_special_tokens=False)["input_ids"]
-            if not answer_ids:
-                continue
-            if len(answer_ids) >= MAX_SEQ:
-                answer_ids = answer_ids[:MAX_SEQ]
-                prompt_ids = []
-            else:
-                prompt_budget = MAX_SEQ - len(answer_ids)
-                prompt_ids = prompt_ids[-prompt_budget:]
-            ids = prompt_ids + answer_ids
-            labels = [-100] * len(prompt_ids) + answer_ids
-            self.items.append({"input_ids": ids, "labels": labels})
-    def __len__(self):
-        return len(self.items)
-    def __getitem__(self, idx):
-        return self.items[idx]
-
-def collate_batch(batch, tokenizer):
-    pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-    max_len = max(len(item["input_ids"]) for item in batch)
-    input_ids, labels, masks = [], [], []
-    for item in batch:
-        pad_len = max_len - len(item["input_ids"])
-        input_ids.append(item["input_ids"] + [pad] * pad_len)
-        labels.append(item["labels"] + [-100] * pad_len)
-        masks.append([1] * len(item["input_ids"]) + [0] * pad_len)
-    return {
-        "input_ids": torch.tensor(input_ids, dtype=torch.long),
-        "labels": torch.tensor(labels, dtype=torch.long),
-        "attention_mask": torch.tensor(masks, dtype=torch.long),
-    }
 
 def train_after():
     examples = best_training_examples()
     if not examples:
         raise SystemExit("[zrald-offline] no scored examples available for training")
+    vram_flush()  # ensure VRAM is free before loading student for training
     model, tokenizer = load_student(train_adapter=True)
     if hasattr(FastLanguageModel, "for_training"):
         FastLanguageModel.for_training(model)
-    model.train()
-    ds = SupervisedDataset(examples, tokenizer)
-    if len(ds) == 0:
-        raise SystemExit("[zrald-offline] all supervised examples were empty after tokenization")
-    loader = DataLoader(ds, batch_size=max(1, PER_DEVICE_BS), shuffle=True, collate_fn=lambda b: collate_batch(b, tokenizer))
-    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=LR)
-    total_epochs = max(1, math.ceil(EPOCHS))
-    global_step = 0
-    losses = []
-    print(f"[zrald-offline] training student adapter: examples={len(ds)} epochs={total_epochs}", flush=True)
-    for epoch in range(total_epochs):
-        for batch_idx, batch in enumerate(loader, 1):
-            device = next(model.parameters()).device
-            batch = {k: v.to(device) for k, v in batch.items()}
-            loss = model(**batch).loss / max(1, GRAD_ACCUM)
-            loss.backward()
-            if batch_idx % max(1, GRAD_ACCUM) == 0 or batch_idx == len(loader):
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-                global_step += 1
-                losses.append(float(loss.detach().cpu()) * max(1, GRAD_ACCUM))
-                if global_step % 5 == 0 or global_step == 1:
-                    print(f"[zrald-offline] train step={global_step} loss={losses[-1]:.4f}", flush=True)
+
+    # Build HuggingFace Dataset for SFTTrainer — the correct API for unsloth.
+    # SFTTrainer handles gradient checkpointing, packing, and memory management
+    # properly on AMD ROCm, unlike a manual training loop.
+    def format_example(ex):
+        prompt = prompt_to_text(ex["prompt"], tokenizer)
+        answer = str(ex["answer"]).strip()
+        eos = tokenizer.eos_token or ""
+        return {"text": prompt + answer + eos}
+
+    formatted = [format_example(ex) for ex in examples]
+    hf_ds = HFDataset.from_list(formatted)
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(str(OUTPUT_DIR))
+    total_epochs = max(1, math.ceil(EPOCHS))
+    print(f"[zrald-offline] training student adapter via SFTTrainer: examples={len(hf_ds)} epochs={total_epochs} bs={max(1,PER_DEVICE_BS)} grad_accum={max(1,GRAD_ACCUM)}", flush=True)
+
+    # SFTConfig / TrainingArguments — AMD-safe settings
+    try:
+        train_args = SFTConfig(
+            output_dir=str(OUTPUT_DIR),
+            num_train_epochs=total_epochs,
+            per_device_train_batch_size=max(1, PER_DEVICE_BS),
+            gradient_accumulation_steps=max(1, GRAD_ACCUM),
+            learning_rate=LR,
+            fp16=IS_ROCM,          # float16 on AMD
+            bf16=not IS_ROCM,      # bf16 on CUDA (if supported)
+            logging_steps=5,
+            save_strategy="no",    # we save manually below
+            optim="adamw_torch",   # pure-PyTorch AdamW — no fused CUDA kernels needed
+            warmup_ratio=0.05,
+            lr_scheduler_type="cosine",
+            report_to="none",
+            dataloader_pin_memory=False,  # AMD: pinned memory can cause hangs
+            max_seq_length=MAX_SEQ,
+            dataset_text_field="text",
+            packing=False,
+        )
+        trainer = SFTTrainer(
+            model=model,
+            tokenizer=tokenizer,
+            train_dataset=hf_ds,
+            args=train_args,
+        )
+    except TypeError:
+        # Older trl that doesn't have SFTConfig — fall back to TrainingArguments
+        train_args = TrainingArguments(
+            output_dir=str(OUTPUT_DIR),
+            num_train_epochs=total_epochs,
+            per_device_train_batch_size=max(1, PER_DEVICE_BS),
+            gradient_accumulation_steps=max(1, GRAD_ACCUM),
+            learning_rate=LR,
+            fp16=IS_ROCM,
+            bf16=not IS_ROCM,
+            logging_steps=5,
+            save_strategy="no",
+            optim="adamw_torch",
+            warmup_ratio=0.05,
+            lr_scheduler_type="cosine",
+            report_to="none",
+            dataloader_pin_memory=False,
+        )
+        trainer = SFTTrainer(
+            model=model,
+            tokenizer=tokenizer,
+            train_dataset=hf_ds,
+            args=train_args,
+            dataset_text_field="text",
+            max_seq_length=MAX_SEQ,
+        )
+
+    train_result = trainer.train()
+    losses = [x["loss"] for x in trainer.state.log_history if "loss" in x]
+    (RUN_DIR / "zrald_offline_train_loss.json").write_text(
+        json.dumps({"losses": losses, "train_runtime": train_result.metrics.get("train_runtime", 0)}, indent=2) + "\n",
+        encoding="utf-8"
+    )
+    print(f"[zrald-offline] training complete; saving LoRA adapter to {OUTPUT_DIR}", flush=True)
+
+    # Flush activations before save — prevents OOM during model.save_pretrained on AMD
+    vram_flush()
+    # Use unsloth's memory-safe save (limits GPU memory used during serialisation)
+    try:
+        model.save_pretrained(str(OUTPUT_DIR), maximum_memory_usage=0.5)
+    except TypeError:
+        # Older unsloth without maximum_memory_usage parameter
+        model.save_pretrained(str(OUTPUT_DIR))
     tokenizer.save_pretrained(str(OUTPUT_DIR))
-    (RUN_DIR / "zrald_offline_train_loss.json").write_text(json.dumps({"losses": losses}, indent=2) + "\n", encoding="utf-8")
-    print("[zrald-offline] LoRA saved; generating after benchmark before unloading student", flush=True)
+    print("[zrald-offline] LoRA adapter saved; generating after-benchmark answers", flush=True)
+
+    # Switch to inference mode and generate benchmark completions
+    if hasattr(FastLanguageModel, "for_inference"):
+        FastLanguageModel.for_inference(model)
     benchmark_rows = read_jsonl(RUN_DIR / "zrald_offline_benchmark_prompts.jsonl")
     after = []
     for idx, row in enumerate(benchmark_rows, 1):
@@ -6707,7 +6830,8 @@ def train_after():
             print(f"[zrald-offline] benchmark-after answers: {idx}/{len(benchmark_rows)}", flush=True)
     dump_jsonl(RUN_DIR / "zrald_offline_benchmark_after_candidates.jsonl", after)
     cleanup_model(model, tokenizer)
-    print("[zrald-offline] student removed after training and after-benchmark generation", flush=True)
+    print("[zrald-offline] student unloaded after training and after-benchmark generation", flush=True)
+
 
 def score_after_report():
     after = score_file("zrald_offline_benchmark_after_candidates.jsonl", "zrald_offline_benchmark_after.jsonl", "benchmark_after")
@@ -6872,8 +6996,14 @@ if __name__ == "__main__":
     let venv_dir = format!("{}/.zrald_venv", run.remote_dir);
 
     let runner = format!(
-        r#"set -euo pipefail
+        r#"#!/usr/bin/env bash
+set -uo pipefail
 export PYTHONUNBUFFERED=1
+# CRITICAL: these must be set at runtime (not just install time) so unsloth
+# loads in ROCm mode. Without UNSLOTH_IS_ROCM=1, unsloth falls back to CUDA/CPU,
+# fails to find the AMD GPU, and the process is killed with SIGTERM (exit 143).
+export UNSLOTH_IS_ROCM=1
+export PYTORCH_ROCM_ARCH="${{PYTORCH_ROCM_ARCH:-gfx1100}}"
 LOCAL_REWARD_TEACHER={local_reward_teacher}
 TEACHER_PORT={teacher_port}
 TEACHER_LOG={teacher_log}
@@ -6885,6 +7015,14 @@ TEACHER_CMD={teacher_cmd}
 # `vllm serve` uses the container's prebuilt ROCm vLLM.
 PYBIN={venv_dir}/bin/python3
 teacher_live=0
+
+# Workaround: libdrm looks for amdgpu.ids to enumerate GPU IDs. If the file is
+# missing it prints a warning and may cause GPU detection to fail. Create a
+# minimal stub so libdrm finds the file.
+if [ ! -f /opt/amdgpu/share/libdrm/amdgpu.ids ]; then
+  mkdir -p /opt/amdgpu/share/libdrm 2>/dev/null || true
+  touch /opt/amdgpu/share/libdrm/amdgpu.ids 2>/dev/null || true
+fi
 
 stop_teacher() {{
   if [ "$LOCAL_REWARD_TEACHER" != "1" ]; then return 0; fi
@@ -6899,6 +7037,9 @@ stop_teacher() {{
   (command -v fuser >/dev/null 2>&1 && fuser -k "$TEACHER_PORT"/tcp 2>/dev/null) || true
   rm -f "$TEACHER_PID" 2>/dev/null || true
   teacher_live=0
+  # Wait for GPU VRAM to be released before loading student model
+  echo "[zrald-offline] waiting 15s for VRAM to free after stopping teacher..."
+  sleep 15
 }}
 
 boot_teacher() {{
@@ -6925,18 +7066,57 @@ boot_teacher() {{
 }}
 
 cleanup() {{
+  local ec=$?
   if [ "$teacher_live" = "1" ]; then stop_teacher || true; fi
+  if [ $ec -ne 0 ]; then
+    echo "[zrald-offline] runner exiting with code $ec" >&2
+    if command -v rocm-smi >/dev/null 2>&1; then rocm-smi 2>/dev/null || true; fi
+  fi
 }}
 trap cleanup EXIT
 
+# SIGTERM handler — print diagnostics so the user knows what was killed
+handle_sigterm() {{
+  echo "[zrald-offline] SIGTERM received — process was killed (likely OOM or container stop)" >&2
+  echo "[zrald-offline] Check GPU memory with: rocm-smi" >&2
+  echo "[zrald-offline] If OOM: reduce batch_size, lower epochs, or increase GPU memory utilization budget" >&2
+  exit 143
+}}
+trap handle_sigterm TERM
+
+# Run one ZRALD stage and, on failure, surface WHY with the real exit code.
+# A stage killed by the OOM killer dies with 137 (SIGKILL) or 143 (SIGTERM);
+# bash's `|| ` branch would otherwise mask that as a bare "exit 1" and the user
+# never learns it was OOM. Echo the actual code and an OOM hint when it matches.
+run_stage() {{
+  local stage="$1"
+  "$PYBIN" {script} "$stage"
+  local ec=$?
+  if [ $ec -ne 0 ]; then
+    echo "[zrald-offline] $stage stage failed (exit $ec)" >&2
+    if [ $ec -eq 137 ] || [ $ec -eq 143 ]; then
+      echo "[zrald-offline] exit $ec means the $stage process was KILLED (OOM killer or container stop), not a Python error." >&2
+      echo "[zrald-offline] Free VRAM/RAM: lower zrald_train_questions, zrald_num_generations, batch size, or cutoff_len; check rocm-smi." >&2
+      if command -v rocm-smi >/dev/null 2>&1; then rocm-smi 2>/dev/null || true; fi
+    fi
+    exit $ec
+  fi
+}}
+
 stop_teacher || true
-"$PYBIN" {script} prepare
+echo "[zrald-offline] stage: prepare (generating student candidates)"
+run_stage prepare
+echo "[zrald-offline] stage: boot_teacher for scoring"
 boot_teacher
-"$PYBIN" {script} score_train_before
+echo "[zrald-offline] stage: score_train_before"
+run_stage score_train_before
 stop_teacher
-"$PYBIN" {script} train_after
+echo "[zrald-offline] stage: train_after (training student adapter)"
+run_stage train_after
+echo "[zrald-offline] stage: boot_teacher for after-scoring"
 boot_teacher
-"$PYBIN" {script} score_after_report
+echo "[zrald-offline] stage: score_after_report"
+run_stage score_after_report
 stop_teacher
 trap - EXIT
 "#,
@@ -7032,7 +7212,8 @@ trap - EXIT
               ({torch_probe} || {rocm_torch}) && \
               pip install --no-cache-dir 'unsloth[amd]' 'unsloth_zoo' \
                  'datasets>=2.16.0' 'requests>=2.31.0' 'peft>=0.19,<0.20' \
-                 'accelerate>=0.34.0' 'sentencepiece>=0.2.0' 'protobuf' 'hf_transfer' 'psutil'{torch_hip_guard} && \
+                 'accelerate>=0.34.0' 'sentencepiece>=0.2.0' 'protobuf' 'hf_transfer' 'psutil' \
+                 'trl>=0.8.0' 'transformers>=4.41.2,<4.58'{torch_hip_guard} && \
               (pip install --force-reinstall --no-cache-dir --no-deps '{bnb_wheel}' || \
                pip install --force-reinstall --no-cache-dir --no-deps 'bitsandbytes>=0.49.1'))) && \
          mkdir -p {output_dir} && \
@@ -7048,19 +7229,58 @@ trap - EXIT
         torch_hip_guard = torch_hip_guard,
     );
 
+    // ── Launch the runner in a setsid-detached background process ───────────
+    // ZRALD Offline training can run for many hours. A direct `bash runner`
+    // in the exec_stream channel is vulnerable to SIGTERM if the SSH connection
+    // drops (server reboot, NAT timeout, network blip). The fix:
+    //
+    //   1. Launch the runner via `setsid nohup bash runner &` — this detaches
+    //      it from the SSH session's process group so SSH hangup (HUP) and
+    //      terminal close don't propagate SIGTERM to the training process.
+    //   2. Write the PID to a sentinel file so we can re-attach on reconnect.
+    //   3. Write the exit code to a sentinel file when the runner finishes so
+    //      the SSH waiter can surface the real exit code.
+    //   4. The SSH exec_stream channel is held by a `tail -f train.log` +
+    //      a PID-polling loop. This gives us live log streaming while the
+    //      background process runs, and a clean exit with the runner's exit code
+    //      when it finishes. If SSH drops, the tail/waiter dies but the nohup
+    //      background process keeps running; the remote-tail poller in the Rust
+    //      pipeline picks up new bytes from train.log on the next tick.
+    let pid_file = format!("{}/zrald_offline_runner.pid", run.remote_dir);
+    let exit_file = format!("{}/zrald_offline_runner.exit", run.remote_dir);
+    let dir_q = sh_quote(&run.remote_dir);
+    let runner_q = sh_quote(&runner_path);
+    let pid_file_q = sh_quote(&pid_file);
+    let exit_file_q = sh_quote(&exit_file);
+    let start_msg_q = sh_quote("[zrald-offline] starting low-VRAM staged ZRALD");
+
     Ok(format!(
         "{install_prefix} &&\n\
          {py_heredoc}\
          {runner_heredoc}\
-         {{ echo {start_msg} && bash {runner}; }} \
-           > >(tee -a {dir}/log.txt {dir}/train.log) \
-           2> >(tee -a {dir}/errorlog.txt {dir}/train.log >&2)\n",
+         rm -f {exit_file_q} {pid_file_q};\n\
+         setsid nohup bash -c 'set -o pipefail; \
+           {{ echo {start_msg_q} && bash {runner_q}; }} \
+             > >(tee -a {dir_q}/log.txt {dir_q}/train.log) \
+             2> >(tee -a {dir_q}/errorlog.txt {dir_q}/train.log >&2); \
+           echo $? > {exit_file_q}' &\n\
+         echo $! > {pid_file_q};\n\
+         echo \"[zrald-offline] runner detached as PID $(cat {pid_file_q}) — surviving SSH reconnects\";\n\
+         tail -f {dir_q}/train.log &\n\
+         TAIL_PID=$!;\n\
+         while kill -0 \"$(cat {pid_file_q} 2>/dev/null)\" 2>/dev/null; do sleep 5; done;\n\
+         sleep 2;\n\
+         kill $TAIL_PID 2>/dev/null || true;\n\
+         _ec=$(cat {exit_file_q} 2>/dev/null | tr -d '[:space:]');\n\
+         exit ${{_ec:-143}}\n",
         install_prefix = install_prefix,
         py_heredoc = py_heredoc,
         runner_heredoc = runner_heredoc,
-        dir = sh_quote(&run.remote_dir),
-        start_msg = sh_quote("[zrald-offline] starting low-VRAM staged ZRALD"),
-        runner = sh_quote(&runner_path),
+        exit_file_q = exit_file_q,
+        pid_file_q = pid_file_q,
+        start_msg_q = start_msg_q,
+        runner_q = runner_q,
+        dir_q = dir_q,
     ))
 }
 

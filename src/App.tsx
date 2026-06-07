@@ -86,6 +86,7 @@ export default function App() {
   const [runsTick, setRunsTick] = useState(0); // bump to force RunDashboard reload
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [cwd, setCwd] = useState("/root");
+  const [showSidebar, setShowSidebar] = useState(true);
   const [wizardStep, setWizardStep] = useState(0);
   const activeCmdOutputRef = useRef("");
 
@@ -411,6 +412,18 @@ export default function App() {
               </span>
             </div>
           )}
+          <button
+            onClick={() => setShowSidebar((s) => !s)}
+            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded theme-surface border text-[9px] uppercase tracking-widest font-black font-mono transition-all duration-150 cursor-pointer ${
+              showSidebar
+                ? "border-theme-accent theme-accent bg-theme-accent/10"
+                : "border-white/10 theme-muted hover:theme-accent hover:bg-white/[0.05]"
+            }`}
+            title={showSidebar ? "Hide Terminal Sidebar" : "Show Terminal Sidebar"}
+          >
+            <TerminalIcon className="w-3.5 h-3.5" />
+            <span>{showSidebar ? "Hide Terminal" : "Show Terminal"}</span>
+          </button>
         </div>
       </div>
 
@@ -418,7 +431,7 @@ export default function App() {
         {/* Main layout grid splitting workspace (left 8/12) and copilot sidebar (right 4/12) */}
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch lg:h-full">
           {/* Main Content Pane */}
-          <section className="lg:col-span-8 flex flex-col lg:h-full lg:overflow-hidden">
+          <section className={`${showSidebar ? "lg:col-span-8" : "lg:col-span-12"} flex flex-col lg:h-full lg:overflow-hidden`}>
             <div style={{ display: tab === "pipeline" ? "" : "none" }} className="w-full max-w-6xl mx-auto lg:h-full lg:overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-white/10">
               <PipelineWizard
                 config={config}
@@ -461,32 +474,34 @@ export default function App() {
           </section>
 
           {/* Persistent Sidebar (AI Terminal copilot) */}
-          <aside className="lg:col-span-4 flex flex-col lg:h-full lg:overflow-y-auto pl-1 space-y-6 scrollbar-thin scrollbar-thumb-white/10">
-            <AITerminalPanel
-              logs={logs}
-              isStreaming={isStreaming}
-              onClearLogs={() => setLogs("")}
-              onRunCustomCommand={(cmd) => runCommand(cmd, cmd)}
-              onStopStreaming={stopStream}
-              dockerEnabled={config.docker?.enabled ?? true}
-              bypassTerminal={config.docker?.bypassTerminal ?? false}
-              onToggleBypassTerminal={() =>
-                setConfig((prev) => ({
-                  ...prev,
-                  docker: {
-                    ...prev.docker,
-                    bypassTerminal: !prev.docker.bypassTerminal,
-                  },
-                }))
-              }
-              cwd={cwd}
-              config={config}
-              onConfigChange={(patch) => setConfig((prev) => ({ ...prev, ...patch }))}
-              activeTab={tab}
-              wizardStep={wizardStep}
-              gpuStatus={gpuStatus}
-            />
-          </aside>
+          {showSidebar && (
+            <aside className="lg:col-span-4 flex flex-col lg:h-full lg:overflow-y-auto pl-1 space-y-6 scrollbar-thin scrollbar-thumb-white/10">
+              <AITerminalPanel
+                logs={logs}
+                isStreaming={isStreaming}
+                onClearLogs={() => setLogs("")}
+                onRunCustomCommand={(cmd) => runCommand(cmd, cmd)}
+                onStopStreaming={stopStream}
+                dockerEnabled={config.docker?.enabled ?? true}
+                bypassTerminal={config.docker?.bypassTerminal ?? false}
+                onToggleBypassTerminal={() =>
+                  setConfig((prev) => ({
+                    ...prev,
+                    docker: {
+                      ...prev.docker,
+                      bypassTerminal: !prev.docker.bypassTerminal,
+                    },
+                  }))
+                }
+                cwd={cwd}
+                config={config}
+                onConfigChange={(patch) => setConfig((prev) => ({ ...prev, ...patch }))}
+                activeTab={tab}
+                wizardStep={wizardStep}
+                gpuStatus={gpuStatus}
+              />
+            </aside>
+          )}
         </div>
       </main>
     </div>

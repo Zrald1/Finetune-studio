@@ -167,6 +167,7 @@ pub async fn launch_embedder(
     let serve_cmd = format!(
         "cd /root && {env} \
          MODEL_ID={model}; \
+         python3 -c 'import torchvision' 2>&1 | grep -E -q 'nms|operator' && python3 -m pip uninstall -y torchvision || true; \
          run_vllm() {{ \
            if command -v vllm >/dev/null 2>&1; then vllm serve \"$MODEL_ID\" \"$@\"; \
            elif python3 -c 'import vllm' >/dev/null 2>&1; then python3 -m vllm.entrypoints.openai.api_server --model \"$MODEL_ID\" \"$@\"; \
@@ -395,7 +396,6 @@ pub async fn boot_paddleocr(
         }
         return Ok("127.0.0.1".to_string());
     }
-
     if let Some(ref cb) = on_log {
         cb(format!(
             "[paddleocr] booting PaddleOCR-VL on port {} (image: {})\n",
@@ -420,9 +420,59 @@ max_num_seqs: 8
         AppError::pipeline(format!("write vllm_config.yml to GPU server: {}", e))
     })?;
 
+    // Pull the image explicitly (with up to 3 retries) before docker run.
+    // This avoids the cryptic "exit -1" that occurs when docker run is killed
+    // mid-pull by the OOM killer or a network interruption.
+    if let Some(ref cb) = on_log {
+        cb(format!("[paddleocr] pulling image {} (this may take several minutes)...\n", paddle.docker_image));
+    }
+    let pull_cmd = format!("docker pull {}", paddle.docker_image);
+    let mut pull_ok = false;
+    for attempt in 1u8..=3 {
+        if let Some(ref cb) = on_log {
+            if attempt > 1 {
+                cb(format!("[paddleocr] pull attempt {}...\n", attempt));
+            }
+        }
+        match session.exec_blocking(&pull_cmd).await {
+            Ok(r) if r.exit_code == 0 => {
+                pull_ok = true;
+                break;
+            }
+            Ok(r) => {
+                if let Some(ref cb) = on_log {
+                    cb(format!(
+                        "[paddleocr] pull attempt {} failed (exit {}): {}\n",
+                        attempt, r.exit_code, r.stderr.trim()
+                    ));
+                }
+            }
+            Err(e) => {
+                if let Some(ref cb) = on_log {
+                    cb(format!("[paddleocr] pull attempt {} error: {}\n", attempt, e));
+                }
+            }
+        }
+        if attempt < 3 {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    }
+    if !pull_ok {
+        return Err(AppError::pipeline(format!(
+            "PaddleOCR image pull failed after 3 attempts: {}. \
+             Check GPU server internet access or set a reachable docker_image in Settings.",
+            paddle.docker_image
+        )));
+    }
+
+    if let Some(ref cb) = on_log {
+        cb("[paddleocr] image ready, starting container...\n".to_string());
+    }
+
     let run_cmd = format!(
         "docker run -d \
          --name {} \
+         --restart=no \
          --user root \
          --device=/dev/kfd \
          --device=/dev/dri \
@@ -449,10 +499,6 @@ max_num_seqs: 8
         port,
     );
 
-    if let Some(ref cb) = on_log {
-        cb(format!("[paddleocr] pulling image & starting container...\n"));
-    }
-
     let r = session.exec_blocking(&run_cmd).await?;
     if r.exit_code != 0 {
         return Err(AppError::pipeline(format!(
@@ -460,6 +506,7 @@ max_num_seqs: 8
             r.exit_code, r.stderr
         )));
     }
+
 
     if let Some(ref cb) = on_log {
         cb("[paddleocr] container started, waiting for init...\n".to_string());

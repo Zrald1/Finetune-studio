@@ -644,47 +644,51 @@ const mergeAndUpload = async () => {
 
       {/* Runs workspace */}
       <div className="flex-1 min-h-0 grid grid-rows-[minmax(0,1fr)_auto] theme-surface-soft overflow-hidden">
-        <div className="min-h-0 grid grid-cols-1 xl:grid-cols-[380px_minmax(0,1fr)] grid-rows-[auto_minmax(0,1fr)] xl:grid-rows-1 overflow-hidden">
-          <div className="p-4 space-y-4 border-b xl:border-b-0 xl:border-r theme-surface-soft bg-black/10 overflow-hidden">
-            <section className="space-y-3">
-              <div className="flex items-center justify-between">
-                <p className="text-[10px] uppercase tracking-[0.2em] theme-muted font-mono font-bold">
-                  Run Stats
-                </p>
-                {metrics.length > 0 && (
-                  <span className="text-[9px] font-mono text-white/50 bg-white/5 px-2 py-0.5 rounded border border-white/5">
-                    STEP {metrics[metrics.length - 1].step}
+        <div className="min-h-0 overflow-y-auto p-4 space-y-4 scrollbar-thin">
+          {/* Row 1: Left (Stats + Curve) & Right (Execution Logs) */}
+          <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 items-stretch xl:h-[450px]">
+            {/* Left Column: Stats & Learning Curve unified in one card */}
+            <section className="theme-surface border rounded-lg p-4 space-y-4 bg-black/10 flex flex-col justify-between">
+              {/* Run Stats */}
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <p className="text-[10px] uppercase tracking-[0.2em] theme-muted font-mono font-bold">
+                    Run Stats
+                  </p>
+                  {metrics.length > 0 && (
+                    <span className="text-[9px] font-mono text-white/50 bg-white/5 px-2 py-0.5 rounded border border-white/5">
+                      STEP {metrics[metrics.length - 1].step}
+                    </span>
+                  )}
+                </div>
+                <div className="grid grid-cols-3 gap-4">
+                  <Stat label="Kept" value={progress.kept.toLocaleString()} accent />
+                  <Stat label="Scanned" value={progress.scanned.toLocaleString()} />
+                  <Stat label="Fail" value={progress.rejected.toLocaleString()} muted />
+                </div>
+              </div>
+
+              {/* Divider */}
+              <div className="border-t border-white/10" />
+
+              {/* Learning Curve */}
+              <div className="space-y-3 flex-1 flex flex-col justify-between">
+                <div className="flex items-center justify-between">
+                  <p className="text-[10px] uppercase tracking-[0.2em] theme-accent font-mono font-bold">
+                    Learning Curve
+                  </p>
+                  <span className="text-[9px] theme-faint font-mono uppercase">
+                    {metrics.length > 0 ? `${metrics.length} points` : "No telemetry"}
                   </span>
-                )}
-              </div>
-              <div className="grid grid-cols-3 gap-2">
-                <Stat label="Kept" value={progress.kept.toLocaleString()} accent />
-                <Stat label="Scanned" value={progress.scanned.toLocaleString()} />
-                <Stat label="Fail" value={progress.rejected.toLocaleString()} muted />
+                </div>
+                <div className="flex-1 min-h-[180px] mt-2">
+                  <LossChart points={metrics} />
+                </div>
               </div>
             </section>
 
-            <section className="space-y-3">
-              <div className="flex items-center justify-between">
-                <p className="text-[10px] uppercase tracking-[0.2em] theme-accent font-mono font-bold">
-                  Learning Curve
-                </p>
-                <span className="text-[9px] theme-faint font-mono uppercase">
-                  {metrics.length > 0 ? `${metrics.length} points` : "No telemetry"}
-                </span>
-              </div>
-              <div className="h-44 min-h-0">
-                <LossChart points={metrics} />
-              </div>
-            </section>
-
-            <section className="theme-surface border rounded p-3">
-              <TopicStats run={{ ...run, qaKept: progress.kept || run.qaKept, qaTotal: progress.scanned || run.qaTotal, qaRejected: progress.rejected || run.qaRejected }} />
-            </section>
-          </div>
-
-          <div className="min-h-0 grid grid-rows-[minmax(0,1fr)_minmax(220px,36%)] divide-y theme-surface-soft">
-            <section className="flex flex-col min-h-0">
+            {/* Right Column: Execution Logs */}
+            <section className="theme-surface border rounded-lg overflow-hidden flex flex-col bg-black/10">
               <div className="p-3 border-b theme-surface-soft flex items-center justify-between bg-black/10 shrink-0">
                 <p className="text-[10px] uppercase tracking-[0.2em] theme-muted font-mono font-bold">
                   Execution Logs
@@ -700,7 +704,7 @@ const mergeAndUpload = async () => {
               <div
                 ref={logBoxRef}
                 onScroll={onLogScroll}
-                className="flex-1 min-h-0 bg-black/30 p-4 text-[11px] font-mono leading-relaxed overflow-y-auto selection:bg-theme-selection scrollbar-thin"
+                className="flex-1 min-h-[300px] bg-black/30 p-4 text-[11px] font-mono leading-relaxed overflow-y-auto selection:bg-theme-selection scrollbar-thin"
               >
                 {coloredLogs ?? <span className="theme-faint italic">Awaiting secure session feedback...</span>}
               </div>
@@ -710,52 +714,58 @@ const mergeAndUpload = async () => {
                 </p>
               </div>
             </section>
-
-            <section className="min-h-0 flex flex-col bg-black/20">
-              <div className="px-4 py-2 border-b theme-surface-soft flex items-center justify-between gap-3 shrink-0">
-                <div>
-                  <p className="text-[10px] uppercase tracking-[0.2em] theme-accent font-mono font-bold">
-                    Generated Q&A Samples
-                  </p>
-                  <p className="text-[9px] theme-faint font-mono uppercase tracking-widest">
-                    {previewTotal > 0
-                      ? `${previewOffset + 1}-${Math.min(previewOffset + previewPageSize, previewTotal)} of ${previewTotal}`
-                      : previewLoading
-                        ? "Loading samples"
-                        : "No accepted pairs yet"}
-                  </p>
-                </div>
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => setPreviewOffset((o) => Math.max(0, o - previewPageSize))}
-                    disabled={previewOffset === 0 || previewLoading}
-                    className="p-2 rounded theme-surface-soft border theme-faint hover:theme-text disabled:opacity-25 transition"
-                    title="Previous samples"
-                  >
-                    <ChevronLeft className="w-3.5 h-3.5" />
-                  </button>
-                  <button
-                    onClick={() => setPreviewOffset((o) => Math.min(Math.max(0, previewTotal - previewPageSize), o + previewPageSize))}
-                    disabled={previewOffset + previewPageSize >= previewTotal || previewLoading}
-                    className="p-2 rounded theme-surface-soft border theme-faint hover:theme-text disabled:opacity-25 transition"
-                    title="Next samples"
-                  >
-                    <ChevronRight className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-              </div>
-              <div className="flex-1 min-h-0 overflow-y-auto p-4 scrollbar-thin">
-                {previewLoading ? (
-                  <div className="h-24 flex items-center justify-center theme-faint font-mono text-[10px] uppercase tracking-widest">
-                    <Loader2 className="w-4 h-4 animate-spin mr-2" />
-                    Loading generated samples
-                  </div>
-                ) : (
-                  <DatasetPreview pairs={preview} />
-                )}
-              </div>
-            </section>
           </div>
+
+          {/* Generated Q&A Samples */}
+          <section className="theme-surface border rounded-lg overflow-hidden flex flex-col bg-black/10">
+            <div className="px-4 py-2 border-b theme-surface-soft flex items-center justify-between gap-3 shrink-0">
+              <div>
+                <p className="text-[10px] uppercase tracking-[0.2em] theme-accent font-mono font-bold">
+                  Generated Q&A Samples
+                </p>
+                <p className="text-[9px] theme-faint font-mono uppercase tracking-widest">
+                  {previewTotal > 0
+                    ? `${previewOffset + 1}-${Math.min(previewOffset + previewPageSize, previewTotal)} of ${previewTotal}`
+                    : previewLoading
+                      ? "Loading samples"
+                      : "No accepted pairs yet"}
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setPreviewOffset((o) => Math.max(0, o - previewPageSize))}
+                  disabled={previewOffset === 0 || previewLoading}
+                  className="p-2 rounded theme-surface-soft border theme-faint hover:theme-text disabled:opacity-25 transition"
+                  title="Previous samples"
+                >
+                  <ChevronLeft className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  onClick={() => setPreviewOffset((o) => Math.min(Math.max(0, previewTotal - previewPageSize), o + previewPageSize))}
+                  disabled={previewOffset + previewPageSize >= previewTotal || previewLoading}
+                  className="p-2 rounded theme-surface-soft border theme-faint hover:theme-text disabled:opacity-25 transition"
+                  title="Next samples"
+                >
+                  <ChevronRight className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            </div>
+            <div className="p-4 bg-black/20 max-h-[400px] overflow-y-auto scrollbar-thin">
+              {previewLoading ? (
+                <div className="h-24 flex items-center justify-center theme-faint font-mono text-[10px] uppercase tracking-widest">
+                  <Loader2 className="w-4 h-4 animate-spin mr-2" />
+                  Loading generated samples
+                </div>
+              ) : (
+                <DatasetPreview pairs={preview} />
+              )}
+            </div>
+          </section>
+
+          {/* Q&A Breakdown by Domain */}
+          <section className="theme-surface border rounded-lg p-4 bg-black/10">
+            <TopicStats run={{ ...run, qaKept: progress.kept || run.qaKept, qaTotal: progress.scanned || run.qaTotal, qaRejected: progress.rejected || run.qaRejected }} />
+          </section>
         </div>
 
         <div className="border-t theme-surface-soft bg-black/20 p-4 shrink-0">
