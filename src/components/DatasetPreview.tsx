@@ -4,7 +4,7 @@ import { FileText, ChevronRight, Folder } from "lucide-react";
 
 export interface PreviewPair {
   question: string;
-  think?: string;
+  reasoning?: string;
   answer: string;
   source_file?: string;
 }

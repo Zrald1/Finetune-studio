@@ -10,6 +10,7 @@ mod hf;
 mod ingest;
 mod llamafactory;
 mod manifest;
+mod method;
 mod pipeline;
 mod qdrant;
 mod research;
@@ -1167,6 +1168,38 @@ async fn check_teacher_deployed(
         } else {
             (teacher.repo_id.clone(), teacher.vllm_port)
         };
+    let app_cfg = config::load().await.unwrap_or_default();
+    let mut non_teacher_ports = vec![8118, app_cfg.paddle_ocr.port];
+    non_teacher_ports.extend(app_cfg.embedders.iter().map(|e| e.port));
+    non_teacher_ports.sort_unstable();
+    non_teacher_ports.dedup();
+    let mut non_teacher_markers = vec![
+        "embedding".to_string(),
+        "embed".to_string(),
+        "bge".to_string(),
+        "e5-".to_string(),
+        "e5_".to_string(),
+        "/e5".to_string(),
+        "gte-".to_string(),
+        "gte_".to_string(),
+        "jina-embeddings".to_string(),
+        "paddleocr".to_string(),
+        "paddle-ocr".to_string(),
+        "paddle_ocr".to_string(),
+        "paddleocr-vl".to_string(),
+        "paddleocr-vl-1.6-0.9b".to_string(),
+    ];
+    let paddle_model_name = app_cfg.paddle_ocr.model_name.trim().to_lowercase();
+    if !paddle_model_name.is_empty() {
+        non_teacher_markers.push(paddle_model_name);
+    }
+    let non_teacher_ports_json =
+        serde_json::to_string(&non_teacher_ports).unwrap_or_else(|_| "[]".to_string());
+    let non_teacher_markers_json =
+        serde_json::to_string(&non_teacher_markers).unwrap_or_else(|_| "[]".to_string());
+    let non_teacher_markers_json = non_teacher_markers_json
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
 
     // Scan all listening ports for a running vLLM teacher, same approach as pipeline.rs.
     let check_script = format!(
@@ -1184,6 +1217,8 @@ def g():
                         if lp not in p: p.append(lp)
         except: pass
     return sorted(p)
+skip_ports = set({})
+non_teacher_markers = {}
 m_cfg = '{}'.lower().replace('.gguf', '').split(':')[0]
 p_cfg = {}
 ports = g()
@@ -1192,7 +1227,7 @@ if p_cfg in ports:
     ports.insert(0, p_cfg)
 exact, any_m = None, None
 for p in ports:
-    if p in [22, 53, 80, 443, 3306, 5432, 6333, 8888, 27017, 30000]: continue
+    if p in skip_ports or p in [22, 53, 80, 443, 3306, 5432, 6333, 8888, 27017, 30000]: continue
     try:
         req = urllib.request.Request(f'http://127.0.0.1:{{p}}/v1/models', headers={{'User-Agent': 'vllm-probe'}})
         with urllib.request.urlopen(req, timeout=1.0) as res:
@@ -1202,18 +1237,20 @@ for p in ports:
                 if m:
                     mid = m[0].get('id', '')
                     cid = mid.lower().replace('.gguf', '').split(':')[0]
-                    if any(k in cid for k in ['embedding', 'embed', 'bge', 'e5-', 'e5_', '/e5', 'gte-', 'gte_', 'jina-embeddings']):
+                    if any(k in cid for k in non_teacher_markers):
                         continue
                     if m_cfg and cid == m_cfg:
                         exact = (p, mid)
                         break
-                    elif not any_m:
+                    elif p == p_cfg and not any_m:
                         any_m = (p, mid)
     except: pass
 if exact: print('STATUS::' + json.dumps({{'port': exact[0], 'modelId': exact[1], 'exact': True}}))
 elif any_m: print('STATUS::' + json.dumps({{'port': any_m[0], 'modelId': any_m[1], 'exact': False}}))
 else: print('NOT_FOUND')\
 \" 2>/dev/null || echo 'ERROR'",
+        non_teacher_ports_json,
+        non_teacher_markers_json,
         model_to_check.replace("\"", "\\\"").replace("'", "\\'"),
         port_to_check
     );
@@ -3116,11 +3153,7 @@ PY"#,
 }
 
 #[tauri::command]
-async fn stop_teacher(
-    cfg: SshConfig,
-    docker: DockerConfig,
-    port: u16,
-) -> Result<String> {
+async fn stop_teacher(cfg: SshConfig, docker: DockerConfig, port: u16) -> Result<String> {
     let session = SshSession::connect(&cfg).await?;
 
     let pkill_body = format!(

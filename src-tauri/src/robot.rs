@@ -161,8 +161,7 @@ pub async fn enqueue_capture(cfg: &AppConfig, input: CaptureInput) -> Result<Cap
             if existing.image_sha256 == sha
                 && existing.status != CaptureStatus::Rejected
                 && (now - existing.created_at).num_seconds() >= 0
-                && (now - existing.created_at).num_seconds()
-                    <= cfg.robot.dedupe_window_secs as i64
+                && (now - existing.created_at).num_seconds() <= cfg.robot.dedupe_window_secs as i64
             {
                 return Ok(existing);
             }
@@ -288,7 +287,8 @@ async fn research_capture_inner(
         query_parts.push("unidentified object".to_string());
     }
     let query = query_parts.join(" ");
-    let packet = research::research_object(&cfg.web_research, &query, &Utc::now().to_rfc3339()).await?;
+    let packet =
+        research::research_object(&cfg.web_research, &query, &Utc::now().to_rfc3339()).await?;
 
     if packet.blocked {
         return Ok((ocr_text, packet, 0));

@@ -7,16 +7,13 @@ use serde_json::json;
 
 /// Convert generated pairs → ShareGPT-style messages JSONL for LLaMA-Factory.
 /// 95/5 train/val split, deterministic by source_chunk_id hash.
+/// Convert generated pairs → format-specific JSONL for LLaMA-Factory.
+/// 95/5 train/val split, deterministic by source_chunk_id hash.
 pub fn build_jsonl(pairs: &[GeneratedPair]) -> (String, String) {
     let mut train = String::new();
     let mut val = String::new();
     for (i, p) in pairs.iter().enumerate() {
-        let line = json!({
-            "messages": [
-                { "role": "user",      "content": p.question },
-                { "role": "assistant", "content": p.answer },
-            ]
-        });
+        let line = crate::generator::export_to_jsonl(p);
         let row = line.to_string();
         // Deterministic 1-in-20 → val.
         if i % 20 == 0 {
@@ -36,32 +33,44 @@ pub fn build_jsonl(pairs: &[GeneratedPair]) -> (String, String) {
 }
 
 /// dataset_info.json that LLaMA-Factory expects in --dataset_dir.
-pub fn dataset_info(run_name: &str) -> String {
-    let v = json!({
-        run_name: {
-            "file_name": "train.jsonl",
-            "formatting": "sharegpt",
-            "columns": { "messages": "messages" },
-            "tags": {
-                "role_tag": "role",
-                "content_tag": "content",
-                "user_tag": "user",
-                "assistant_tag": "assistant"
-            }
-        },
-        format!("{}_val", run_name): {
-            "file_name": "val.jsonl",
-            "formatting": "sharegpt",
-            "columns": { "messages": "messages" },
-            "tags": {
-                "role_tag": "role",
-                "content_tag": "content",
-                "user_tag": "user",
-                "assistant_tag": "assistant"
-            }
-        }
+pub fn dataset_info(run_name: &str, format: Option<crate::generator::DatasetFormat>) -> String {
+    let fmt = format.unwrap_or(crate::generator::DatasetFormat::MultipleChoice);
+
+    let (formatting, columns) = if fmt == crate::generator::DatasetFormat::InstructionIo {
+        let mut cols = serde_json::Map::new();
+        cols.insert("prompt".to_string(), json!("instruction"));
+        cols.insert("query".to_string(), json!("input"));
+        cols.insert("response".to_string(), json!("output"));
+        ("alpaca".to_string(), cols)
+    } else {
+        let mut cols = serde_json::Map::new();
+        cols.insert("messages".to_string(), json!("messages"));
+        ("sharegpt".to_string(), cols)
+    };
+
+    let mut entry = json!({
+        "file_name": "train.jsonl",
+        "formatting": formatting,
+        "columns": columns,
     });
-    serde_json::to_string_pretty(&v).unwrap()
+
+    if formatting == "sharegpt" {
+        entry["tags"] = json!({
+            "role_tag": "role",
+            "content_tag": "content",
+            "user_tag": "user",
+            "assistant_tag": "assistant"
+        });
+    }
+
+    let mut entry_val = entry.clone();
+    entry_val["file_name"] = json!("val.jsonl");
+
+    let mut map = serde_json::Map::new();
+    map.insert(run_name.to_string(), entry);
+    map.insert(format!("{}_val", run_name), entry_val);
+
+    serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap()
 }
 
 /// Trimmed, deduplicated list of HF dataset repo IDs configured for this run.
@@ -110,24 +119,46 @@ pub fn dataset_info_hf(run: &Run) -> String {
     let ds = &run.hub_dataset;
     let mut columns = ds.dataset_columns.clone();
 
+    let format_str = if ds.dataset_format.is_empty() {
+        let fmt = run
+            .dataset_format
+            .unwrap_or(crate::generator::DatasetFormat::MultipleChoice);
+        if fmt == crate::generator::DatasetFormat::InstructionIo {
+            "alpaca".to_string()
+        } else {
+            "sharegpt".to_string()
+        }
+    } else {
+        ds.dataset_format.clone()
+    };
+
     // Default columns if none provided
     if columns.is_empty() {
-        if ds.dataset_format == "sharegpt" {
+        if format_str == "sharegpt" {
             columns.insert("messages".to_string(), "messages".to_string());
         } else {
-            columns.insert("prompt".to_string(), "question".to_string());
-            columns.insert("query".to_string(), "think".to_string());
-            columns.insert("response".to_string(), "answer".to_string());
+            let fmt = run
+                .dataset_format
+                .unwrap_or(crate::generator::DatasetFormat::MultipleChoice);
+            if fmt == crate::generator::DatasetFormat::InstructionIo {
+                columns.insert("prompt".to_string(), "instruction".to_string());
+                columns.insert("query".to_string(), "input".to_string());
+                columns.insert("response".to_string(), "output".to_string());
+            } else {
+                columns.insert("prompt".to_string(), "question".to_string());
+                columns.insert("query".to_string(), "reasoning".to_string());
+                columns.insert("response".to_string(), "answer".to_string());
+            }
         }
     }
 
     let make_entry = |repo: &str| -> serde_json::Value {
         let mut entry = json!({
             "hf_hub_url": repo,
-            "formatting": ds.dataset_format,
+            "formatting": format_str,
             "columns": columns,
         });
-        if ds.dataset_format == "sharegpt" {
+        if format_str == "sharegpt" {
             entry["tags"] = json!({
                 "role_tag": "role",
                 "content_tag": "content",
@@ -331,6 +362,7 @@ pub fn train_yaml(
     let trainable_model = resolve_trainable_repo(&run.student_model);
     let template = pick_template(&trainable_model);
     let method = lora.method.trim().to_lowercase();
+    let method_yaml = crate::method::yaml(&method);
     // Vision-language models (Qwen-VL, Llava, etc.) emit collated tensors with
     // broadcast/expanded storage (e.g. 3D rope position_ids, expanded attention
     // masks). torch's `pin_memory` rejects tensors whose strides overlap memory,
@@ -346,21 +378,10 @@ pub fn train_yaml(
         || model_lower.contains("internvl")
         || model_lower.contains("minicpm-v");
     let dataloader_pin_memory = if is_vl_model { Some(false) } else { None };
-    let full_methods = ["full", "galore", "badam"];
-    let finetuning_type = if method == "freeze" {
-        "freeze"
-    } else if full_methods.contains(&method.as_str()) {
-        "full"
-    } else {
-        "lora"
-    };
-    let is_lora_family = finetuning_type == "lora";
     // `loftq` is no longer surfaced in the UI (the offline scripts/loftq_init.py
     // workflow that LLaMA-Factory requires isn't wired up here); old saved runs
     // with that value fall through to QLoRA. `peft` is likewise an alias for
     // plain LoRA — both names accepted for resume compatibility only.
-    let use_qlora = method == "qlora" || method == "loftq";
-    let use_unsloth = method == "unsloth";
 
     // The app uploads adapters itself after training so it can repair PEFT
     // metadata before the Hub validates README.md. Trainer-managed pushes can
@@ -387,66 +408,86 @@ pub fn train_yaml(
         model_name_or_path: &trainable_model,
         stage: "sft",
         do_train: true,
-        finetuning_type,
-        lora_target: if is_lora_family { Some("all") } else { None },
-        lora_rank: if is_lora_family { Some(lora.r) } else { None },
-        lora_alpha: if is_lora_family {
-            Some(lora.alpha)
-        } else {
-            None
-        },
-        lora_dropout: if is_lora_family {
-            Some(lora.dropout)
-        } else {
-            None
-        },
-        quantization_bit: if use_qlora { Some(4) } else { None },
-        // LLaMA-Factory v0.9.4 QuantizationMethod enum: "bnb"|"gptq"|"awq"|"aqlm"|"quanto"|"eetq"|"hqq"|"mxfp4"|"fp8".
-        // We use bitsandbytes via the "bnb" alias — "bitsandbytes" is rejected at arg-parse time.
-        quantization_method: if use_qlora { Some("bnb") } else { None },
-        use_unsloth: if use_unsloth { Some(true) } else { None },
-        use_dora: if method == "dora" { Some(true) } else { None },
-        loraplus_lr_ratio: if method == "loraplus" {
-            Some(16.0)
-        } else {
-            None
-        },
-        pissa_init: if method == "pissa" { Some(true) } else { None },
-        // Number of SVD iterations and convert-on-save: without `pissa_convert`,
-        // LF leaves the original base weights untouched and the residual is
-        // never folded into the saved adapter — measurably hurts accuracy.
-        pissa_iter: if method == "pissa" { Some(16) } else { None },
-        pissa_convert: if method == "pissa" { Some(true) } else { None },
-        // Positive = last N transformer blocks are trainable; negative = first N.
-        // Default of 2 mirrors LLaMA-Factory's freeze example.
-        freeze_trainable_layers: if method == "freeze" { Some(2) } else { None },
-        use_galore: if method == "galore" { Some(true) } else { None },
-        galore_layerwise: if method == "galore" { Some(true) } else { None },
-        galore_target: if method == "galore" {
+        finetuning_type: method_yaml.finetuning_type,
+        lora_target: if method_yaml.is_lora_family {
             Some("all")
         } else {
             None
         },
-        galore_rank: if method == "galore" { Some(128) } else { None },
-        galore_update_interval: if method == "galore" { Some(200) } else { None },
-        galore_scale: if method == "galore" { Some(2.0) } else { None },
-        use_badam: if method == "badam" { Some(true) } else { None },
-        badam_mode: if method == "badam" {
-            Some("layer")
+        lora_rank: if method_yaml.is_lora_family {
+            Some(lora.r)
         } else {
             None
         },
-        badam_switch_mode: if method == "badam" {
-            Some("ascending")
+        lora_alpha: if method_yaml.is_lora_family {
+            Some(lora.alpha)
         } else {
             None
         },
-        badam_switch_interval: if method == "badam" { Some(50) } else { None },
-        badam_verbose: if method == "badam" { Some(2) } else { None },
+        lora_dropout: if method_yaml.is_lora_family {
+            Some(lora.dropout)
+        } else {
+            None
+        },
+        quantization_bit: method_yaml.quantization_bit,
+        // LLaMA-Factory v0.9.4 QuantizationMethod enum: "bnb"|"gptq"|"awq"|"aqlm"|"quanto"|"eetq"|"hqq"|"mxfp4"|"fp8".
+        // We use bitsandbytes via the "bnb" alias — "bitsandbytes" is rejected at arg-parse time.
+        quantization_method: method_yaml.quantization_method,
+        use_unsloth: if method_yaml.use_unsloth {
+            Some(true)
+        } else {
+            None
+        },
+        use_dora: if method_yaml.use_dora {
+            Some(true)
+        } else {
+            None
+        },
+        loraplus_lr_ratio: method_yaml.loraplus_lr_ratio,
+        pissa_init: if method_yaml.pissa_init {
+            Some(true)
+        } else {
+            None
+        },
+        // Number of SVD iterations and convert-on-save: without `pissa_convert`,
+        // LF leaves the original base weights untouched and the residual is
+        // never folded into the saved adapter — measurably hurts accuracy.
+        pissa_iter: method_yaml.pissa_iter,
+        pissa_convert: if method_yaml.pissa_convert {
+            Some(true)
+        } else {
+            None
+        },
+        // Positive = last N transformer blocks are trainable; negative = first N.
+        // Default of 2 mirrors LLaMA-Factory's freeze example.
+        freeze_trainable_layers: method_yaml.freeze_trainable_layers,
+        use_galore: if method_yaml.use_galore {
+            Some(true)
+        } else {
+            None
+        },
+        galore_layerwise: if method_yaml.galore_layerwise {
+            Some(true)
+        } else {
+            None
+        },
+        galore_target: method_yaml.galore_target,
+        galore_rank: method_yaml.galore_rank,
+        galore_update_interval: method_yaml.galore_update_interval,
+        galore_scale: method_yaml.galore_scale,
+        use_badam: if method_yaml.use_badam {
+            Some(true)
+        } else {
+            None
+        },
+        badam_mode: method_yaml.badam_mode,
+        badam_switch_mode: method_yaml.badam_switch_mode,
+        badam_switch_interval: method_yaml.badam_switch_interval,
+        badam_verbose: method_yaml.badam_verbose,
         // GaLore-layerwise + BAdam all benefit from / require pure bf16.
         // Layerwise optimizers update parameter groups one layer at a time so
         // the usual mixed-precision master copy doesn't help.
-        pure_bf16: if matches!(method.as_str(), "badam" | "galore") {
+        pure_bf16: if method_yaml.pure_bf16 {
             Some(true)
         } else {
             None

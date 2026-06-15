@@ -105,6 +105,222 @@ Source material:
 {chunk_text}
 """`;
 
+type DatasetFormatKey =
+  | "simple_qa"
+  | "reasoning_qa"
+  | "multiple_choice"
+  | "chain_of_thought"
+  | "instruction_io"
+  | "conversational";
+
+const DEFAULT_DATASET_FORMAT: DatasetFormatKey = "multiple_choice";
+
+const DATASET_FORMATS: Array<{
+  key: DatasetFormatKey;
+  label: string;
+  desc: string;
+  icon: React.ComponentType<{ className?: string }>;
+  prompt: string;
+}> = [
+  {
+    key: "simple_qa",
+    label: "Simple Q&A",
+    desc: "Direct question-answer pairs for FAQs and quick instruction tuning.",
+    icon: FileText,
+    prompt: `FOCUS TOPIC: {topic}
+
+ROLE: You are a knowledgeable tutor creating clear, direct study questions.
+
+TASK:
+Using the source material below, write ONE original question and a concise, factually-grounded answer.
+
+RULES:
+- Question must be answerable strictly from the source.
+- Do NOT copy the source verbatim. Rephrase or shift the angle.
+- Answer should be 2-5 sentences, direct and complete.
+- If the source is unrelated to '{topic}', respond EXACTLY: SKIP: off-topic
+
+OUTPUT FORMAT (strict):
+QUESTION:
+ANSWER:
+
+Source material:
+"""
+{chunk_text}
+"""`
+  },
+  {
+    key: "reasoning_qa",
+    label: "Q&A with Reasoning",
+    desc: "Emits <think> reasoning blocks for DeepSeek/Qwen-style SFT.",
+    icon: Sparkles,
+    prompt: `FOCUS TOPIC: {topic}
+
+ROLE: You are an expert tutor creating reasoning-based training data for advanced LLMs.
+
+TASK:
+Using the source material below, write ONE original question, a reasoning chain, and a final answer.
+
+RULES:
+- Question must be answerable strictly from the source.
+- REASONING should identify facts, connect them, and derive the answer.
+- ANSWER should be the final, clean response.
+- Reasoning should be 3-7 sentences using words like "because", "therefore", "since", or "this means".
+- If source is unrelated to '{topic}', respond EXACTLY: SKIP: off-topic
+
+OUTPUT FORMAT (strict):
+QUESTION:
+REASONING:
+ANSWER:
+
+Source material:
+"""
+{chunk_text}
+"""`
+  },
+  {
+    key: "multiple_choice",
+    label: "Multiple Choice",
+    desc: "Four-option MCQ with distractors, reasoning, and answer summary.",
+    icon: Layers,
+    prompt: `FOCUS TOPIC: {topic}
+
+ROLE: You are an expert dataset curator and question writer. Your job is to generate high-quality training question-answer pairs with detailed reasoning from source material for any domain or subject.
+
+TASK:
+Given the source material below, generate ONE high-quality question-answer pair with step-by-step reasoning.
+
+RULES:
+1. Detect the domain from the source material and adapt your question style accordingly:
+   - Quantitative/math-heavy material -> computation or problem-solving question (change given values slightly)
+   - Legal/regulatory material -> scenario-based application question, NOT a definition question
+   - Conceptual/theory material -> "which is MOST accurate / appropriate" question that tests understanding, not recall
+   - Procedural material -> step-ordering or error-identification question
+2. Provide exactly 4 choices (A-D) with plausible distractors based on common mistakes or misconceptions.
+3. REASONING must be detailed:
+   - Break the problem down step by step
+   - Eliminate wrong choices explicitly and explain why each is wrong
+   - Show the derivation, formula application, or rule being used
+   - Conclude with why the correct answer is correct
+4. ANSWER must state the correct letter and a concise summary of the reasoning (2-3 sentences max).
+5. Do NOT copy the source verbatim. Rephrase, vary values, or shift the angle.
+6. The question must be answerable strictly from the source material.
+7. If the source material has no meaningful connection to '{topic}', respond with exactly: SKIP: off-topic
+
+FORMAT (strictly - no extra text before or after):
+QUESTION: <stem>
+A. <choice>
+B. <choice>
+C. <choice>
+D. <choice>
+REASONING: <detailed step-by-step reasoning, distractor elimination, formula/rule application>
+ANSWER: <correct letter> - <concise 2-3 sentence summary of why it is correct>
+
+Source material:
+"""
+{chunk_text}
+"""`
+  },
+  {
+    key: "chain_of_thought",
+    label: "Chain-of-Thought",
+    desc: "Numbered step-by-step solutions for math, logic, and procedures.",
+    icon: Zap,
+    prompt: `FOCUS TOPIC: {topic}
+
+ROLE: You are a methodical teacher creating step-by-step solution training data.
+
+TASK:
+Using the source material, write ONE problem and a numbered step-by-step solution leading to a final answer. Ideal for math, logic, procedures, or multi-step derivations.
+
+RULES:
+- Problem should require at least 3 reasoning steps.
+- Each step must be explicit, atomic, and explained.
+- End with a clearly labeled FINAL ANSWER.
+- Use formulas, equations, or rule citations where applicable.
+- If unrelated to '{topic}', respond EXACTLY: SKIP: off-topic
+
+OUTPUT FORMAT (strict):
+PROBLEM:
+SOLUTION:
+Step 1:
+Step 2:
+Step 3:
+[continue as needed]
+FINAL ANSWER:
+
+Source material:
+"""
+{chunk_text}
+"""`
+  },
+  {
+    key: "instruction_io",
+    label: "Alpaca Instruction",
+    desc: "Instruction, input, and output triples for general SFT.",
+    icon: Database,
+    prompt: `FOCUS TOPIC: {topic}
+
+ROLE: You are creating Alpaca-style instruction tuning data.
+
+TASK:
+Using the source material, generate ONE instruction-input-output triple.
+
+RULES:
+- INSTRUCTION: a clear task directive (for example, "Summarize the following", "Explain why...", "Calculate...").
+- INPUT: relevant context/data the instruction operates on. Use "N/A" if the instruction is self-contained.
+- OUTPUT: the complete, accurate response derived from the source.
+- Vary instruction types: summarize, explain, classify, extract, compare, calculate.
+- If unrelated to '{topic}', respond EXACTLY: SKIP: off-topic
+
+OUTPUT FORMAT (strict):
+INSTRUCTION:
+INPUT:
+OUTPUT:
+
+Source material:
+"""
+{chunk_text}
+"""`
+  },
+  {
+    key: "conversational",
+    label: "Multi-Turn Conversation",
+    desc: "Source-grounded tutoring dialogue for chat model training.",
+    icon: ScanText,
+    prompt: `FOCUS TOPIC: {topic}
+
+ROLE: You are scripting a realistic tutor-student dialogue for training a conversational AI.
+
+TASK:
+Using the source material, write a 3-4 turn dialogue between a curious USER and an expert ASSISTANT. The conversation should naturally explore a concept from the source.
+
+RULES:
+- Turn 1: USER asks a beginner-level question.
+- Turn 2: ASSISTANT explains clearly using source facts.
+- Turn 3: USER asks a follow-up (clarification, edge case, or deeper question).
+- Turn 4: ASSISTANT gives a precise, source-grounded answer.
+- Optional Turn 5-6: deeper exchange.
+- Keep tone natural and helpful. No reasoning leakage.
+- If unrelated to '{topic}', respond EXACTLY: SKIP: off-topic
+
+OUTPUT FORMAT (strict):
+USER:
+ASSISTANT:
+USER:
+ASSISTANT:
+
+Source material:
+"""
+{chunk_text}
+"""`
+  },
+];
+
+function promptForDatasetFormat(format: string): string {
+  return DATASET_FORMATS.find((f) => f.key === format)?.prompt || DATASET_FORMATS.find((f) => f.key === DEFAULT_DATASET_FORMAT)?.prompt || DEFAULT_PROMPT;
+}
+
 const SELECT_CLASS =
   "w-full px-4 py-2.5 premium-input rounded-xl text-sm-fluid font-black font-mono focus:outline-none appearance-none cursor-pointer [color-scheme:dark]";
 const OPTION_CLASS = "theme-surface theme-text";
@@ -2115,6 +2331,12 @@ function DatasetStep(props: {
   sshHostSet: boolean;
   onConfigChange?: (patch: Partial<AppConfig>) => void;
   method?: string;
+  enableVerification: boolean;
+  onEnableVerificationChange: (v: boolean) => void;
+  bundleWindow: number;
+  onBundleWindowChange: (n: number) => void;
+  datasetFormat: string;
+  onDatasetFormatChange: (s: string) => void;
 }) {
   const isZraldOffline = props.method === "zrald_offline";
   const embedders = props.config.embedders && props.config.embedders.length > 0 ? props.config.embedders : [DEFAULT_EMBEDDER];
@@ -2152,6 +2374,23 @@ function DatasetStep(props: {
 
   const hd = props.hubDataset;
   const setHd = <K extends keyof HubDatasetConfig>(k: K, v: HubDatasetConfig[K]) => props.onHubDatasetChange({ ...hd, [k]: v });
+  const selectedFormat = DATASET_FORMATS.find((f) => f.key === props.datasetFormat) || DATASET_FORMATS.find((f) => f.key === DEFAULT_DATASET_FORMAT) || DATASET_FORMATS[0];
+
+  const applyDatasetFormat = (format: DatasetFormatKey) => {
+    const nextPrompt = promptForDatasetFormat(format);
+    const previousPrompt = promptForDatasetFormat(props.datasetFormat);
+    props.onDatasetFormatChange(format);
+    props.onPromptChange(nextPrompt);
+    props.onTopicsChange(
+      props.topics.map((topic) => {
+        const currentPrompt = topic.promptTemplate || "";
+        if (!currentPrompt.trim() || currentPrompt === props.prompt || currentPrompt === previousPrompt) {
+          return { ...topic, promptTemplate: nextPrompt };
+        }
+        return topic;
+      })
+    );
+  };
 
   const selectedDatasets = useMemo<string[]>(() => {
     const list = (hd.repoIds && hd.repoIds.length > 0) ? hd.repoIds : (hd.repoId ? [hd.repoId] : []);
@@ -2169,9 +2408,9 @@ function DatasetStep(props: {
     next[idx] = { ...next[idx], ...patch };
     props.onTopicsChange(next);
   };
-  const addRow = () => props.onTopicsChange([...props.topics, { topic: "", totalQuestions: undefined }]);
+  const addRow = () => props.onTopicsChange([...props.topics, { topic: "", totalQuestions: undefined, promptTemplate: selectedFormat.prompt }]);
   const removeRow = (idx: number) => {
-    if (props.topics.length <= 1) { props.onTopicsChange([{ topic: "", totalQuestions: undefined }]); return; }
+    if (props.topics.length <= 1) { props.onTopicsChange([{ topic: "", totalQuestions: undefined, promptTemplate: selectedFormat.prompt }]); return; }
     props.onTopicsChange(props.topics.filter((_, i) => i !== idx));
     setGeneratingTopicIdx((cur) => (cur === idx ? null : cur));
   };
@@ -2216,7 +2455,7 @@ function DatasetStep(props: {
         }
         headers["Authorization"] = `Bearer ${apiKey}`;
       }
-      const userPrompt = `You are a system prompt engineering expert. Generate an engineering directive system prompt for an LLM teacher model that will read source material chunks and generate board-exam-level QA pairs focused exclusively on the topic: "${topicText}".
+      const userPrompt = `You are a system prompt engineering expert. Generate an engineering directive prompt for an LLM teacher model that will read source material chunks and generate ${selectedFormat.label} dataset rows focused exclusively on the topic: "${topicText}".
 
 The template prompt MUST be written as an instruction system prompt for the teacher LLM, and it MUST contain the following exact placeholders:
 - {topic} : representing the current focus topic (will resolve to "${topicText}").
@@ -2224,7 +2463,8 @@ The template prompt MUST be written as an instruction system prompt for the teac
 
 Tailor the wording, examples, and rules specifically to "${topicText}" — assume the teacher will only ever generate questions about this single topic.
 
-The generated template must explicitly forbid hidden reasoning, chain-of-thought, <think> blocks, markdown, and conversational introductions. It must instruct the teacher to output only QUESTION and ANSWER fields for each generated pair.
+Use this selected dataset format as the structural baseline:
+${selectedFormat.prompt}
 
 Provide ONLY the final generated instruction system prompt text. Do not include markdown code fence formatting (like \`\`\`), <think> blocks, analysis, conversational intros, or explanations.`;
       const bodyData: any = provider === "anthropic"
@@ -2278,6 +2518,41 @@ Provide ONLY the final generated instruction system prompt text. Do not include 
                 Direct Dataset Context
              </div>
              <p className="mt-4 text-sm-fluid theme-muted opacity-90 leading-relaxed font-medium">Point to existing Hub repositories. Training will proceed without synthetic generation cycles.</p>
+          </div>
+        </div>
+      )}
+
+      {!props.trainingOnly && (
+        <div className="space-y-4">
+          <div className="flex items-center justify-between ml-1">
+            <label className="text-[10px] uppercase tracking-[0.3em] theme-muted font-black font-mono">Dataset Format</label>
+            <span className="text-[10px] font-black font-mono theme-accent uppercase tracking-widest">{selectedFormat.label}</span>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            {DATASET_FORMATS.map((format) => {
+              const Icon = format.icon;
+              const active = format.key === props.datasetFormat;
+              return (
+                <button
+                  key={format.key}
+                  type="button"
+                  onClick={() => applyDatasetFormat(format.key)}
+                  className={`text-left rounded-xl border p-4 transition-all duration-300 premium-button ${
+                    active
+                      ? "theme-accent-soft theme-accent border-theme-accent/40 shadow-lg shadow-theme-accent/5"
+                      : "border-white/5 bg-white/[0.015] theme-muted hover:theme-text hover:border-white/15"
+                  }`}
+                >
+                  <div className="flex items-center gap-3">
+                    <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${active ? "theme-accent-bg text-black" : "bg-white/5 text-white/40"}`}>
+                      <Icon className="w-4 h-4" />
+                    </div>
+                    <span className="text-[10px] uppercase tracking-[0.18em] font-black font-mono">{format.label}</span>
+                  </div>
+                  <p className="mt-2 text-[10px] theme-muted opacity-70 leading-relaxed">{format.desc}</p>
+                </button>
+              );
+            })}
           </div>
         </div>
       )}
@@ -2412,6 +2687,37 @@ Provide ONLY the final generated instruction system prompt text. Do not include 
             <div className="space-y-2.5"><label className="text-[10px] uppercase tracking-widest theme-muted font-black ml-1 font-mono tracking-widest">Density</label><input type="number" min={1} value={props.maxPairsPerChunk} onChange={(e) => props.onMaxPairsChange(Math.max(1, Number(e.target.value)))} className="w-full px-5 py-3.5 premium-input rounded-xl text-sm-fluid font-mono focus:outline-none bg-black/40 border border-white/10" /></div>
             <div className="space-y-2.5"><label className="text-[10px] uppercase tracking-widest theme-muted font-black ml-1 font-mono tracking-widest">Concurrency</label><input type="number" min={1} value={props.concurrency} onChange={(e) => props.onConcurrencyChange(Math.max(1, Number(e.target.value)))} className="w-full px-5 py-3.5 premium-input rounded-xl text-sm-fluid font-mono focus:outline-none disabled:opacity-20 bg-black/40 border border-white/10" /></div>
             <div className="space-y-2.5"><label className="text-[10px] uppercase tracking-widest theme-muted font-black ml-1 font-mono tracking-widest">Cap</label><input type="text" value={props.maxChunks === "all" ? "all" : String(props.maxChunks)} onChange={(e) => { const v = e.target.value.trim().toLowerCase(); props.onMaxChunksChange((v === "" || v === "all") ? "all" : Number(v)); }} className="w-full px-5 py-3.5 premium-input rounded-xl text-sm-fluid font-mono focus:outline-none bg-black/40 border border-white/10" /></div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <label className={`flex items-center gap-4 rounded-xl border p-4 cursor-pointer transition-all ${props.enableVerification ? "theme-accent-soft theme-accent border-theme-accent/40" : "border-white/5 bg-white/[0.015] theme-muted hover:theme-text"}`}>
+              <input
+                type="checkbox"
+                checked={props.enableVerification}
+                onChange={(e) => props.onEnableVerificationChange(e.target.checked)}
+                className="h-4 w-4 accent-[rgb(var(--app-accent-rgb))]"
+              />
+              <div>
+                <div className="text-[10px] uppercase tracking-[0.2em] font-black font-mono">Teacher Verification</div>
+                <p className="mt-1 text-[10px] opacity-70 leading-relaxed">Run a factuality judge pass before accepting each generated row.</p>
+              </div>
+            </label>
+            <div className="rounded-xl border border-white/5 bg-white/[0.015] p-4 space-y-2">
+              <div className="flex items-center justify-between">
+                <label className="text-[10px] uppercase tracking-[0.2em] theme-muted font-black font-mono">Bundle Window</label>
+                <span className="text-[10px] font-black font-mono theme-accent">{props.bundleWindow}</span>
+              </div>
+              <input
+                type="range"
+                min={0}
+                max={3}
+                step={1}
+                value={props.bundleWindow}
+                onChange={(e) => props.onBundleWindowChange(Number(e.target.value))}
+                className="w-full accent-[rgb(var(--app-accent-rgb))]"
+              />
+              <p className="text-[10px] theme-muted opacity-70 leading-relaxed">Include neighboring chunks from the same source document for richer context.</p>
+            </div>
           </div>
           
           {showCustomCollection && (
@@ -2778,13 +3084,14 @@ const [pipelineMode, setPipelineMode] = useState<PipelineMode>("rag");
     setCheckingTeacher(true);
     try {
       const activeTeacher = await api.checkTeacherDeployed(config.ssh, config.docker, currentTeacher);
-      setTeacherDeployed(activeTeacher !== null);
-      setDeployedTeacherModel(activeTeacher?.modelId || null);
-      if (activeTeacher !== null) {
+      const exactTeacher = activeTeacher?.exact ? activeTeacher : null;
+      setTeacherDeployed(exactTeacher !== null);
+      setDeployedTeacherModel(exactTeacher?.modelId || null);
+      if (exactTeacher !== null) {
         const updatedTeacher = {
           ...currentTeacher,
-          vllmPort: activeTeacher.port,
-          repoId: activeTeacher.modelId || currentTeacher.repoId,
+          vllmPort: exactTeacher.port,
+          repoId: exactTeacher.modelId || currentTeacher.repoId,
         };
         if (!teacherConfigEquals(updatedTeacher, currentTeacher)) {
           setTeacher(updatedTeacher);
@@ -2921,7 +3228,7 @@ const [pipelineMode, setPipelineMode] = useState<PipelineMode>("rag");
       const legacyTopic = runTopics.length === 1 ? runTopics[0].topic : undefined;
       const legacyTotal = runTopics.length === 1 ? runTopics[0].totalQuestions : undefined;
       const generationHubDataset: HubDatasetConfig = isZraldMethod ? { ...hubDataset, trainOnly: false } : hubDataset;
-      const rc: RunConfig = { name: `gen-${new Date().toISOString().slice(0, 19).replace(/:/g, "-")}`, teacher, studentModel, lora, promptTemplate: prompt, maxPairsPerChunk, concurrency, maxChunks: maxChunks === "all" ? undefined : (maxChunks as number), topic: legacyTopic, totalQuestions: legacyTotal, topics: runTopics.length > 0 ? runTopics : undefined, hub, hubDataset: generationHubDataset, generateOnly: true };
+      const rc: RunConfig = { name: `gen-${new Date().toISOString().slice(0, 19).replace(/:/g, "-")}`, teacher, studentModel, lora, promptTemplate: prompt, maxPairsPerChunk, concurrency, maxChunks: maxChunks === "all" ? undefined : (maxChunks as number), topic: legacyTopic, totalQuestions: legacyTotal, topics: runTopics.length > 0 ? runTopics : undefined, hub, hubDataset: generationHubDataset, generateOnly: true, enableVerification, bundleWindow, datasetFormat };
       const runId = await api.startPipeline(mergedConfig, rc); setGenerationRunId(runId);
       try { const initialLog = await api.readRunLog(runId, 64 * 1024); if (initialLog.trim()) { setGenerationLogs(initialLog); } const run = await api.getRun(runId); setGenerationProgress({ scanned: run.qaTotal || 0, kept: run.qaKept || 0, rejected: run.qaRejected || 0, status: run.status }); if (run.status === "dataset_ready" || run.status === "done") { setGeneratingDataset(false); setDatasetGenerated(true); setCompletedRunId(runId); } } catch {}
     } catch (e: any) { setGenerationError(e.message || String(e)); setGeneratingDataset(false); }
@@ -2929,11 +3236,15 @@ const [pipelineMode, setPipelineMode] = useState<PipelineMode>("rag");
 
   const cancelDatasetGeneration = async () => { if (!generationRunId) return; try { await api.cancelRun(generationRunId); } catch {} finally { setGeneratingDataset(false); } };
 
-  const [topics, setTopics] = useState<TopicTarget[]>([{ topic: "", totalQuestions: undefined }]);
+  const initialDatasetPrompt = config.promptTemplate || promptForDatasetFormat(DEFAULT_DATASET_FORMAT);
+  const [datasetFormat, setDatasetFormat] = useState<string>(DEFAULT_DATASET_FORMAT);
+  const [topics, setTopics] = useState<TopicTarget[]>([{ topic: "", totalQuestions: undefined, promptTemplate: initialDatasetPrompt }]);
   const [maxPairsPerChunk, setMaxPairsPerChunk] = useState(1);
   const [concurrency, setConcurrency] = useState(100);
   const [maxChunks, setMaxChunks] = useState<number | "all">("all");
-  const [prompt, setPrompt] = useState(() => config.promptTemplate || DEFAULT_PROMPT);
+  const [prompt, setPrompt] = useState(() => initialDatasetPrompt);
+  const [enableVerification, setEnableVerification] = useState(false);
+  const [bundleWindow, setBundleWindow] = useState(0);
 
   useEffect(() => {
     if (config.promptTemplate && config.promptTemplate !== prompt) {
@@ -3162,7 +3473,7 @@ const [pipelineMode, setPipelineMode] = useState<PipelineMode>("rag");
       else {
         const legacyTopic = runTopics.length === 1 ? runTopics[0].topic : undefined;
         const legacyTotal = runTopics.length === 1 ? runTopics[0].totalQuestions : undefined;
-        const rc: RunConfig = { name: runName || `run-${new Date().toISOString().slice(0, 19)}`, teacher, studentModel, lora, promptTemplate: prompt, maxPairsPerChunk, concurrency, maxChunks: maxChunks === "all" ? undefined : (maxChunks as number), topic: legacyTopic, totalQuestions: legacyTotal, topics: runTopics.length > 0 ? runTopics : undefined, hub, hubDataset: hubDatasetOut };
+        const rc: RunConfig = { name: runName || `run-${new Date().toISOString().slice(0, 19)}`, teacher, studentModel, lora, promptTemplate: prompt, maxPairsPerChunk, concurrency, maxChunks: maxChunks === "all" ? undefined : (maxChunks as number), topic: legacyTopic, totalQuestions: legacyTotal, topics: runTopics.length > 0 ? runTopics : undefined, hub, hubDataset: hubDatasetOut, enableVerification, bundleWindow, datasetFormat };
         const runId = await api.startPipeline(mergedConfig, rc); onPipelineLaunched(runId);
       }
     } catch (e: any) { setLaunchError(e.message || String(e)); } finally { setLaunching(false); }
@@ -3200,8 +3511,8 @@ const [pipelineMode, setPipelineMode] = useState<PipelineMode>("rag");
       <div className="p-8 space-y-8 min-h-[520px]">
         {step === 0 && <KnowledgeBaseStep gpuStatus={gpuStatus ?? null} samples={samples} loading={loadingKb} error={kbError} config={config} onConfigChange={onConfigChange} onSkip={() => setStep(1)} />}
         {step === 1 && <TeacherStep value={teacher} onChange={(t) => { setTeacher(t); onConfigChange({ teacher: t }); }} gpuStatus={gpuStatus} hfToken={config.hfToken || ""} checkingTeacher={checkingTeacher} teacherDeployed={teacherDeployed} deployedTeacherModel={deployedTeacherModel} deploying={deploying} deployLogs={deployLogs} deployError={deployError} onCheckStatus={() => checkDeployment(teacher)} onDeploy={startDeployment} onCancelDeploy={cancelDeployment} />}
-        {step === 2 && !isTrainingOnly && <DatasetStep config={config} onConfigChange={onConfigChange} trainingOnly={isTrainingOnly} onSwitchToGenerateDataset={() => { setPipelineMode("rag"); setStep(0); }} topics={topics} onTopicsChange={setTopics} prompt={prompt} onPromptChange={handlePromptChange} maxPairsPerChunk={maxPairsPerChunk} onMaxPairsChange={setMaxPairsPerChunk} concurrency={concurrency} onConcurrencyChange={setConcurrency} maxChunks={maxChunks} onMaxChunksChange={setMaxChunks} hubDataset={hubDataset} onHubDatasetChange={setHubDataset} hfTokenSet={!!config.hfToken} hfUsername={hfUsername} hfDatasets={hfDatasets} hfLoading={hfLoading} hfError={hfError} onRefreshHf={refreshHf} generating={generatingDataset} generated={datasetGenerated} progress={generationProgress} logs={generationLogs} error={generationError} onGenerate={startDatasetGeneration} onCancel={cancelDatasetGeneration} sshHostSet={!!config.ssh.host} method={lora.method} />}
-        {step === 3 && <TrainStep trainingOnly={isTrainingOnly} requiresCloudTrainingDataset={requiresCloudTrainingDataset} zraldUsesHf={zraldUsesHf} trainingDataset={(isTrainingOnly || zraldUsesHf) ? <DatasetStep config={config} onConfigChange={onConfigChange} trainingOnly={requiresCloudTrainingDataset} onSwitchToGenerateDataset={() => { setPipelineMode("rag"); setStep(0); }} topics={topics} onTopicsChange={setTopics} prompt={prompt} onPromptChange={handlePromptChange} maxPairsPerChunk={maxPairsPerChunk} onMaxPairsChange={setMaxPairsPerChunk} concurrency={concurrency} onConcurrencyChange={setConcurrency} maxChunks={maxChunks} onMaxChunksChange={setMaxChunks} hubDataset={hubDataset} onHubDatasetChange={setHubDataset} hfTokenSet={!!config.hfToken} hfUsername={hfUsername} hfDatasets={hfDatasets} hfLoading={hfLoading} hfError={hfError} onRefreshHf={refreshHf} generating={generatingDataset} generated={datasetGenerated} progress={generationProgress} logs={generationLogs} error={generationError} onGenerate={startDatasetGeneration} onCancel={cancelDatasetGeneration} sshHostSet={!!config.ssh.host} method={lora.method} /> : null} runName={runName} onRunNameChange={setRunName} lora={lora} onLoraChange={setLora} studentModel={studentModel} onStudentChange={setStudentModel} studentModelOptions={studentModelOptions} hfLoading={hfLoading} hfTokenSet={!!config.hfToken} onRefreshModels={refreshModelPickers} hub={hub} onHubChange={setHub} hfUsername={hfUsername} canLaunch={!!canLaunch} launching={launching} launchError={launchError} onLaunch={launch} validatingDataset={validatingDataset} datasetsValidated={datasetsValidated} trainingOnlyDatasets={trainingOnlyDatasets} hubDatasetValidation={hubDataset.validationResult || {}} onValidateDatasets={validateDatasets} validateButtonRef={validateButtonRef} />}
+        {step === 2 && !isTrainingOnly && <DatasetStep config={config} onConfigChange={onConfigChange} trainingOnly={isTrainingOnly} onSwitchToGenerateDataset={() => { setPipelineMode("rag"); setStep(0); }} topics={topics} onTopicsChange={setTopics} prompt={prompt} onPromptChange={handlePromptChange} maxPairsPerChunk={maxPairsPerChunk} onMaxPairsChange={setMaxPairsPerChunk} concurrency={concurrency} onConcurrencyChange={setConcurrency} maxChunks={maxChunks} onMaxChunksChange={setMaxChunks} hubDataset={hubDataset} onHubDatasetChange={setHubDataset} hfTokenSet={!!config.hfToken} hfUsername={hfUsername} hfDatasets={hfDatasets} hfLoading={hfLoading} hfError={hfError} onRefreshHf={refreshHf} generating={generatingDataset} generated={datasetGenerated} progress={generationProgress} logs={generationLogs} error={generationError} onGenerate={startDatasetGeneration} onCancel={cancelDatasetGeneration} sshHostSet={!!config.ssh.host} method={lora.method} enableVerification={enableVerification} onEnableVerificationChange={setEnableVerification} bundleWindow={bundleWindow} onBundleWindowChange={setBundleWindow} datasetFormat={datasetFormat} onDatasetFormatChange={setDatasetFormat} />}
+        {step === 3 && <TrainStep trainingOnly={isTrainingOnly} requiresCloudTrainingDataset={requiresCloudTrainingDataset} zraldUsesHf={zraldUsesHf} trainingDataset={(isTrainingOnly || zraldUsesHf) ? <DatasetStep config={config} onConfigChange={onConfigChange} trainingOnly={requiresCloudTrainingDataset} onSwitchToGenerateDataset={() => { setPipelineMode("rag"); setStep(0); }} topics={topics} onTopicsChange={setTopics} prompt={prompt} onPromptChange={handlePromptChange} maxPairsPerChunk={maxPairsPerChunk} onMaxPairsChange={setMaxPairsPerChunk} concurrency={concurrency} onConcurrencyChange={setConcurrency} maxChunks={maxChunks} onMaxChunksChange={setMaxChunks} hubDataset={hubDataset} onHubDatasetChange={setHubDataset} hfTokenSet={!!config.hfToken} hfUsername={hfUsername} hfDatasets={hfDatasets} hfLoading={hfLoading} hfError={hfError} onRefreshHf={refreshHf} generating={generatingDataset} generated={datasetGenerated} progress={generationProgress} logs={generationLogs} error={generationError} onGenerate={startDatasetGeneration} onCancel={cancelDatasetGeneration} sshHostSet={!!config.ssh.host} method={lora.method} enableVerification={enableVerification} onEnableVerificationChange={setEnableVerification} bundleWindow={bundleWindow} onBundleWindowChange={setBundleWindow} datasetFormat={datasetFormat} onDatasetFormatChange={setDatasetFormat} /> : null} runName={runName} onRunNameChange={setRunName} lora={lora} onLoraChange={setLora} studentModel={studentModel} onStudentChange={setStudentModel} studentModelOptions={studentModelOptions} hfLoading={hfLoading} hfTokenSet={!!config.hfToken} onRefreshModels={refreshModelPickers} hub={hub} onHubChange={setHub} hfUsername={hfUsername} canLaunch={!!canLaunch} launching={launching} launchError={launchError} onLaunch={launch} validatingDataset={validatingDataset} datasetsValidated={datasetsValidated} trainingOnlyDatasets={trainingOnlyDatasets} hubDatasetValidation={hubDataset.validationResult || {}} onValidateDatasets={validateDatasets} validateButtonRef={validateButtonRef} />}
       </div>
 
       <div className="border-t border-white/5 px-8 py-5 flex items-center justify-between bg-white/[0.01] rounded-b-2xl">

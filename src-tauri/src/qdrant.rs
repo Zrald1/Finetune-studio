@@ -22,13 +22,14 @@ pub struct Chunk {
 
 fn http() -> Client {
     static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| {
-        Client::builder()
-            .timeout(std::time::Duration::from_secs(30 * 60))
-            .build()
-            .unwrap()
-    })
-    .clone()
+    CLIENT
+        .get_or_init(|| {
+            Client::builder()
+                .timeout(std::time::Duration::from_secs(30 * 60))
+                .build()
+                .unwrap()
+        })
+        .clone()
 }
 
 fn base(cfg: &QdrantConfig) -> Result<String> {
@@ -44,11 +45,17 @@ fn api_key(cfg: &QdrantConfig) -> String {
 
 pub async fn health(cfg: &QdrantConfig) -> Result<()> {
     let url = format!("{}/collections", base(cfg)?);
-    let res = http().get(&url).header("api-key", api_key(cfg)).send().await?;
+    let res = http()
+        .get(&url)
+        .header("api-key", api_key(cfg))
+        .send()
+        .await?;
     if !res.status().is_success() {
         let s = res.status();
         let body = res.text().await.unwrap_or_default();
-        return Err(AppError::qdrant(format!("Qdrant health check failed {s}: {body}")));
+        return Err(AppError::qdrant(format!(
+            "Qdrant health check failed {s}: {body}"
+        )));
     }
     Ok(())
 }
@@ -66,9 +73,10 @@ pub async fn count_in_collection(cfg: &QdrantConfig, collection: &str) -> Result
         let body = res.text().await.unwrap_or_default();
         return Err(AppError::qdrant(format!("count failed {s}: {body}")));
     }
-    let body = res.text().await.map_err(|e| {
-        AppError::qdrant(format!("count body read failed: {e}"))
-    })?;
+    let body = res
+        .text()
+        .await
+        .map_err(|e| AppError::qdrant(format!("count body read failed: {e}")))?;
     let v: Value = serde_json::from_str(&body).map_err(|e| {
         let preview: String = body.chars().take(200).collect();
         AppError::qdrant(format!("count body not JSON: {e} — preview: {preview}"))
@@ -139,9 +147,10 @@ pub async fn scroll_in_collection(
         let text = res.text().await.unwrap_or_default();
         return Err(AppError::qdrant(format!("scroll failed {s}: {text}")));
     }
-    let body = res.text().await.map_err(|e| {
-        AppError::qdrant(format!("scroll body read failed: {e}"))
-    })?;
+    let body = res
+        .text()
+        .await
+        .map_err(|e| AppError::qdrant(format!("scroll body read failed: {e}")))?;
     let v: Value = serde_json::from_str(&body).map_err(|e| {
         let preview: String = body.chars().take(200).collect();
         AppError::qdrant(format!("scroll body not JSON: {e} — preview: {preview}"))
@@ -166,29 +175,43 @@ pub async fn scroll(
     if cfg.collection == "all" {
         let cols = list_collections(cfg).await?;
         if cols.is_empty() {
-            return Ok(ScrollPage { chunks: vec![], next_offset: None });
+            return Ok(ScrollPage {
+                chunks: vec![],
+                next_offset: None,
+            });
         }
-        
+
         let (col_index, col_offset) = match offset {
             Some(val) => {
                 let idx = val.get("col_index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
                 let off = val.get("col_offset").cloned();
-                let off = if off.as_ref().map(|v| v.is_null()).unwrap_or(true) { None } else { off };
+                let off = if off.as_ref().map(|v| v.is_null()).unwrap_or(true) {
+                    None
+                } else {
+                    off
+                };
                 (idx, off)
             }
             None => (0, None),
         };
-        
+
         let mut accumulated_chunks = Vec::new();
         let mut current_offset = col_offset;
         let mut current_index = col_index;
-        
+
         while current_index < cols.len() && accumulated_chunks.len() < page_size as usize {
             let col = &cols[current_index];
             let needed = page_size as usize - accumulated_chunks.len();
-            let page = scroll_in_collection(cfg, &col.name, needed as u32, current_offset.take(), tag_filter).await?;
+            let page = scroll_in_collection(
+                cfg,
+                &col.name,
+                needed as u32,
+                current_offset.take(),
+                tag_filter,
+            )
+            .await?;
             accumulated_chunks.extend(page.chunks);
-            
+
             if let Some(next) = page.next_offset {
                 return Ok(ScrollPage {
                     chunks: accumulated_chunks,
@@ -202,7 +225,7 @@ pub async fn scroll(
                 current_offset = None;
             }
         }
-        
+
         let next_offset = if current_index < cols.len() {
             Some(json!({
                 "col_index": current_index,
@@ -211,7 +234,7 @@ pub async fn scroll(
         } else {
             None
         };
-        
+
         Ok(ScrollPage {
             chunks: accumulated_chunks,
             next_offset,
@@ -271,7 +294,11 @@ pub async fn sample(cfg: &QdrantConfig, n: u32) -> Result<Vec<Chunk>> {
     Ok(page.chunks)
 }
 
-pub async fn sample_in_collection(cfg: &QdrantConfig, collection: &str, n: u32) -> Result<Vec<Chunk>> {
+pub async fn sample_in_collection(
+    cfg: &QdrantConfig,
+    collection: &str,
+    n: u32,
+) -> Result<Vec<Chunk>> {
     let page = scroll_in_collection(cfg, collection, n.max(1), None, None).await?;
     Ok(page.chunks)
 }
@@ -296,7 +323,11 @@ pub async fn scroll_all(cfg: &QdrantConfig, max_total: u32) -> Result<Vec<Chunk>
     Ok(all_chunks)
 }
 
-pub async fn scroll_all_in_collection(cfg: &QdrantConfig, collection: &str, max_total: u32) -> Result<Vec<Chunk>> {
+pub async fn scroll_all_in_collection(
+    cfg: &QdrantConfig,
+    collection: &str,
+    max_total: u32,
+) -> Result<Vec<Chunk>> {
     let mut all_chunks = Vec::new();
     let mut offset: Option<Value> = None;
     let page_size = 256u32.min(max_total);
@@ -364,16 +395,24 @@ pub async fn ensure_text_index(cfg: &QdrantConfig, collection: &str, field: &str
     if text.to_lowercase().contains("already exists") {
         return Ok(());
     }
-    
+
     // If it conflicts (already indexed as keyword), delete it first and recreate.
-    if text.to_lowercase().contains("already indexed") || text.to_lowercase().contains("conflict") || status.as_u16() == 400 {
-        let delete_url = format!("{}/collections/{}/index/{}?wait=true", base(cfg)?, collection, field);
+    if text.to_lowercase().contains("already indexed")
+        || text.to_lowercase().contains("conflict")
+        || status.as_u16() == 400
+    {
+        let delete_url = format!(
+            "{}/collections/{}/index/{}?wait=true",
+            base(cfg)?,
+            collection,
+            field
+        );
         let _ = http()
             .delete(&delete_url)
             .header("api-key", api_key(cfg))
             .send()
             .await;
-            
+
         let res2 = http()
             .put(&url)
             .header("api-key", api_key(cfg))
@@ -391,7 +430,11 @@ pub async fn ensure_text_index(cfg: &QdrantConfig, collection: &str, field: &str
 
 /// Get the configured vector size of an existing collection, or None if it doesn't exist.
 async fn get_collection_dim(cfg: &QdrantConfig, collection: &str) -> Option<usize> {
-    let url = format!("{}/collections/{}", cfg.endpoint.trim_end_matches('/'), collection);
+    let url = format!(
+        "{}/collections/{}",
+        cfg.endpoint.trim_end_matches('/'),
+        collection
+    );
     let res = http()
         .get(&url)
         .header("api-key", api_key(cfg))
@@ -484,8 +527,7 @@ pub async fn create_collection(cfg: &QdrantConfig, collection: &str, dim: usize)
 
     Err(AppError::qdrant(format!(
         "create collection '{}' failed {}: {text}",
-        collection,
-        status
+        collection, status
     )))
 }
 
@@ -532,9 +574,10 @@ pub async fn search_in_collection(
         let txt = res.text().await.unwrap_or_default();
         return Err(AppError::qdrant(format!("search failed {s}: {txt}")));
     }
-    let body = res.text().await.map_err(|e| {
-        AppError::qdrant(format!("search body read failed: {e}"))
-    })?;
+    let body = res
+        .text()
+        .await
+        .map_err(|e| AppError::qdrant(format!("search body read failed: {e}")))?;
     let v: Value = serde_json::from_str(&body).map_err(|e| {
         let preview: String = body.chars().take(200).collect();
         AppError::qdrant(format!("search body not JSON: {e} — preview: {preview}"))
@@ -554,7 +597,9 @@ pub async fn search(
         let cols = list_collections(cfg).await?;
         let mut all_chunks = Vec::new();
         for col in cols {
-            if let Ok(chunks) = search_in_collection(cfg, &col.name, vector, limit, tag_filter).await {
+            if let Ok(chunks) =
+                search_in_collection(cfg, &col.name, vector, limit, tag_filter).await
+            {
                 all_chunks.extend(chunks);
             }
         }
@@ -571,9 +616,6 @@ pub async fn search(
         search_in_collection(cfg, &cfg.collection, vector, limit, tag_filter).await
     }
 }
-
-
-
 
 // ─── Collection listing ───────────────────────────────────────────────────────
 
@@ -596,11 +638,14 @@ pub async fn list_collections(cfg: &QdrantConfig) -> Result<Vec<CollectionInfo>>
     if !res.status().is_success() {
         let s = res.status();
         let body = res.text().await.unwrap_or_default();
-        return Err(AppError::qdrant(format!("list collections failed {s}: {body}")));
+        return Err(AppError::qdrant(format!(
+            "list collections failed {s}: {body}"
+        )));
     }
-    let v: Value = res.json().await.map_err(|e| {
-        AppError::qdrant(format!("list collections JSON parse failed: {e}"))
-    })?;
+    let v: Value = res
+        .json()
+        .await
+        .map_err(|e| AppError::qdrant(format!("list collections JSON parse failed: {e}")))?;
     let arr = v
         .get("result")
         .and_then(|r| r.get("collections"))
@@ -650,11 +695,14 @@ pub async fn list_snapshots(cfg: &QdrantConfig, collection: &str) -> Result<Vec<
     if !res.status().is_success() {
         let s = res.status();
         let body = res.text().await.unwrap_or_default();
-        return Err(AppError::qdrant(format!("list snapshots failed {s}: {body}")));
+        return Err(AppError::qdrant(format!(
+            "list snapshots failed {s}: {body}"
+        )));
     }
-    let v: Value = res.json().await.map_err(|e| {
-        AppError::qdrant(format!("list snapshots JSON parse failed: {e}"))
-    })?;
+    let v: Value = res
+        .json()
+        .await
+        .map_err(|e| AppError::qdrant(format!("list snapshots JSON parse failed: {e}")))?;
     let arr = v
         .get("result")
         .and_then(|r| r.as_array())
@@ -662,11 +710,13 @@ pub async fn list_snapshots(cfg: &QdrantConfig, collection: &str) -> Result<Vec<
         .unwrap_or_default();
     let mut snaps = vec![];
     for entry in arr {
-        snaps.push(serde_json::from_value(entry).unwrap_or_else(|_| SnapshotInfo {
-            name: String::new(),
-            creation_time: None,
-            size: 0,
-        }));
+        snaps.push(
+            serde_json::from_value(entry).unwrap_or_else(|_| SnapshotInfo {
+                name: String::new(),
+                creation_time: None,
+                size: 0,
+            }),
+        );
     }
     Ok(snaps)
 }
@@ -685,13 +735,18 @@ pub async fn create_snapshot(cfg: &QdrantConfig, collection: &str) -> Result<Sna
     if !res.status().is_success() && res.status().as_u16() != 409 {
         let s = res.status();
         let body = res.text().await.unwrap_or_default();
-        return Err(AppError::qdrant(format!("create snapshot failed {s}: {body}")));
+        return Err(AppError::qdrant(format!(
+            "create snapshot failed {s}: {body}"
+        )));
     }
     #[derive(Deserialize)]
-    struct SnapResponse { result: SnapshotInfo }
-    let v: SnapResponse = res.json().await.map_err(|e| {
-        AppError::qdrant(format!("create snapshot JSON parse failed: {e}"))
-    })?;
+    struct SnapResponse {
+        result: SnapshotInfo,
+    }
+    let v: SnapResponse = res
+        .json()
+        .await
+        .map_err(|e| AppError::qdrant(format!("create snapshot JSON parse failed: {e}")))?;
     Ok(v.result)
 }
 
@@ -716,22 +771,25 @@ pub async fn download_snapshot(
     if !res.status().is_success() {
         let s = res.status();
         let body = res.text().await.unwrap_or_default();
-        return Err(AppError::qdrant(format!("download snapshot failed {s}: {body}")));
+        return Err(AppError::qdrant(format!(
+            "download snapshot failed {s}: {body}"
+        )));
     }
-    let bytes = res.bytes().await.map_err(|e| {
-        AppError::qdrant(format!("read snapshot bytes failed: {e}"))
-    })?;
+    let bytes = res
+        .bytes()
+        .await
+        .map_err(|e| AppError::qdrant(format!("read snapshot bytes failed: {e}")))?;
     let mut file = tokio::io::BufWriter::new(
-        tokio::fs::File::create(local_path).await.map_err(|e| {
-            AppError::qdrant(format!("create snapshot file failed: {e}"))
-        })?,
+        tokio::fs::File::create(local_path)
+            .await
+            .map_err(|e| AppError::qdrant(format!("create snapshot file failed: {e}")))?,
     );
-    file.write_all(&bytes).await.map_err(|e| {
-        AppError::qdrant(format!("write snapshot file failed: {e}"))
-    })?;
-    file.flush().await.map_err(|e| {
-        AppError::qdrant(format!("flush snapshot file failed: {e}"))
-    })?;
+    file.write_all(&bytes)
+        .await
+        .map_err(|e| AppError::qdrant(format!("write snapshot file failed: {e}")))?;
+    file.flush()
+        .await
+        .map_err(|e| AppError::qdrant(format!("flush snapshot file failed: {e}")))?;
     Ok(local_path.to_path_buf())
 }
 
@@ -741,14 +799,20 @@ pub async fn restore_snapshot(
     snapshot_path: &str,
 ) -> Result<()> {
     let base_url = base(cfg)?;
-    let url = format!("{}/collections/{}/snapshots/recover?wait=true", base_url, collection);
+    let url = format!(
+        "{}/collections/{}/snapshots/recover?wait=true",
+        base_url, collection
+    );
     let location = if snapshot_path.starts_with("http://")
         || snapshot_path.starts_with("https://")
         || snapshot_path.starts_with("file://")
     {
         snapshot_path.to_string()
     } else {
-        format!("{}/collections/{}/snapshots/{}", base_url, collection, snapshot_path)
+        format!(
+            "{}/collections/{}/snapshots/{}",
+            base_url, collection, snapshot_path
+        )
     };
     let mut body = json!({
         "location": location,
@@ -767,7 +831,9 @@ pub async fn restore_snapshot(
     if !res.status().is_success() {
         let s = res.status();
         let body = res.text().await.unwrap_or_default();
-        return Err(AppError::qdrant(format!("restore snapshot failed {s}: {body}")));
+        return Err(AppError::qdrant(format!(
+            "restore snapshot failed {s}: {body}"
+        )));
     }
     Ok(())
 }
@@ -790,12 +856,14 @@ pub async fn upload_snapshot(
         .unwrap_or("snapshot.snapshot")
         .to_string();
 
-    let file = tokio::fs::File::open(snapshot_path).await.map_err(|e| {
-        AppError::qdrant(format!("failed to open snapshot file for upload: {e}"))
-    })?;
-    let file_size = file.metadata().await.map_err(|e| {
-        AppError::qdrant(format!("failed to stat snapshot file for upload: {e}"))
-    })?.len();
+    let file = tokio::fs::File::open(snapshot_path)
+        .await
+        .map_err(|e| AppError::qdrant(format!("failed to open snapshot file for upload: {e}")))?;
+    let file_size = file
+        .metadata()
+        .await
+        .map_err(|e| AppError::qdrant(format!("failed to stat snapshot file for upload: {e}")))?
+        .len();
     if file_size == 0 {
         return Err(AppError::qdrant("snapshot file is empty"));
     }
@@ -805,9 +873,7 @@ pub async fn upload_snapshot(
     let part = multipart::Part::stream_with_length(body, file_size)
         .file_name(file_name)
         .mime_str("application/octet-stream")
-        .map_err(|e| {
-            AppError::qdrant(format!("failed to prepare snapshot upload: {e}"))
-        })?;
+        .map_err(|e| AppError::qdrant(format!("failed to prepare snapshot upload: {e}")))?;
 
     let form = multipart::Form::new().part("snapshot", part);
 
@@ -821,7 +887,9 @@ pub async fn upload_snapshot(
     if !res.status().is_success() {
         let s = res.status();
         let body = res.text().await.unwrap_or_default();
-        return Err(AppError::qdrant(format!("snapshot upload/restore failed {s}: {body}")));
+        return Err(AppError::qdrant(format!(
+            "snapshot upload/restore failed {s}: {body}"
+        )));
     }
     Ok(())
 }
@@ -861,9 +929,9 @@ pub async fn download_all_snapshots(
 ) -> Result<Vec<std::path::PathBuf>> {
     use tokio::io::AsyncWriteExt;
     let cols = list_collections(cfg).await?;
-    tokio::fs::create_dir_all(local_dir).await.map_err(|e| {
-        AppError::qdrant(format!("create download dir failed: {e}"))
-    })?;
+    tokio::fs::create_dir_all(local_dir)
+        .await
+        .map_err(|e| AppError::qdrant(format!("create download dir failed: {e}")))?;
     let mut paths = vec![];
     for col in &cols {
         let snaps = list_snapshots(cfg, &col.name).await.unwrap_or_default();
@@ -882,23 +950,116 @@ pub async fn download_all_snapshots(
             if !res.status().is_success() {
                 continue;
             }
-            let bytes = res.bytes().await.map_err(|e| {
-                AppError::qdrant(format!("read snapshot bytes failed: {e}"))
-            })?;
+            let bytes = res
+                .bytes()
+                .await
+                .map_err(|e| AppError::qdrant(format!("read snapshot bytes failed: {e}")))?;
             let file_path = local_dir.join(format!("{}__{}", col.name, snap.name));
             let mut file = tokio::io::BufWriter::new(
-                tokio::fs::File::create(&file_path).await.map_err(|e| {
-                    AppError::qdrant(format!("create snapshot file failed: {e}"))
-                })?,
+                tokio::fs::File::create(&file_path)
+                    .await
+                    .map_err(|e| AppError::qdrant(format!("create snapshot file failed: {e}")))?,
             );
-            file.write_all(&bytes).await.map_err(|e| {
-                AppError::qdrant(format!("write snapshot file failed: {e}"))
-            })?;
-            file.flush().await.map_err(|e| {
-                AppError::qdrant(format!("flush snapshot file failed: {e}"))
-            })?;
+            file.write_all(&bytes)
+                .await
+                .map_err(|e| AppError::qdrant(format!("write snapshot file failed: {e}")))?;
+            file.flush()
+                .await
+                .map_err(|e| AppError::qdrant(format!("flush snapshot file failed: {e}")))?;
             paths.push(file_path);
         }
     }
     Ok(paths)
+}
+
+pub async fn scroll_filtered_in_collection(
+    cfg: &QdrantConfig,
+    collection: &str,
+    file_path: &str,
+    start_idx: i64,
+    end_idx: i64,
+) -> Result<Vec<Chunk>> {
+    let url = format!("{}/collections/{}/points/scroll", base(cfg)?, collection);
+
+    // Qdrant filter: file_path == value AND chunk_index in [start_idx, end_idx]
+    let filter = json!({
+        "must": [
+            {
+                "key": "file_path",
+                "match": { "value": file_path }
+            },
+            {
+                "key": "chunk_index",
+                "range": {
+                    "gte": start_idx,
+                    "lte": end_idx
+                }
+            }
+        ]
+    });
+
+    let body = json!({
+        "limit": 100, // Safe upper limit for windows
+        "with_payload": true,
+        "with_vector": false,
+        "filter": filter
+    });
+
+    let res = http()
+        .post(url)
+        .header("api-key", api_key(cfg))
+        .json(&body)
+        .send()
+        .await?;
+
+    if !res.status().is_success() {
+        let s = res.status();
+        let text = res.text().await.unwrap_or_default();
+        return Err(AppError::qdrant(format!(
+            "scroll_filtered failed {s}: {text}"
+        )));
+    }
+
+    let body_text = res
+        .text()
+        .await
+        .map_err(|e| AppError::qdrant(format!("scroll_filtered body read failed: {e}")))?;
+
+    let v: Value = serde_json::from_str(&body_text).map_err(|e| {
+        let preview: String = body_text.chars().take(200).collect();
+        AppError::qdrant(format!(
+            "scroll_filtered body not JSON: {e} — preview: {preview}"
+        ))
+    })?;
+
+    let result = v
+        .get("result")
+        .ok_or_else(|| AppError::qdrant("response missing result"))?;
+
+    let chunks = parse_chunk_array(result.get("points"));
+    Ok(chunks)
+}
+
+pub async fn scroll_filtered(
+    cfg: &QdrantConfig,
+    file_path: &str,
+    start_idx: i64,
+    end_idx: i64,
+) -> Result<Vec<Chunk>> {
+    if cfg.collection == "all" {
+        let cols = list_collections(cfg).await?;
+        let mut all_chunks = Vec::new();
+        for col in &cols {
+            if let Ok(chunks) =
+                scroll_filtered_in_collection(cfg, &col.name, file_path, start_idx, end_idx).await
+            {
+                all_chunks.extend(chunks);
+            }
+        }
+        all_chunks.sort_by_key(|c| c.chunk_index);
+        all_chunks.dedup_by(|a, b| a.id == b.id);
+        Ok(all_chunks)
+    } else {
+        scroll_filtered_in_collection(cfg, &cfg.collection, file_path, start_idx, end_idx).await
+    }
 }

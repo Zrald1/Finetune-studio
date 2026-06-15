@@ -91,7 +91,7 @@ pub async fn whoami(token: &str) -> Result<HfWhoami> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HfDatasetRepo {
-    pub id: String,           // e.g. "zrald/ge-reviewer-qa"
+    pub id: String, // e.g. "zrald/ge-reviewer-qa"
     #[serde(default)]
     pub private: bool,
     #[serde(default)]
@@ -162,11 +162,18 @@ pub async fn list_user_datasets(token: &str, username: &str) -> Result<Vec<HfDat
         };
         if let Some(arr) = v.as_array() {
             for item in arr {
-                let id = item.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let id = item
+                    .get("id")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 if id.is_empty() {
                     continue;
                 }
-                let private = item.get("private").and_then(|x| x.as_bool()).unwrap_or(false);
+                let private = item
+                    .get("private")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false);
                 let last_modified = item
                     .get("lastModified")
                     .and_then(|x| x.as_str())
@@ -246,7 +253,10 @@ pub async fn list_user_models(token: &str, username: &str) -> Result<Vec<HfModel
                 if id.is_empty() {
                     continue;
                 }
-                let private = item.get("private").and_then(|x| x.as_bool()).unwrap_or(false);
+                let private = item
+                    .get("private")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false);
                 let last_modified = item
                     .get("lastModified")
                     .and_then(|x| x.as_str())
@@ -289,7 +299,7 @@ async fn list_user_orgs(token: &str) -> Result<Vec<String>> {
             }
         }
     }
-Ok(orgs)
+    Ok(orgs)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -321,13 +331,15 @@ pub async fn get_dataset_info(token: &str, repo_id: &str) -> Result<DatasetInfo>
         return Err(AppError::other(format!("HF dataset info {s}: {body}")));
     }
     let v: serde_json::Value = res.json().await.map_err(AppError::Http)?;
-    
-    let splits = v.get("splits")
+
+    let splits = v
+        .get("splits")
         .and_then(|s| s.as_object())
         .map(|obj| {
             let mut map = std::collections::HashMap::new();
             for (k, val) in obj {
-                let num_examples = val.get("numExamples")
+                let num_examples = val
+                    .get("numExamples")
                     .or_else(|| val.get("num_examples"))
                     .and_then(|x| x.as_u64())
                     .unwrap_or(0) as usize;
@@ -336,19 +348,30 @@ pub async fn get_dataset_info(token: &str, repo_id: &str) -> Result<DatasetInfo>
             map
         })
         .unwrap_or_default();
-    
-    let id = v.get("id")
+
+    let id = v
+        .get("id")
         .or_else(|| v.get("repo_id"))
         .and_then(|x| x.as_str())
         .unwrap_or(repo_id)
         .to_string();
-    
+
     let private = v.get("private").and_then(|x| x.as_bool()).unwrap_or(false);
-    
-    let tags = v.get("tags")
+
+    let tags = v
+        .get("tags")
         .and_then(|x| x.as_array())
-        .map(|arr| arr.iter().filter_map(|t| t.as_str().map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| t.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
-    
-    Ok(DatasetInfo { id, private, tags, splits })
+
+    Ok(DatasetInfo {
+        id,
+        private,
+        tags,
+        splits,
+    })
 }

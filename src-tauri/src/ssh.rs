@@ -68,16 +68,15 @@ impl SshSession {
         // --- Resolve to a concrete SocketAddr ---------------------------
         // tokio's resolver returns a useful error if the name is bogus,
         // unlike russh's downstream connect which surfaces a raw winsock code.
-        let addrs: Vec<std::net::SocketAddr> =
-            tokio::net::lookup_host((host.as_str(), port))
-                .await
-                .map_err(|e| {
-                    AppError::ssh(format!(
-                        "cannot resolve host `{host}:{port}`: {e} \
+        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
+            .await
+            .map_err(|e| {
+                AppError::ssh(format!(
+                    "cannot resolve host `{host}:{port}`: {e} \
                          (check the host field — no http://, no trailing /, no spaces)"
-                    ))
-                })?
-                .collect();
+                ))
+            })?
+            .collect();
         if addrs.is_empty() {
             return Err(AppError::ssh(format!(
                 "DNS returned no addresses for `{host}:{port}`"
@@ -211,7 +210,9 @@ impl SshSession {
             return Err(AppError::ssh("authentication failed"));
         }
 
-        Ok(SshSession { handle: Arc::new(handle) })
+        Ok(SshSession {
+            handle: Arc::new(handle),
+        })
     }
 
     /// Run a command and collect stdout/stderr fully.
@@ -283,8 +284,7 @@ impl SshSession {
         })
     }
 
-
-/// Run a command and stream chunks to the receiver. Sends `None` once finished.
+    /// Run a command and stream chunks to the receiver. Sends `None` once finished.
     /// Cancellation: drop the receiver to abort OR set the cancel flag.
     pub async fn exec_stream(
         &self,
@@ -379,7 +379,9 @@ impl SshSession {
 
         if let Some(code) = exit_code {
             if code != 0 {
-                return Err(AppError::ssh(format!("write_file process exited with code {code}")));
+                return Err(AppError::ssh(format!(
+                    "write_file process exited with code {code}"
+                )));
             }
         }
         Ok(())
@@ -615,7 +617,9 @@ fn find_number_by_key(v: &Value, required: &[&str]) -> Option<f64> {
             }
             None
         }
-        Value::Array(items) => items.iter().find_map(|item| find_number_by_key(item, required)),
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| find_number_by_key(item, required)),
         _ => None,
     }
 }
@@ -635,7 +639,9 @@ fn find_string_by_key(v: &Value, required: &[&str]) -> Option<String> {
             }
             None
         }
-        Value::Array(items) => items.iter().find_map(|item| find_string_by_key(item, required)),
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| find_string_by_key(item, required)),
         _ => None,
     }
 }
@@ -670,7 +676,9 @@ fn parse_rocm_smi_json(stdout: &str) -> Option<GpuState> {
         .round()
         .clamp(0.0, 100.0) as u32;
     let utilization_memory = if memory_total > 0.0 {
-        ((memory_used / memory_total) * 100.0).round().clamp(0.0, 100.0) as u32
+        ((memory_used / memory_total) * 100.0)
+            .round()
+            .clamp(0.0, 100.0) as u32
     } else {
         find_number_by_key(&json, &["memory", "use"])
             .unwrap_or(0.0)
@@ -783,4 +791,3 @@ pub async fn nvidia_smi(session: &SshSession) -> Result<GpuState> {
         processes,
     })
 }
-

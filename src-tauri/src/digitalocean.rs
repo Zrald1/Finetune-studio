@@ -292,7 +292,11 @@ fn parse_image(raw: &str) -> ImageRef {
     }
 }
 
-async fn get_json<T: for<'de> Deserialize<'de>>(cfg: &DigitalOceanConfig, path: &str, action: &str) -> Result<T> {
+async fn get_json<T: for<'de> Deserialize<'de>>(
+    cfg: &DigitalOceanConfig,
+    path: &str,
+    action: &str,
+) -> Result<T> {
     let res = client()?
         .get(format!("{API_BASE}{path}"))
         .bearer_auth(token(cfg)?)
@@ -304,12 +308,12 @@ async fn get_json<T: for<'de> Deserialize<'de>>(cfg: &DigitalOceanConfig, path: 
     Ok(res.json::<T>().await?)
 }
 
-async fn get_url<T: for<'de> Deserialize<'de>>(cfg: &DigitalOceanConfig, url: &str, action: &str) -> Result<T> {
-    let res = client()?
-        .get(url)
-        .bearer_auth(token(cfg)?)
-        .send()
-        .await?;
+async fn get_url<T: for<'de> Deserialize<'de>>(
+    cfg: &DigitalOceanConfig,
+    url: &str,
+    action: &str,
+) -> Result<T> {
+    let res = client()?.get(url).bearer_auth(token(cfg)?).send().await?;
     if !res.status().is_success() {
         return Err(parse_error(res, action).await);
     }
@@ -428,7 +432,12 @@ pub async fn list_gpu_sizes(cfg: &DigitalOceanConfig) -> Result<Vec<DoSize>> {
             transfer: 15000.0,
             price_monthly: Some(1648.8),
             price_hourly: Some(2.29),
-            regions: vec!["atl1".to_string(), "nyc2".to_string(), "sfo3".to_string(), "tor1".to_string()],
+            regions: vec![
+                "atl1".to_string(),
+                "nyc2".to_string(),
+                "sfo3".to_string(),
+                "tor1".to_string(),
+            ],
             available: true,
             description: "AMD Instinct MI325X (1 GPU)".to_string(),
             gpu_info: Some(DoGpuInfo {
@@ -448,7 +457,12 @@ pub async fn list_gpu_sizes(cfg: &DigitalOceanConfig) -> Result<Vec<DoSize>> {
             transfer: 60000.0,
             price_monthly: Some(13190.4),
             price_hourly: Some(18.32),
-            regions: vec!["atl1".to_string(), "nyc2".to_string(), "sfo3".to_string(), "tor1".to_string()],
+            regions: vec![
+                "atl1".to_string(),
+                "nyc2".to_string(),
+                "sfo3".to_string(),
+                "tor1".to_string(),
+            ],
             available: true,
             description: "AMD Instinct MI325X (8 GPUs)".to_string(),
             gpu_info: Some(DoGpuInfo {
@@ -617,7 +631,9 @@ pub async fn list_projects(cfg: &DigitalOceanConfig) -> Result<Vec<DoProject>> {
 }
 
 pub async fn get_account(cfg: &DigitalOceanConfig) -> Result<DoAccount> {
-    Ok(get_json::<AccountResponse>(cfg, "/account", "get account").await?.account)
+    Ok(get_json::<AccountResponse>(cfg, "/account", "get account")
+        .await?
+        .account)
 }
 
 async fn assign_project(cfg: &DigitalOceanConfig, droplet: &DoDroplet) -> Result<()> {
@@ -629,9 +645,14 @@ async fn assign_project(cfg: &DigitalOceanConfig, droplet: &DoDroplet) -> Result
         .clone()
         .unwrap_or_else(|| format!("do:droplet:{}", droplet.id));
     let res = client()?
-        .post(format!("{API_BASE}/projects/{}/resources", cfg.project_id.trim()))
+        .post(format!(
+            "{API_BASE}/projects/{}/resources",
+            cfg.project_id.trim()
+        ))
         .bearer_auth(token(cfg)?)
-        .json(&AssignProjectResourcesRequest { resources: vec![resource] })
+        .json(&AssignProjectResourcesRequest {
+            resources: vec![resource],
+        })
         .send()
         .await?;
     if !res.status().is_success() {
@@ -640,7 +661,10 @@ async fn assign_project(cfg: &DigitalOceanConfig, droplet: &DoDroplet) -> Result
     Ok(())
 }
 
-async fn create_once(cfg: &DigitalOceanConfig, req: &CreateDropletRequest) -> std::result::Result<DoDroplet, CreateAttemptError> {
+async fn create_once(
+    cfg: &DigitalOceanConfig,
+    req: &CreateDropletRequest,
+) -> std::result::Result<DoDroplet, CreateAttemptError> {
     // Route to the host that can serve the size being requested. The size field
     // here already carries the `-devcloud` suffix for AMD candidates, so this
     // picks the AMD Developer Cloud endpoint for them and the standard control
@@ -743,7 +767,12 @@ fn region_prefix(region: &str) -> Option<String> {
 
 fn is_amd_gpu_slug(slug: &str) -> bool {
     let lower = slug.to_ascii_lowercase();
-    lower.starts_with("gpu-mi") && lower[6..].chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+    lower.starts_with("gpu-mi")
+        && lower[6..]
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
 }
 
 /// The API host that can actually serve the configured size. AMD MI-series GPU
@@ -797,7 +826,11 @@ fn size_create_candidates(size: &str) -> Vec<String> {
 fn create_rejection_message(body: &str) -> String {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
-        .and_then(|json| json.get("message").and_then(|msg| msg.as_str()).map(str::to_string))
+        .and_then(|json| {
+            json.get("message")
+                .and_then(|msg| msg.as_str())
+                .map(str::to_string)
+        })
         .unwrap_or_else(|| body.to_string())
 }
 
@@ -826,14 +859,19 @@ fn summarize_attempts(attempts: &[CreateAttemptLog], limit: usize) -> String {
         .collect::<Vec<_>>();
 
     if attempts.len() > limit {
-        lines.push(format!("... {} more attempts omitted", attempts.len() - limit));
+        lines.push(format!(
+            "... {} more attempts omitted",
+            attempts.len() - limit
+        ));
     }
 
     lines.join(" | ")
 }
 
 fn strip_contracted_suffix(slug: &str) -> &str {
-    slug.trim().strip_suffix("-contracted").unwrap_or(slug.trim())
+    slug.trim()
+        .strip_suffix("-contracted")
+        .unwrap_or(slug.trim())
 }
 
 // GPU size regions are sometimes missing from /v2/sizes even when DigitalOcean
@@ -862,7 +900,10 @@ async fn candidate_create_regions(cfg: &DigitalOceanConfig) -> (Vec<String>, Vec
     };
 
     let account_regions = match list_regions(cfg).await {
-        Ok(regions) => regions.into_iter().map(|region| region.slug).collect::<Vec<_>>(),
+        Ok(regions) => regions
+            .into_iter()
+            .map(|region| region.slug)
+            .collect::<Vec<_>>(),
         Err(_) => Vec::new(),
     };
 
@@ -921,10 +962,7 @@ async fn create_context(cfg: &DigitalOceanConfig) -> String {
             .unwrap_or_else(|| {
                 format!(
                     "account={}",
-                    account
-                        .name
-                        .or(account.email)
-                        .unwrap_or(account.uuid)
+                    account.name.or(account.email).unwrap_or(account.uuid)
                 )
             }),
         Err(_) => "team=unknown".to_string(),
@@ -943,7 +981,11 @@ async fn create_context(cfg: &DigitalOceanConfig) -> String {
         }
     };
 
-    format!("{account}, {project}, size={}, image={}", cfg.size.trim(), cfg.image.trim())
+    format!(
+        "{account}, {project}, size={}, image={}",
+        cfg.size.trim(),
+        cfg.image.trim()
+    )
 }
 
 pub async fn create_droplet(cfg: &DigitalOceanConfig) -> Result<DoDroplet> {
@@ -951,7 +993,9 @@ pub async fn create_droplet(cfg: &DigitalOceanConfig) -> Result<DoDroplet> {
         return Err(AppError::config("DigitalOcean droplet name is required"));
     }
     if cfg.size.trim().is_empty() || cfg.image.trim().is_empty() {
-        return Err(AppError::config("DigitalOcean GPU size and image are required"));
+        return Err(AppError::config(
+            "DigitalOcean GPU size and image are required",
+        ));
     }
 
     let base_req = CreateDropletRequest {

@@ -2,15 +2,15 @@ use crate::config::QdrantConfig;
 use crate::error::{AppError, Result};
 use crate::ssh::SshSessionManager;
 use base64::Engine;
+use once_cell::sync::Lazy;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use uuid::Uuid;
-use once_cell::sync::Lazy;
 use tokio::sync::Semaphore;
+use uuid::Uuid;
 
 static REMOTE_OCR_SEMAPHORE: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(2));
 
@@ -92,8 +92,7 @@ impl Default for EmbeddingConfig {
 }
 
 const ID_NAMESPACE: Uuid = Uuid::from_bytes([
-    0x6f, 0xe7, 0x1a, 0x2c, 0x49, 0x8d, 0x4b, 0x71,
-    0x9a, 0x10, 0xc5, 0x3b, 0xd2, 0x88, 0x12, 0x55,
+    0x6f, 0xe7, 0x1a, 0x2c, 0x49, 0x8d, 0x4b, 0x71, 0x9a, 0x10, 0xc5, 0x3b, 0xd2, 0x88, 0x12, 0x55,
 ]);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,7 +108,12 @@ pub struct IngestOptions {
 
 impl Default for IngestOptions {
     fn default() -> Self {
-        Self { tag: None, chunk_size: None, chunk_overlap: None, vector_dim: None }
+        Self {
+            tag: None,
+            chunk_size: None,
+            chunk_overlap: None,
+            vector_dim: None,
+        }
     }
 }
 
@@ -139,11 +143,8 @@ pub fn read_file_text(path: &Path) -> Result<String> {
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_default();
     match ext.as_str() {
-        "txt" | "md" => {
-            std::fs::read_to_string(path).map_err(|e| {
-                AppError::pipeline(format!("read {} failed: {}", path.display(), e))
-            })
-        }
+        "txt" | "md" => std::fs::read_to_string(path)
+            .map_err(|e| AppError::pipeline(format!("read {} failed: {}", path.display(), e))),
         "pdf" => {
             let p = path.to_path_buf();
             let result = std::panic::catch_unwind(move || pdf_extract::extract_text(&p));
@@ -161,11 +162,9 @@ pub fn read_file_text(path: &Path) -> Result<String> {
                 ))),
             }
         }
-        "docx" => {
-            docx_lite::extract_text(path).map_err(|e| {
-                AppError::pipeline(format!("docx extract {} failed: {}", path.display(), e))
-            })
-        }
+        "docx" => docx_lite::extract_text(path).map_err(|e| {
+            AppError::pipeline(format!("docx extract {} failed: {}", path.display(), e))
+        }),
         "pptx" | "ppt" => {
             let python_script = r#"
 import sys
@@ -264,11 +263,7 @@ except Exception as e:
     sys.exit(1)
 "#;
             let output = std::process::Command::new("python")
-                .args(&[
-                    "-c",
-                    python_script,
-                    path.to_str().unwrap_or_default(),
-                ])
+                .args(&["-c", python_script, path.to_str().unwrap_or_default()])
                 .output();
 
             match output {
@@ -291,7 +286,9 @@ except Exception as e:
             }
         }
         other => Err(AppError::pipeline(format!(
-            "unsupported file extension '{}' for {}", other, path.display()
+            "unsupported file extension '{}' for {}",
+            other,
+            path.display()
         ))),
     }
 }
@@ -340,7 +337,10 @@ pub async fn read_file_text_with_ocr(
                         }
                     }
                     Err(e) => {
-                        println!("OCR fallback failed for short PDF (using standard text): {:?}", e);
+                        println!(
+                            "OCR fallback failed for short PDF (using standard text): {:?}",
+                            e
+                        );
                     }
                 }
             }
@@ -415,17 +415,21 @@ async fn ocr_extract_file(
                 }]
             }]
         });
-        let res = http().post(&url).json(&body).send().await.map_err(|e| {
-            AppError::pipeline(format!("PaddleOCR HTTP request failed: {}", e))
-        })?;
+        let res = http()
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AppError::pipeline(format!("PaddleOCR HTTP request failed: {}", e)))?;
         if !res.status().is_success() {
             let s = res.status();
             let txt = res.text().await.unwrap_or_default();
             return Err(AppError::pipeline(format!("PaddleOCR HTTP {}: {}", s, txt)));
         }
-        let v: Value = res.json().await.map_err(|e| {
-            AppError::pipeline(format!("PaddleOCR response parse: {}", e))
-        })?;
+        let v: Value = res
+            .json()
+            .await
+            .map_err(|e| AppError::pipeline(format!("PaddleOCR response parse: {}", e)))?;
         let text = v
             .get("choices")
             .and_then(|c| c.get(0))
@@ -436,14 +440,19 @@ async fn ocr_extract_file(
             .to_string();
         if text.is_empty() {
             return Err(AppError::pipeline(format!(
-                "PaddleOCR returned empty text for {}", path.display()
+                "PaddleOCR returned empty text for {}",
+                path.display()
             )));
         }
         return Ok(text);
     };
 
     // Remote Case: retry loop with auto-reconnect
-    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string();
     on_progress("ocr_start", &file_name, 0, 0);
 
     // Acquire OCR semaphore permit to limit concurrent remote OCR processing
@@ -454,14 +463,28 @@ async fn ocr_extract_file(
     let mut last_err = None;
     for attempt in 1..=3 {
         if attempt > 1 {
-            on_progress("ocr_start", &format!("{} (Retry {})", file_name, attempt - 1), 0, 0);
+            on_progress(
+                "ocr_start",
+                &format!("{} (Retry {})", file_name, attempt - 1),
+                0,
+                0,
+            );
         }
         match ocr_extract_file_inner(path, ocr, mgr, on_progress).await {
             Ok(text) => return Ok(text),
             Err(e) => {
-                println!("OCR attempt {} failed for {}: {}. Retrying...", attempt, path.display(), e);
+                println!(
+                    "OCR attempt {} failed for {}: {}. Retrying...",
+                    attempt,
+                    path.display(),
+                    e
+                );
                 let err_str = e.to_string();
-                if err_str.contains("ssh error") || err_str.contains("Channel") || err_str.contains("Disconnected") || err_str.contains("timeout") {
+                if err_str.contains("ssh error")
+                    || err_str.contains("Channel")
+                    || err_str.contains("Disconnected")
+                    || err_str.contains("timeout")
+                {
                     mgr.clear_session().await;
                 }
                 last_err = Some(e);
@@ -481,7 +504,10 @@ async fn ocr_extract_file_inner(
     on_progress: &ProgressFn,
 ) -> Result<String> {
     let session = mgr.get_session().await?;
-    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("doc.dat");
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("doc.dat");
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -503,32 +529,39 @@ async fn ocr_extract_file_inner(
     let remote_dir = format!("/tmp/paddleocr_ingest/{}", uuid);
     let remote_path = format!("{}/{}", remote_dir, file_name);
 
-    let data = tokio::fs::read(path).await.map_err(|e| {
-        AppError::pipeline(format!("read file bytes {}: {}", path.display(), e))
-    })?;
+    let data = tokio::fs::read(path)
+        .await
+        .map_err(|e| AppError::pipeline(format!("read file bytes {}: {}", path.display(), e)))?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-    
+
     // Ensure remote directory exists
     let mkdir_cmd = format!("mkdir -p \"{}\"", remote_dir);
-    session.exec_blocking(&mkdir_cmd).await.map_err(|e| {
-        AppError::pipeline(format!("create remote ocr temp dir: {}", e))
-    })?;
+    session
+        .exec_blocking(&mkdir_cmd)
+        .await
+        .map_err(|e| AppError::pipeline(format!("create remote ocr temp dir: {}", e)))?;
 
     // Upload original file to remote server
     if b64.len() < 65_536 {
         let write_cmd = format!("echo '{}' | base64 -d > \"{}\"", b64, remote_path);
-        session.exec_blocking(&write_cmd).await.map_err(|e| {
-            AppError::pipeline(format!("upload file to GPU server: {}", e))
-        })?;
+        session
+            .exec_blocking(&write_cmd)
+            .await
+            .map_err(|e| AppError::pipeline(format!("upload file to GPU server: {}", e)))?;
     } else {
         let temp_b64_path = format!("{}.b64", remote_path);
-        session.write_file(&temp_b64_path, &b64).await.map_err(|e| {
-            AppError::pipeline(format!("write_file base64 to GPU server: {}", e))
-        })?;
-        let decode_cmd = format!("base64 -d < \"{}\" > \"{}\" && rm -f \"{}\"", temp_b64_path, remote_path, temp_b64_path);
-        session.exec_blocking(&decode_cmd).await.map_err(|e| {
-            AppError::pipeline(format!("decode base64 on GPU server: {}", e))
-        })?;
+        session
+            .write_file(&temp_b64_path, &b64)
+            .await
+            .map_err(|e| AppError::pipeline(format!("write_file base64 to GPU server: {}", e)))?;
+        let decode_cmd = format!(
+            "base64 -d < \"{}\" > \"{}\" && rm -f \"{}\"",
+            temp_b64_path, remote_path, temp_b64_path
+        );
+        session
+            .exec_blocking(&decode_cmd)
+            .await
+            .map_err(|e| AppError::pipeline(format!("decode base64 on GPU server: {}", e)))?;
     }
 
     let container_name = "paddleocr-vl";
@@ -623,54 +656,87 @@ if __name__ == "__main__":
     ocr_pdf(sys.argv[1], sys.argv[2], sys.argv[3])"#;
 
         let script_path = format!("{}/pdf_ocr.py", remote_dir);
-        session.write_file(&script_path, python_script).await.map_err(|e| {
-            AppError::pipeline(format!("write pdf_ocr.py to GPU server: {}", e))
-        })?;
+        session
+            .write_file(&script_path, python_script)
+            .await
+            .map_err(|e| AppError::pipeline(format!("write pdf_ocr.py to GPU server: {}", e)))?;
 
         // Copy PDF and script into container using unique directory to avoid concurrent overrides
-        session.exec_blocking(&format!("docker exec {} mkdir -p \"/tmp/paddleocr_ingest/{}\"", container_name, uuid)).await?;
-        session.exec_blocking(&format!("docker cp \"{}\" \"{}:/tmp/paddleocr_ingest/{}/{}\"", remote_path, container_name, uuid, file_name)).await?;
-        session.exec_blocking(&format!("docker cp \"{}\" \"{}:/tmp/paddleocr_ingest/{}/pdf_ocr.py\"", script_path, container_name, uuid)).await?;
+        session
+            .exec_blocking(&format!(
+                "docker exec {} mkdir -p \"/tmp/paddleocr_ingest/{}\"",
+                container_name, uuid
+            ))
+            .await?;
+        session
+            .exec_blocking(&format!(
+                "docker cp \"{}\" \"{}:/tmp/paddleocr_ingest/{}/{}\"",
+                remote_path, container_name, uuid, file_name
+            ))
+            .await?;
+        session
+            .exec_blocking(&format!(
+                "docker cp \"{}\" \"{}:/tmp/paddleocr_ingest/{}/pdf_ocr.py\"",
+                script_path, container_name, uuid
+            ))
+            .await?;
 
         // Execute script
         let run_script_cmd = format!(
             "docker exec {} python3 \"/tmp/paddleocr_ingest/{}/pdf_ocr.py\" \"/tmp/paddleocr_ingest/{}/{}\" {} {}",
             container_name, uuid, uuid, file_name, ocr.port, ocr.model_name
         );
-        
+
         let mut line_buffer = String::new();
-        let r = session.exec_collect_stderr(&run_script_cmd, |data| {
-            if let Ok(s) = std::str::from_utf8(data) {
-                line_buffer.push_str(s);
-                while let Some(pos) = line_buffer.find('\n') {
-                    let line = line_buffer[..pos].trim().to_string();
-                    line_buffer = line_buffer[pos + 1..].to_string();
-                    if line.starts_with("PAGE_DONE:") {
-                        let parts: Vec<&str> = line["PAGE_DONE:".len()..].split('/').map(|p| p.trim()).collect();
-                        if parts.len() == 2 {
-                            if let (Ok(curr), Ok(tot)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
-                                on_progress("ocr_page", file_name, curr, tot);
+        let r = session
+            .exec_collect_stderr(&run_script_cmd, |data| {
+                if let Ok(s) = std::str::from_utf8(data) {
+                    line_buffer.push_str(s);
+                    while let Some(pos) = line_buffer.find('\n') {
+                        let line = line_buffer[..pos].trim().to_string();
+                        line_buffer = line_buffer[pos + 1..].to_string();
+                        if line.starts_with("PAGE_DONE:") {
+                            let parts: Vec<&str> = line["PAGE_DONE:".len()..]
+                                .split('/')
+                                .map(|p| p.trim())
+                                .collect();
+                            if parts.len() == 2 {
+                                if let (Ok(curr), Ok(tot)) =
+                                    (parts[0].parse::<u64>(), parts[1].parse::<u64>())
+                                {
+                                    on_progress("ocr_page", file_name, curr, tot);
+                                }
                             }
                         }
                     }
                 }
-            }
-        }).await.map_err(|e| AppError::ssh(e.to_string()))?;
+            })
+            .await
+            .map_err(|e| AppError::ssh(e.to_string()))?;
 
         // Clean up files in container and on host
-        let _ = session.exec_blocking(&format!("docker exec {} rm -rf \"/tmp/paddleocr_ingest/{}\"", container_name, uuid)).await;
-        let _ = session.exec_blocking(&format!("rm -rf \"{}\"", remote_dir)).await;
+        let _ = session
+            .exec_blocking(&format!(
+                "docker exec {} rm -rf \"/tmp/paddleocr_ingest/{}\"",
+                container_name, uuid
+            ))
+            .await;
+        let _ = session
+            .exec_blocking(&format!("rm -rf \"{}\"", remote_dir))
+            .await;
 
         if r.exit_code != 0 {
             return Err(AppError::pipeline(format!(
-                "PDF OCR script failed (exit {}): {}", r.exit_code, r.stderr
+                "PDF OCR script failed (exit {}): {}",
+                r.exit_code, r.stderr
             )));
         }
 
         let text = r.stdout.trim().to_string();
         if text.is_empty() {
             return Err(AppError::pipeline(format!(
-                "PaddleOCR returned empty text for PDF {}", path.display()
+                "PaddleOCR returned empty text for PDF {}",
+                path.display()
             )));
         }
         Ok(text)
@@ -691,30 +757,38 @@ if __name__ == "__main__":
             }]
         });
 
-        session.write_file(&req_json_path, &body.to_string()).await.map_err(|e| {
-            AppError::pipeline(format!("write ocr request body to GPU server: {}", e))
-        })?;
+        session
+            .write_file(&req_json_path, &body.to_string())
+            .await
+            .map_err(|e| {
+                AppError::pipeline(format!("write ocr request body to GPU server: {}", e))
+            })?;
 
         let curl_cmd = format!(
             "curl -s -X POST '{}' -H 'Content-Type: application/json' -d @\"{}\"",
-            ocr_url,
-            req_json_path
+            ocr_url, req_json_path
         );
         let r = session.exec_blocking(&curl_cmd).await.map_err(|e| {
             AppError::pipeline(format!("PaddleOCR OCR request on GPU server: {}", e))
         })?;
 
         // Clean up host temp files
-        let _ = session.exec_blocking(&format!("rm -rf \"{}\"", remote_dir)).await;
+        let _ = session
+            .exec_blocking(&format!("rm -rf \"{}\"", remote_dir))
+            .await;
 
         if r.exit_code != 0 {
             return Err(AppError::pipeline(format!(
-                "PaddleOCR curl failed (exit {}): {}", r.exit_code, r.stderr
+                "PaddleOCR curl failed (exit {}): {}",
+                r.exit_code, r.stderr
             )));
         }
 
         let v: Value = serde_json::from_str(&r.stdout).map_err(|e| {
-            AppError::pipeline(format!("PaddleOCR response parse error: {}, body was: {}", e, r.stdout))
+            AppError::pipeline(format!(
+                "PaddleOCR response parse error: {}, body was: {}",
+                e, r.stdout
+            ))
         })?;
 
         let text = v
@@ -728,7 +802,8 @@ if __name__ == "__main__":
 
         if text.is_empty() {
             return Err(AppError::pipeline(format!(
-                "PaddleOCR returned empty text for {}", path.display()
+                "PaddleOCR returned empty text for {}",
+                path.display()
             )));
         }
         Ok(text)
@@ -812,11 +887,7 @@ pub async fn embed_chunk(config: &EmbeddingConfig, text: &str) -> Result<Vec<f32
                 &config.model_id
             };
             let body = json!({ "model": model_name, "input": input });
-            let res = http()
-                .post(&url)
-                .json(&body)
-                .send()
-                .await?;
+            let res = http().post(&url).json(&body).send().await?;
             if !res.status().is_success() {
                 let s = res.status();
                 let txt = res.text().await.unwrap_or_default();
@@ -835,7 +906,8 @@ pub async fn embed_chunk(config: &EmbeddingConfig, text: &str) -> Result<Vec<f32
                 return Err(AppError::qdrant(format!("ollama embed http {s}: {txt}")));
             }
             let v: Value = res.json().await?;
-            let arr = v.get("embedding")
+            let arr = v
+                .get("embedding")
                 .and_then(|e| e.as_array())
                 .ok_or_else(|| AppError::qdrant("ollama: no embedding in response"))?;
             let mut vec: Vec<f32> = arr
@@ -850,7 +922,11 @@ pub async fn embed_chunk(config: &EmbeddingConfig, text: &str) -> Result<Vec<f32
         }
         EmbeddingProvider::Llamacpp => {
             let url = format!("{}/v1/embeddings", config.api_url.trim_end_matches('/'));
-            let model_name = if config.model_id.is_empty() { "default" } else { &config.model_id };
+            let model_name = if config.model_id.is_empty() {
+                "default"
+            } else {
+                &config.model_id
+            };
             let body = json!({ "model": model_name, "input": input });
             let res = http().post(&url).json(&body).send().await?;
             if !res.status().is_success() {
@@ -972,7 +1048,12 @@ pub async fn ingest_files(
         match embed_chunk(&embedding_config, "dimension probe").await {
             Ok(v) => v.len(),
             Err(e) => {
-                on_progress("warn", &format!("Could not probe embedding dim (using {TARGET_VECTOR_DIM}): {e}"), 0, 0);
+                on_progress(
+                    "warn",
+                    &format!("Could not probe embedding dim (using {TARGET_VECTOR_DIM}): {e}"),
+                    0,
+                    0,
+                );
                 TARGET_VECTOR_DIM
             }
         }
@@ -982,7 +1063,12 @@ pub async fn ingest_files(
     crate::qdrant::create_collection(&qdrant, &collection, probe_dim).await?;
 
     if let Err(e) = crate::qdrant::ensure_text_index(&qdrant, &collection, "tag").await {
-        on_progress("warn", &format!("payload index for 'tag' not created: {e}"), 0, 0);
+        on_progress(
+            "warn",
+            &format!("payload index for 'tag' not created: {e}"),
+            0,
+            0,
+        );
     }
 
     let total_files = files.len() as u64;
@@ -995,7 +1081,11 @@ pub async fn ingest_files(
     let results: Vec<FileResult> = stream::iter(files.into_iter())
         .map(|path_str| {
             let path = Path::new(&path_str).to_path_buf();
-            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            let file_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
             let file_path_str = path.to_string_lossy().to_string();
 
             let ocr = ocr.clone();
@@ -1022,7 +1112,14 @@ pub async fn ingest_files(
 
                 on_progress("read", &file_name, 0, 0);
 
-                let text = match read_file_text_with_ocr(&path, &ocr, ssh.as_ref().map(|s| s.as_ref()), &on_progress).await {
+                let text = match read_file_text_with_ocr(
+                    &path,
+                    &ocr,
+                    ssh.as_ref().map(|s| s.as_ref()),
+                    &on_progress,
+                )
+                .await
+                {
                     Ok(t) => t,
                     Err(e) => {
                         on_progress("error", &file_name, 0, 0);
@@ -1057,22 +1154,23 @@ pub async fn ingest_files(
                 let file_name_ref = &file_name;
                 let n_chunks_u64 = n_chunks;
 
-                let embedded: Vec<std::result::Result<(usize, String, Vec<f32>), (usize, String, AppError)>> =
-                    stream::iter(chunks.into_iter().enumerate().map(|(i, txt)| {
-                        let c = embedding_config.clone();
-                        async move {
-                            let res = embed_chunk_retrying(&c, &txt).await;
-                            let prev = embed_done_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            on_progress_ref("embed", file_name_ref, prev + 1, n_chunks_u64);
-                            match res {
-                                Ok(v) => Ok((i, txt, v)),
-                                Err(e) => Err((i, txt, e)),
-                            }
+                let embedded: Vec<
+                    std::result::Result<(usize, String, Vec<f32>), (usize, String, AppError)>,
+                > = stream::iter(chunks.into_iter().enumerate().map(|(i, txt)| {
+                    let c = embedding_config.clone();
+                    async move {
+                        let res = embed_chunk_retrying(&c, &txt).await;
+                        let prev = embed_done_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        on_progress_ref("embed", file_name_ref, prev + 1, n_chunks_u64);
+                        match res {
+                            Ok(v) => Ok((i, txt, v)),
+                            Err(e) => Err((i, txt, e)),
                         }
-                    }))
-                    .buffer_unordered(chunk_concurrency)
-                    .collect()
-                    .await;
+                    }
+                }))
+                .buffer_unordered(chunk_concurrency)
+                .collect()
+                .await;
 
                 if cancel.load(Ordering::SeqCst) || cancelled_flag.load(Ordering::SeqCst) {
                     cancelled_flag.store(true, Ordering::SeqCst);
@@ -1126,7 +1224,14 @@ pub async fn ingest_files(
                         cancelled_flag.store(true, Ordering::SeqCst);
                         break;
                     }
-                    match upsert_batch_to_collection(&endpoint, &api_key, &collection, batch.to_vec()).await {
+                    match upsert_batch_to_collection(
+                        &endpoint,
+                        &api_key,
+                        &collection,
+                        batch.to_vec(),
+                    )
+                    .await
+                    {
                         Ok(()) => {
                             done += batch.len() as u64;
                             on_progress("upsert", &file_name, done, n_chunks);
@@ -1141,13 +1246,25 @@ pub async fn ingest_files(
                 let err_msg = if let Some(u) = upsert_err {
                     Some(format!("upsert failed after {} chunks: {}", done, u))
                 } else if !embed_errors.is_empty() && done < ok_count {
-                    Some(format!("{} chunk embed errors; first: {}", embed_errors.len(), embed_errors[0]))
+                    Some(format!(
+                        "{} chunk embed errors; first: {}",
+                        embed_errors.len(),
+                        embed_errors[0]
+                    ))
                 } else if !embed_errors.is_empty() {
-                    Some(format!("{} chunks failed to embed (rest ingested)", embed_errors.len()))
+                    Some(format!(
+                        "{} chunks failed to embed (rest ingested)",
+                        embed_errors.len()
+                    ))
                 } else {
                     None
                 };
-                on_progress(if err_msg.is_some() { "error" } else { "done" }, &file_name, done, n_chunks);
+                on_progress(
+                    if err_msg.is_some() { "error" } else { "done" },
+                    &file_name,
+                    done,
+                    n_chunks,
+                );
 
                 FileResult {
                     file_path: file_path_str,

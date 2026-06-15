@@ -1,7 +1,9 @@
 import React, { useEffect, useState } from "react";
-import { ChevronRight, Plus, RefreshCw, Trash2 } from "lucide-react";
 import type { LoraConfig, MatchedGuideInfo } from "../types";
 import { api } from "../lib/tauri";
+import { METHOD_OPTIONS, methodInfo } from "../method";
+import type { FineTuneMethod } from "../method";
+import { ChevronRight, Plus, RefreshCw, Trash2 } from "lucide-react";
 
 export interface StudentModelOption {
   id: string;
@@ -34,205 +36,10 @@ export default function TrainingConfigForm({
 }: Props) {
   const set = <K extends keyof LoraConfig>(k: K, v: LoraConfig[K]) =>
     onChange({ ...value, [k]: v });
-  const method = value.method || "lora";
-  const methodCopy: Record<"lora" | "qlora" | "unsloth" | "full" | "freeze" | "dora" | "loraplus" | "pissa" | "galore" | "badam" | "grpo" | "zrald" | "zrald_offline" | "custom", {
-    title: string;
-    detail: string;
-    rankLabel: string;
-    alphaLabel: string;
-    dropoutLabel: string;
-    learningLabel: string;
-    batchLabel: string;
-    accumLabel: string;
-    cutoffLabel: string;
-    saveLabel: string;
-    note: string;
-  }> = {
-    lora: {
-      title: "LoRA adapter training",
-      detail: "Trains standard low-rank adapters with the base model loaded normally.",
-      rankLabel: "LoRA Rank (r)",
-      alphaLabel: "LoRA Alpha",
-      dropoutLabel: "LoRA Dropout",
-      learningLabel: "LoRA Learning Rate",
-      batchLabel: "Batch Size",
-      accumLabel: "Grad Accum Steps",
-      cutoffLabel: "Context Cutoff Length",
-      saveLabel: "Save Steps (ckpt + hub push)",
-      note: "Standard LoRA keeps VRAM use moderate and works broadly across supported LLaMA-Factory models.",
-    },
-    qlora: {
-      title: "QLoRA 4-bit adapter training",
-      detail: "Loads the base model in 4-bit with bitsandbytes (multi-backend wheel), then trains LoRA adapters.",
-      rankLabel: "QLoRA Rank (r)",
-      alphaLabel: "QLoRA Alpha",
-      dropoutLabel: "QLoRA Dropout",
-      learningLabel: "QLoRA Learning Rate",
-      batchLabel: "4-bit Batch Size",
-      accumLabel: "4-bit Grad Accum",
-      cutoffLabel: "4-bit Context Cutoff",
-      saveLabel: "Checkpoint Push Steps",
-      note: "Installs bitsandbytes>=0.45 multi-backend on ROCm. gfx942 (MI300X) is officially supported; gfx1100 is experimental.",
-    },
-    unsloth: {
-      title: "Unsloth accelerated LoRA",
-      detail: "Adds use_unsloth: true to LLaMA-Factory. ROCm-only install path: unsloth --no-deps + pinned peft/trl/accelerate.",
-      rankLabel: "Unsloth LoRA Rank (r)",
-      alphaLabel: "Unsloth LoRA Alpha",
-      dropoutLabel: "Unsloth Dropout",
-      learningLabel: "Unsloth Learning Rate",
-      batchLabel: "Unsloth Batch Size",
-      accumLabel: "Unsloth Grad Accum",
-      cutoffLabel: "Unsloth Max Seq Length",
-      saveLabel: "Unsloth Save Steps",
-      note: "Unsloth on ROCm is community-supported. MI300X (gfx942) is best-tested; gfx1100 may hit Triton-kernel issues.",
-    },
-    full: {
-      title: "Full parameter fine-tuning",
-      detail: "Trains all model weights with finetuning_type: full.",
-      rankLabel: "Unused Rank",
-      alphaLabel: "Unused Alpha",
-      dropoutLabel: "Unused Dropout",
-      learningLabel: "Full Fine-tune LR",
-      batchLabel: "Full Batch Size",
-      accumLabel: "Full Grad Accum",
-      cutoffLabel: "Full Cutoff Length",
-      saveLabel: "Full Checkpoint Steps",
-      note: "Full fine-tuning needs much more VRAM and storage because all model weights are trainable.",
-    },
-    freeze: {
-      title: "Freeze tuning",
-      detail: "Trains selected upper layers with finetuning_type: freeze.",
-      rankLabel: "Unused Rank",
-      alphaLabel: "Unused Alpha",
-      dropoutLabel: "Unused Dropout",
-      learningLabel: "Freeze Learning Rate",
-      batchLabel: "Freeze Batch Size",
-      accumLabel: "Freeze Grad Accum",
-      cutoffLabel: "Freeze Cutoff Length",
-      saveLabel: "Freeze Save Steps",
-      note: "Freeze tuning trains part of the base model and sits between LoRA and full fine-tuning.",
-    },
-    dora: {
-      title: "DoRA adapter training",
-      detail: "Uses LoRA with use_dora enabled for magnitude-aware adapter updates.",
-      rankLabel: "DoRA Rank (r)",
-      alphaLabel: "DoRA Alpha",
-      dropoutLabel: "DoRA Dropout",
-      learningLabel: "DoRA Learning Rate",
-      batchLabel: "DoRA Batch Size",
-      accumLabel: "DoRA Grad Accum",
-      cutoffLabel: "DoRA Cutoff Length",
-      saveLabel: "DoRA Save Steps",
-      note: "DoRA is a LoRA variant, so adapter merge/upload works like regular LoRA.",
-    },
-    loraplus: {
-      title: "LoRA+ adapter training",
-      detail: "Uses LoRA with LoRA+ learning-rate ratio enabled.",
-      rankLabel: "LoRA+ Rank (r)",
-      alphaLabel: "LoRA+ Alpha",
-      dropoutLabel: "LoRA+ Dropout",
-      learningLabel: "LoRA+ Base LR",
-      batchLabel: "LoRA+ Batch Size",
-      accumLabel: "LoRA+ Grad Accum",
-      cutoffLabel: "LoRA+ Cutoff Length",
-      saveLabel: "LoRA+ Save Steps",
-      note: "LoRA+ uses separate adapter learning-rate scaling while keeping normal LoRA outputs.",
-    },
-    pissa: {
-      title: "PiSSA initialized LoRA",
-      detail: "Uses LoRA with PiSSA SVD-based initialization; folds the residual into the adapter at save time.",
-      rankLabel: "PiSSA Rank (r)",
-      alphaLabel: "PiSSA Alpha",
-      dropoutLabel: "PiSSA Dropout",
-      learningLabel: "PiSSA Learning Rate",
-      batchLabel: "PiSSA Batch Size",
-      accumLabel: "PiSSA Grad Accum",
-      cutoffLabel: "PiSSA Cutoff Length",
-      saveLabel: "PiSSA Save Steps",
-      note: "Emits pissa_init + pissa_iter=16 + pissa_convert=true. Saved adapter format matches plain LoRA.",
-    },
-    galore: {
-      title: "GaLore full tuning",
-      detail: "Full fine-tune with GaLore low-rank gradient projection. Memory close to LoRA, ~30% slower per step.",
-      rankLabel: "Unused Rank",
-      alphaLabel: "Unused Alpha",
-      dropoutLabel: "Unused Dropout",
-      learningLabel: "GaLore Learning Rate",
-      batchLabel: "GaLore Batch Size",
-      accumLabel: "GaLore Grad Accum",
-      cutoffLabel: "GaLore Cutoff Length",
-      saveLabel: "GaLore Save Steps",
-      note: "Layerwise mode + pure_bf16; works on ROCm (pure PyTorch). Use Grad Accum = 1 with layerwise GaLore.",
-    },
-    badam: {
-      title: "BAdam full tuning",
-      detail: "Full fine-tune with block-wise Adam updating one layer block at a time. Lower peak VRAM than full Adam.",
-      rankLabel: "Unused Rank",
-      alphaLabel: "Unused Alpha",
-      dropoutLabel: "Unused Dropout",
-      learningLabel: "BAdam Learning Rate",
-      batchLabel: "BAdam Batch Size",
-      accumLabel: "BAdam Grad Accum",
-      cutoffLabel: "BAdam Cutoff Length",
-      saveLabel: "BAdam Save Steps",
-      note: "Installs `badam` from PyPI. Layer mode + ascending switch + interval 50. ROCm-compatible (pure PyTorch).",
-    },
-    grpo: {
-      title: "GRPO reinforcement learning",
-      detail: "Group Relative Policy Optimization via unsloth's GRPOTrainer. Trains LoRA adapters with reward feedback.",
-      rankLabel: "GRPO Rank (r)",
-      alphaLabel: "GRPO Alpha",
-      dropoutLabel: "GRPO Dropout",
-      learningLabel: "GRPO Learning Rate",
-      batchLabel: "GRPO Batch Size",
-      accumLabel: "GRPO Grad Accum",
-      cutoffLabel: "GRPO Max Seq Length",
-      saveLabel: "GRPO Save Steps",
-      note: "GRPO via unsloth's GRPOTrainer. Uses reward functions for code/game-strategy tasks. ROCm-supported on MI300X.",
-    },
-    zrald: {
-      title: "ZRALD RAG reward learning",
-      detail: "Zero-shot Retrieval-Augmented Learning with Dynamic rewards. The RAG teacher builds questions, the student samples four answers, and a reward teacher scores them for GRPO.",
-      rankLabel: "ZRALD LoRA Rank (r)",
-      alphaLabel: "ZRALD LoRA Alpha",
-      dropoutLabel: "ZRALD Dropout",
-      learningLabel: "ZRALD Learning Rate",
-      batchLabel: "ZRALD Prompt Batch",
-      accumLabel: "ZRALD Grad Accum",
-      cutoffLabel: "ZRALD Max Seq Length",
-      saveLabel: "ZRALD Save Steps",
-      note: "Uses the generated RAG question pool, fixed before/after benchmarks, four sampled completions per prompt, and reward-teacher scores clamped from -1 to 1.",
-    },
-    zrald_offline: {
-      title: "ZRALD Offline preference distillation",
-      detail: "Low-VRAM ZRALD. The teacher generates RAG Q&A, unloads, the student writes four answers per question, unloads, then the teacher reloads to score saved answers before student-only adapter training.",
-      rankLabel: "Offline ZRALD LoRA Rank (r)",
-      alphaLabel: "Offline ZRALD LoRA Alpha",
-      dropoutLabel: "Offline ZRALD Dropout",
-      learningLabel: "Offline ZRALD Learning Rate",
-      batchLabel: "Offline ZRALD Batch",
-      accumLabel: "Offline ZRALD Grad Accum",
-      cutoffLabel: "Offline ZRALD Max Seq Length",
-      saveLabel: "Offline ZRALD Save Steps",
-      note: "Teacher and student are never intentionally kept in VRAM together. The student does not see Qdrant/RAG context while answering; the teacher scores saved answers against stored RAG context.",
-    },
-    custom: {
-      title: value.customMethodName?.trim() || "Custom command method",
-      detail: "Runs your saved shell commands in sequence on the remote training node.",
-      rankLabel: "Custom Rank",
-      alphaLabel: "Custom Alpha",
-      dropoutLabel: "Custom Dropout",
-      learningLabel: "Custom Learning Rate",
-      batchLabel: "Custom Batch Size",
-      accumLabel: "Custom Grad Accum",
-      cutoffLabel: "Custom Cutoff Length",
-      saveLabel: "Custom Save Steps",
-      note: "Commands run from the run directory. Write adapter outputs to $OUTPUT_DIR for built-in upload and merge support.",
-    },
-  };
-  const copy = methodCopy[method];
-  const usesAdapterFields = !["full", "freeze", "galore", "badam", "custom"].includes(method);
+  const method: FineTuneMethod = value.method || "lora";
+  const selectedMethod = methodInfo(method, value.customMethodName);
+  const copy = selectedMethod.copy;
+  const usesAdapterFields = selectedMethod.usesAdapterFields;
   const customCommands = value.customCommands?.length ? value.customCommands : [""];
   const mergedOptions = studentModelOptions.filter((o) => o.source === "merged");
   const hfOptions = studentModelOptions.filter((o) => o.source === "hf");
@@ -379,22 +186,7 @@ export default function TrainingConfigForm({
           </label>
         </div>
         <div className="grid grid-cols-2 xl:grid-cols-4 gap-3">
-          {[
-            ["lora", "LoRA", "Adapter weights"],
-            ["qlora", "QLoRA", "4-bit quant"],
-            ["unsloth", "Unsloth", "Fast inference"],
-            ["full", "Full", "All weights"],
-            ["freeze", "Freeze", "Selective layers"],
-            ["dora", "DoRA", "Magnitude LoRA"],
-            ["loraplus", "LoRA+", "LR multiplier"],
-            ["pissa", "PiSSA", "SVD init"],
-            ["galore", "GaLore", "Memory efficient"],
-            ["badam", "BAdam", "Block-wise Adam"],
-            ["grpo", "GRPO", "Reinforcement RL"],
-            ["zrald", "ZRALD", "RAG reward RL"],
-            ["zrald_offline", "ZRALD Offline", "Low-VRAM reward"],
-            ["custom", "Add +", "Command chain"],
-          ].map(([key, label, desc]) => {
+          {METHOD_OPTIONS.map(({ key, label, desc }) => {
             const active = method === key;
             return (
               <button

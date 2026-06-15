@@ -604,6 +604,9 @@ export interface RunConfig {
   generateOnly?: boolean;
   /** Which provider supplies the Teacher API. Defaults to "vllm" if missing. */
   teacherProvider?: "vllm";
+  enableVerification?: boolean;
+  bundleWindow?: number;
+  datasetFormat?: string;
 }
 
 /** Result of `hf_whoami` — used to prefill repo-id placeholders. */

@@ -17,6 +17,7 @@ pub mod hf;
 pub mod ingest;
 pub mod llamafactory;
 pub mod manifest;
+pub mod method;
 pub mod pipeline;
 pub mod qdrant;
 pub mod research;

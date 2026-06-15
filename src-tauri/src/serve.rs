@@ -140,7 +140,12 @@ pub async fn launch_embedder(
     if cfg.enabled {
         let inner = format!("docker ps --format '{{{{.Names}}}}'");
         if let Ok(r) = session.exec_blocking(&inner).await {
-            for cname in r.stdout.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+            for cname in r
+                .stdout
+                .lines()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
                 let inner_kill = wrap_docker_cmd(&pkill_body, &cname);
                 let _ = session.exec_blocking(&inner_kill).await;
             }
@@ -153,7 +158,8 @@ pub async fn launch_embedder(
                      export VLLM_USE_DEEP_GEMM=0; \
                      export GLOO_SOCKET_IFNAME=lo; \
                      export NCCL_SOCKET_IFNAME=lo; \
-                     export VLLM_HOST_IP=127.0.0.1; ".to_string();
+                     export VLLM_HOST_IP=127.0.0.1; "
+            .to_string();
         if let Some(tok) = hf_token.filter(|s| !s.is_empty()) {
             e.push_str(&format!(
                 "export HF_TOKEN={} HUGGING_FACE_HUB_TOKEN={}; ",
@@ -257,17 +263,28 @@ pub async fn wait_for_embedder(
 
         // Stream new log lines of the embedder process to the UI callback
         let count_cmd = if cfg.enabled {
-            wrap_docker_cmd(&format!("wc -l /root/embedder_{}.log 2>/dev/null", port), &cfg.container_name)
+            wrap_docker_cmd(
+                &format!("wc -l /root/embedder_{}.log 2>/dev/null", port),
+                &cfg.container_name,
+            )
         } else {
             format!("wc -l /root/embedder_{}.log 2>/dev/null", port)
         };
 
         if let Ok(count_res) = session.exec_blocking(&count_cmd).await {
-            let first_token = count_res.stdout.trim().split_whitespace().next().unwrap_or("0");
+            let first_token = count_res
+                .stdout
+                .trim()
+                .split_whitespace()
+                .next()
+                .unwrap_or("0");
             if let Ok(total_lines) = first_token.parse::<usize>() {
                 if total_lines > printed_lines {
                     let read_cmd = if cfg.enabled {
-                        wrap_docker_cmd(&format!("tail -n +{} /root/embedder_{}.log", printed_lines + 1, port), &cfg.container_name)
+                        wrap_docker_cmd(
+                            &format!("tail -n +{} /root/embedder_{}.log", printed_lines + 1, port),
+                            &cfg.container_name,
+                        )
                     } else {
                         format!("tail -n +{} /root/embedder_{}.log", printed_lines + 1, port)
                     };
@@ -318,11 +335,22 @@ pub async fn boot_embedder(
     _gpu_memory_utilization: f32,
     on_log: Option<&(dyn Fn(String) + Send + Sync)>,
 ) -> Result<String> {
-    launch_embedder(session, cfg, embedder, hf_token, Some(_gpu_memory_utilization as f64)).await?;
+    launch_embedder(
+        session,
+        cfg,
+        embedder,
+        hf_token,
+        Some(_gpu_memory_utilization as f64),
+    )
+    .await?;
     wait_for_embedder(session, cfg, embedder, 20 * 60, on_log).await
 }
 
-pub async fn embed_text(api_url: &str, model_id: &str, text: &str) -> crate::error::Result<Vec<f32>> {
+pub async fn embed_text(
+    api_url: &str,
+    model_id: &str,
+    text: &str,
+) -> crate::error::Result<Vec<f32>> {
     use crate::ingest::{normalize_vector, MAX_CHARS_PER_EMBED};
     let input: String = text.chars().take(MAX_CHARS_PER_EMBED).collect();
     let body = serde_json::json!({
@@ -337,9 +365,10 @@ pub async fn embed_text(api_url: &str, model_id: &str, text: &str) -> crate::err
             .build()
             .unwrap()
     });
-    let res = client.post(&url).json(&body).send().await.map_err(|e| {
-        crate::error::AppError::pipeline(format!("embed request failed: {}", e))
-    })?;
+    let res =
+        client.post(&url).json(&body).send().await.map_err(|e| {
+            crate::error::AppError::pipeline(format!("embed request failed: {}", e))
+        })?;
     if !res.status().is_success() {
         let s = res.status();
         let txt = res.text().await.unwrap_or_default();
@@ -347,9 +376,10 @@ pub async fn embed_text(api_url: &str, model_id: &str, text: &str) -> crate::err
             "embed http {s}: {txt}"
         )));
     }
-    let v: serde_json::Value = res.json().await.map_err(|e| {
-        crate::error::AppError::pipeline(format!("embed JSON parse failed: {}", e))
-    })?;
+    let v: serde_json::Value = res
+        .json()
+        .await
+        .map_err(|e| crate::error::AppError::pipeline(format!("embed JSON parse failed: {}", e)))?;
     let arr = v
         .get("data")
         .and_then(|d| d.get(0))
@@ -389,7 +419,9 @@ pub async fn boot_paddleocr(
     let port = paddle.port;
     let container_name = "paddleocr-vl";
 
-    let already = health_check_paddleocr(session, cfg, port).await.unwrap_or(false);
+    let already = health_check_paddleocr(session, cfg, port)
+        .await
+        .unwrap_or(false);
     if already {
         if let Some(ref cb) = on_log {
             cb("[paddleocr] already running\n".to_string());
@@ -403,7 +435,10 @@ pub async fn boot_paddleocr(
         ));
     }
 
-    let cleanup = format!("docker stop {} 2>/dev/null; docker rm {} 2>/dev/null; true", container_name, container_name);
+    let cleanup = format!(
+        "docker stop {} 2>/dev/null; docker rm {} 2>/dev/null; true",
+        container_name, container_name
+    );
     let _ = session.exec_blocking(&cleanup).await;
 
     let vllm_cfg_content = r#"tensor_parallel_size: 1
@@ -416,15 +451,19 @@ max_num_seqs: 8
     if let Some(ref cb) = on_log {
         cb("[paddleocr] uploading vLLM config...\n".to_string());
     }
-    session.write_file("/root/vllm_config.yml", vllm_cfg_content).await.map_err(|e| {
-        AppError::pipeline(format!("write vllm_config.yml to GPU server: {}", e))
-    })?;
+    session
+        .write_file("/root/vllm_config.yml", vllm_cfg_content)
+        .await
+        .map_err(|e| AppError::pipeline(format!("write vllm_config.yml to GPU server: {}", e)))?;
 
     // Pull the image explicitly (with up to 3 retries) before docker run.
     // This avoids the cryptic "exit -1" that occurs when docker run is killed
     // mid-pull by the OOM killer or a network interruption.
     if let Some(ref cb) = on_log {
-        cb(format!("[paddleocr] pulling image {} (this may take several minutes)...\n", paddle.docker_image));
+        cb(format!(
+            "[paddleocr] pulling image {} (this may take several minutes)...\n",
+            paddle.docker_image
+        ));
     }
     let pull_cmd = format!("docker pull {}", paddle.docker_image);
     let mut pull_ok = false;
@@ -443,13 +482,18 @@ max_num_seqs: 8
                 if let Some(ref cb) = on_log {
                     cb(format!(
                         "[paddleocr] pull attempt {} failed (exit {}): {}\n",
-                        attempt, r.exit_code, r.stderr.trim()
+                        attempt,
+                        r.exit_code,
+                        r.stderr.trim()
                     ));
                 }
             }
             Err(e) => {
                 if let Some(ref cb) = on_log {
-                    cb(format!("[paddleocr] pull attempt {} error: {}\n", attempt, e));
+                    cb(format!(
+                        "[paddleocr] pull attempt {} error: {}\n",
+                        attempt, e
+                    ));
                 }
             }
         }
@@ -492,11 +536,7 @@ max_num_seqs: 8
            --port {} \
            --backend vllm \
            --backend_config /home/paddleocr/vllm_config.yml",
-        container_name,
-        home,
-        paddle.docker_image,
-        paddle.model_name,
-        port,
+        container_name, home, paddle.docker_image, paddle.model_name, port,
     );
 
     let r = session.exec_blocking(&run_cmd).await?;
@@ -506,7 +546,6 @@ max_num_seqs: 8
             r.exit_code, r.stderr
         )));
     }
-
 
     if let Some(ref cb) = on_log {
         cb("[paddleocr] container started, waiting for init...\n".to_string());
@@ -519,16 +558,23 @@ max_num_seqs: 8
     loop {
         if started.elapsed() > timeout {
             return Err(AppError::pipeline(format!(
-                "PaddleOCR boot timeout (20 min) on port {}", port
+                "PaddleOCR boot timeout (20 min) on port {}",
+                port
             )));
         }
 
         if let Some(ref cb) = on_log {
             let elapsed = started.elapsed().as_secs();
-            cb(format!("[paddleocr] waiting for vLLM ready... ({}s elapsed)\n", elapsed));
+            cb(format!(
+                "[paddleocr] waiting for vLLM ready... ({}s elapsed)\n",
+                elapsed
+            ));
         }
 
-        if health_check_paddleocr(session, cfg, port).await.unwrap_or(false) {
+        if health_check_paddleocr(session, cfg, port)
+            .await
+            .unwrap_or(false)
+        {
             if let Some(ref cb) = on_log {
                 cb("[paddleocr] vLLM server ready!\n".to_string());
             }

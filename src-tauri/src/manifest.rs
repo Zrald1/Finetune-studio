@@ -62,7 +62,11 @@ pub async fn publish(mut manifest: ModelManifest) -> Result<ManifestStore> {
     manifest.previous_version = store.current_version.clone();
     store.current_version = Some(manifest.version.clone());
     // replace any existing manifest with the same version, else append
-    if let Some(slot) = store.manifests.iter_mut().find(|m| m.version == manifest.version) {
+    if let Some(slot) = store
+        .manifests
+        .iter_mut()
+        .find(|m| m.version == manifest.version)
+    {
         *slot = manifest;
     } else {
         store.manifests.push(manifest);

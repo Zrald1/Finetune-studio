@@ -136,7 +136,30 @@ pub fn normalize_runtime_defaults(cfg: &mut AppConfig) {
     if cfg.qdrant.collection.trim().is_empty() {
         cfg.qdrant.collection = "all".to_string();
     }
+    if looks_like_non_teacher_service_model(&cfg.teacher.repo_id) {
+        let default_teacher = TeacherConfig::default();
+        cfg.teacher.repo_id = default_teacher.repo_id;
+        if cfg.teacher.vllm_port == cfg.paddle_ocr.port || cfg.teacher.vllm_port == 8118 {
+            cfg.teacher.vllm_port = default_teacher.vllm_port;
+        }
+    }
     normalize_embedders(&mut cfg.embedders);
+}
+
+fn looks_like_non_teacher_service_model(model_id: &str) -> bool {
+    let id = model_id.trim().to_lowercase();
+    !id.is_empty()
+        && [
+            "paddleocr",
+            "paddle-ocr",
+            "paddle_ocr",
+            "paddleocr-vl",
+            "paddleocr-vl-1.6-0.9b",
+            "embedding",
+            "jina-embeddings",
+        ]
+        .iter()
+        .any(|marker| id.contains(marker))
 }
 
 impl EmbedderConfig {
@@ -295,7 +318,11 @@ impl TeacherConfig {
         }
         if self.enable_auto_tool_choice {
             args.push("--enable-auto-tool-choice".to_string());
-            if let Some(parser) = self.tool_call_parser.as_ref().filter(|s| !s.trim().is_empty()) {
+            if let Some(parser) = self
+                .tool_call_parser
+                .as_ref()
+                .filter(|s| !s.trim().is_empty())
+            {
                 args.push(format!("--tool-call-parser {}", parser.trim()));
             }
         }
@@ -311,7 +338,6 @@ impl TeacherConfig {
         }
         prepare
     }
-
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -512,7 +538,7 @@ pub struct AppConfig {
     pub digital_ocean: DigitalOceanConfig,
     pub qdrant: QdrantConfig,
     pub hf_token: Option<String>,
-/// Deprecated: Featherless cloud embedding/teacher was removed in favour of
+    /// Deprecated: Featherless cloud embedding/teacher was removed in favour of
     /// self-hosted vLLM embedders on the GPU server. Kept here only so existing
     /// config.json files (which still carry this key) continue to parse. Never
     /// read, never written.
@@ -550,8 +576,7 @@ pub fn app_dir() -> Result<PathBuf> {
             return Ok(PathBuf::from(dir));
         }
     }
-    let base = dirs::config_dir()
-        .ok_or_else(|| AppError::config("no OS config dir available"))?;
+    let base = dirs::config_dir().ok_or_else(|| AppError::config("no OS config dir available"))?;
     Ok(base.join("fine-tune"))
 }
 

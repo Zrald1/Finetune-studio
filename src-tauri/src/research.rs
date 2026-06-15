@@ -38,9 +38,19 @@ pub struct ResearchPacket {
 }
 
 const DANGEROUS_TERMS: &[&str] = &[
-    "weapon", "firearm", "explosive", "bomb", "ammunition", "detonator",
-    "improvised explosive", "nerve agent", "bioweapon", "meth synthesis",
-    "how to kill", "self-harm", "suicide method",
+    "weapon",
+    "firearm",
+    "explosive",
+    "bomb",
+    "ammunition",
+    "detonator",
+    "improvised explosive",
+    "nerve agent",
+    "bioweapon",
+    "meth synthesis",
+    "how to kill",
+    "self-harm",
+    "suicide method",
 ];
 
 fn http() -> Client {

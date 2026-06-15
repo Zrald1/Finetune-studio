@@ -37,6 +37,36 @@ Throughout, you get **live logs, kept/scanned/rejected counters, a dataset previ
 
 ---
 
+## ZRALD post-training
+
+Fine-Tune Studio includes an experimental ZRALD workflow:
+**Zero-shot Retrieval-Augmented Learning with Dynamic rewards**.
+
+ZRALD extends the normal RAG dataset pipeline into a teacher-student
+post-training loop. A teacher model reads retrieved source chunks, generates
+grounded questions and reference answers, and later scores student answers
+against the stored source context. The selected answers become supervised
+training examples for a smaller student model.
+
+Two ZRALD paths are maintained:
+
+- **ZRALD Online:** keeps the reward teacher available during student training
+  when enough VRAM is available.
+- **ZRALD Offline:** stages teacher generation, student candidate generation,
+  teacher scoring, and student LoRA training separately so a single AMD ROCm
+  GPU can run the workflow without keeping teacher and student models loaded at
+  the same time.
+
+Current focus: validating dataset generation quality and moving the staged
+ZRALD Offline loop into repeatable post-training experiments on AMD ROCm GPU
+droplets.
+
+See [../method.md](../method.md) and
+[../docs/AMD-GPU-Credit-Request.md](../docs/AMD-GPU-Credit-Request.md) for the
+technical method notes and AMD GPU credit request narrative.
+
+---
+
 ## Architecture
 
 ```

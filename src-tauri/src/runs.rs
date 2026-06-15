@@ -270,6 +270,8 @@ pub struct Run {
     pub prompt_template: Option<String>,
     #[serde(default)]
     pub topics: Vec<TopicTarget>,
+    #[serde(default)]
+    pub dataset_format: Option<crate::generator::DatasetFormat>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -321,6 +323,7 @@ impl Run {
             auto_destroy: false,
             prompt_template: None,
             topics: vec![],
+            dataset_format: None,
         }
     }
 }

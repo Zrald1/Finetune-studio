@@ -132,7 +132,10 @@ async fn robot_capture(
         });
     }
 
-    (StatusCode::ACCEPTED, Json(json!({ "captureId": capture.id, "status": capture.status })))
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({ "captureId": capture.id, "status": capture.status })),
+    )
         .into_response()
 }
 
