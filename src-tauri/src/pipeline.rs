@@ -86,6 +86,61 @@ pub(crate) fn extract_model_and_port(
     (model, port)
 }
 
+/// Resolve a GGUF *repo* to a concrete local `.gguf` file path on the GPU
+/// server. vLLM cannot serve a bare GGUF repo (it has no `config.json`); it must
+/// be pointed at an actual `.gguf` file. This runs `huggingface_hub` inside the
+/// container to list the repo's `.gguf` files, pick one (preferring `model.gguf`
+/// — the name this app uploads — then the largest), download it into the HF
+/// cache, and return the cached path. Returns `None` if resolution fails, so the
+/// caller can fall back to the raw repo id and surface vLLM's own error.
+pub async fn resolve_gguf_model_path(
+    session: &SshSession,
+    docker_enabled: bool,
+    container_name: &str,
+    repo_id: &str,
+    hf_token: Option<&str>,
+) -> Option<String> {
+    let token_export = hf_token
+        .filter(|s| !s.is_empty())
+        .map(|t| format!("export HF_TOKEN={}; export HUGGING_FACE_HUB_TOKEN={}; ", sh_quote(t), sh_quote(t)))
+        .unwrap_or_default();
+
+    // Python: list .gguf files, choose model.gguf > largest, download, print path.
+    let py = format!(
+        "import sys\n\
+         from huggingface_hub import HfApi, hf_hub_download\n\
+         repo = {repo}\n\
+         try:\n\
+         \x20   api = HfApi()\n\
+         \x20   files = [f for f in api.list_repo_files(repo) if f.lower().endswith('.gguf')]\n\
+         \x20   if not files:\n\
+         \x20       print('NO_GGUF'); sys.exit(0)\n\
+         \x20   pick = 'model.gguf' if 'model.gguf' in files else sorted(files)[0]\n\
+         \x20   path = hf_hub_download(repo_id=repo, filename=pick)\n\
+         \x20   print('GGUF_PATH::' + path)\n\
+         except Exception as e:\n\
+         \x20   print('GGUF_ERROR::' + str(e))\n",
+        repo = serde_json::to_string(repo_id).unwrap_or_else(|_| "\"\"".to_string()),
+    );
+    let inner = format!("{token_export}python3 -c {}", sh_quote(&py));
+    let cmd = if docker_enabled {
+        wrap_docker_cmd(&inner, container_name)
+    } else {
+        inner
+    };
+
+    let r = session.exec_blocking(&cmd).await.ok()?;
+    for line in r.stdout.lines().map(str::trim) {
+        if let Some(path) = line.strip_prefix("GGUF_PATH::") {
+            let p = path.trim();
+            if !p.is_empty() {
+                return Some(p.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn is_zrald_method(method: &str) -> bool {
     method::is_zrald_method(method)
 }
@@ -1670,30 +1725,44 @@ else: print('NOT_FOUND')\
                         )
                     }
                 } else {
-                    // Guess the base model for GGUF files to load compatible tokenizer from HF
+                    // GGUF repos have no config.json, so vLLM can't load them by
+                    // repo id. Resolve the actual .gguf file on the server and
+                    // serve that, using the base model for tokenizer + hf-config.
                     let mut tokenizer_arg = String::new();
-                    let repo_id_lower = t.repo_id.to_lowercase();
-                    if repo_id_lower.contains("gguf") {
-                        let parts: Vec<&str> = t.repo_id.split('/').collect();
-                        let base_repo = if parts.len() >= 2 {
-                            format!(
-                                "{}/{}",
-                                parts[0],
-                                parts[1].split(':').next().unwrap_or(parts[1])
-                            )
-                        } else {
-                            t.repo_id
-                                .split(':')
-                                .next()
-                                .unwrap_or(&t.repo_id)
-                                .to_string()
-                        };
-                        let base_model = base_repo
-                            .replace("-GGUF", "")
-                            .replace("-gguf", "")
-                            .replace(".GGUF", "")
-                            .replace(".gguf", "");
-                        tokenizer_arg = format!("--tokenizer {}", base_model);
+                    let mut model_arg = t.repo_id.clone();
+                    if t.is_gguf() {
+                        let base_model = t.gguf_base_model();
+                        tokenizer_arg = format!(
+                            "--tokenizer {} --hf-config-path {}",
+                            base_model, base_model
+                        );
+                        match resolve_gguf_model_path(
+                            session,
+                            docker_cfg.enabled,
+                            &container_name,
+                            &t.repo_id,
+                            cfg.hf_token.as_deref(),
+                        )
+                        .await
+                        {
+                            Some(local_path) => {
+                                emit_log(
+                                    app,
+                                    &run.id,
+                                    &format!("[gguf] resolved {} -> {}\n", t.repo_id, local_path),
+                                    "info",
+                                );
+                                model_arg = local_path;
+                            }
+                            None => {
+                                emit_log(
+                                    app,
+                                    &run.id,
+                                    &format!("[gguf] could not resolve a .gguf file in {}; passing the repo id to vLLM as-is\n", t.repo_id),
+                                    "warn",
+                                );
+                            }
+                        }
                     }
 
                     // Global optimizations for ROCm and AMD MI300X (192GB VRAM)
@@ -1732,7 +1801,7 @@ else: print('NOT_FOUND')\
                          --max-model-len {} --dtype {} \
                          --download-dir /root/hf-cache \
                          --tensor-parallel-size {} --gpu-memory-utilization {} {} {}\n",
-                        t.repo_id,
+                        model_arg,
                         port_to_check_inner,
                         t.max_model_len,
                         t.dtype,
@@ -1761,7 +1830,7 @@ else: print('NOT_FOUND')\
                             teacher_log = teacher_log,
                             env = vllm_env,
                             runtime_prepare = runtime_prepare,
-                            model = t.repo_id,
+                            model = sh_quote(&model_arg),
                             port = port_to_check_inner,
                             mml = t.max_model_len,
                             dtype = t.dtype,
@@ -1784,7 +1853,7 @@ else: print('NOT_FOUND')\
                             teacher_log = teacher_log,
                             env = vllm_env,
                             runtime_prepare = runtime_prepare,
-                            model = t.repo_id,
+                            model = sh_quote(&model_arg),
                             port = port_to_check_inner,
                             mml = t.max_model_len,
                             dtype = t.dtype,
@@ -3535,6 +3604,90 @@ else: print('NOT_FOUND')\
         &info,
     )
     .await?;
+
+    // ── 4a-clean. Pre-training dataset cleaning ─────────────────────────
+    // If the user opted in (via the Validate modal), drop duplicate and/or
+    // short-answer rows before training so the model only sees high-quality
+    // samples. Runs against dataset_info.json so it covers BOTH generated
+    // datasets (local jsonl) and train-only datasets (streamed from the Hub),
+    // rewriting the config to point at the cleaned local files.
+    {
+        let ds = &run.hub_dataset;
+        if ds.clean_remove_duplicates || ds.clean_remove_short {
+            let data_dir = format!("{}/data", run.remote_dir);
+            let script = llamafactory::dataset_clean_script(
+                &data_dir,
+                ds.clean_remove_duplicates,
+                ds.clean_remove_short,
+                ds.clean_min_chars,
+            );
+            let script_path = format!("{}/clean_dataset.py", data_dir);
+            write_file_auto(
+                &session,
+                cfg.docker.enabled,
+                &container_name,
+                &script_path,
+                &script,
+            )
+            .await?;
+            emit_log(
+                app,
+                &run.id,
+                &format!(
+                    "[stage] cleaning dataset before training (duplicates={}, short<{} chars={})\n",
+                    ds.clean_remove_duplicates, ds.clean_min_chars, ds.clean_remove_short
+                ),
+                "stage",
+            );
+            // Export the HF token so train-only datasets stream from the Hub.
+            let clean_hf_export = cfg
+                .hf_token
+                .as_ref()
+                .filter(|s| !s.is_empty())
+                .map(|t| {
+                    format!(
+                        "export HF_TOKEN={} HUGGING_FACE_HUB_TOKEN={}; ",
+                        sh_quote(t),
+                        sh_quote(t)
+                    )
+                })
+                .unwrap_or_default();
+            let mut clean_cmd = format!("{}python3 {}", clean_hf_export, sh_quote(&script_path));
+            if docker_cfg.enabled {
+                clean_cmd = wrap_docker_cmd(&clean_cmd, &container_name);
+            }
+            match session.exec_blocking(&clean_cmd).await {
+                Ok(r) => {
+                    for line in r.stdout.lines().chain(r.stderr.lines()) {
+                        if !line.trim().is_empty() {
+                            emit_log(app, &run.id, &format!("{}\n", line), "info");
+                        }
+                    }
+                    if r.exit_code != 0 {
+                        // Non-fatal: fall back to the original (uncleaned) data so
+                        // a cleaning hiccup never blocks training outright.
+                        emit_log(
+                            app,
+                            &run.id,
+                            &format!(
+                                "[warn] dataset cleaning exited {} — training on original data\n",
+                                r.exit_code
+                            ),
+                            "warn",
+                        );
+                    }
+                }
+                Err(e) => {
+                    emit_log(
+                        app,
+                        &run.id,
+                        &format!("[warn] dataset cleaning failed to run ({e}) — training on original data\n"),
+                        "warn",
+                    );
+                }
+            }
+        }
+    }
 
     // ── 4b. Hugging Face Hub: login + pre-create repo (best-effort) ─────
     if run_cfg.hub.enabled && !run_cfg.hub.model_id.trim().is_empty() {

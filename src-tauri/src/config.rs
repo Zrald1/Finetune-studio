@@ -220,6 +220,12 @@ pub struct TeacherConfig {
     pub enable_auto_tool_choice: bool,
     pub tool_call_parser: Option<String>,
     pub custom_serve_cmd: Option<String>,
+    /// Extra vLLM flags appended to the managed `vllm serve` command (e.g.
+    /// `--quantization gguf --block-size 32 --enable-prefix-caching`). Unlike
+    /// `custom_serve_cmd`, this does NOT replace the command — the model, port,
+    /// host, dtype and ROCm env vars stay intact and these flags are added on top.
+    #[serde(default)]
+    pub extra_serve_args: Option<String>,
     #[serde(default)]
     pub serving_engine: ServingEngine,
 }
@@ -240,6 +246,7 @@ impl Default for TeacherConfig {
             enable_auto_tool_choice: false,
             tool_call_parser: None,
             custom_serve_cmd: None,
+            extra_serve_args: None,
             serving_engine: ServingEngine::Vllm,
         }
     }
@@ -305,6 +312,40 @@ impl TeacherConfig {
         resolved
     }
 
+    /// True when the configured teacher repo is a GGUF model. vLLM cannot load
+    /// a bare GGUF *repo* (no config.json) — the caller must resolve the actual
+    /// `.gguf` file path and serve that, using `gguf_base_model()` for the
+    /// tokenizer / hf-config.
+    pub fn is_gguf(&self) -> bool {
+        self.repo_id.to_lowercase().contains("gguf")
+    }
+
+    /// The base (safetensors) model that produced a GGUF repo: strips the
+    /// `-gguf`/`.gguf` suffix and any trailing `:Q4_K_M`-style quant tag. Used
+    /// for `--tokenizer` and `--hf-config-path` so vLLM can build a config even
+    /// when the GGUF repo itself ships none. Returns the repo unchanged when it
+    /// isn't a GGUF repo.
+    pub fn gguf_base_model(&self) -> String {
+        if !self.is_gguf() {
+            return self.repo_id.clone();
+        }
+        let parts: Vec<&str> = self.repo_id.split('/').collect();
+        let base_repo = if parts.len() >= 2 {
+            format!("{}/{}", parts[0], parts[1].split(':').next().unwrap_or(parts[1]))
+        } else {
+            self.repo_id
+                .split(':')
+                .next()
+                .unwrap_or(&self.repo_id)
+                .to_string()
+        };
+        base_repo
+            .replace("-GGUF", "")
+            .replace("-gguf", "")
+            .replace(".GGUF", "")
+            .replace(".gguf", "")
+    }
+
     pub fn vllm_extra_args(&self) -> String {
         let mut args = Vec::new();
         if self.enable_chunked_prefill {
@@ -325,6 +366,17 @@ impl TeacherConfig {
             {
                 args.push(format!("--tool-call-parser {}", parser.trim()));
             }
+        }
+        // User-supplied advanced flags from the Deploy page (quantization,
+        // block-size, swap-space, kv-cache-dtype, prefix caching, …). Appended
+        // last so they can override defaults set above.
+        if let Some(extra) = self
+            .extra_serve_args
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            args.push(extra.to_string());
         }
         args.join(" ")
     }

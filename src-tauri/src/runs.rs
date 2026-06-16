@@ -171,10 +171,27 @@ pub struct HubDatasetConfig {
     /// Optional column mapping.
     #[serde(default)]
     pub dataset_columns: HashMap<String, String>,
+    /// Pre-training cleaning: drop exact-duplicate rows so the model isn't
+    /// over-weighted on repeated samples. Runs on the GPU server right before
+    /// training, covering both generated and Hub (train-only) datasets.
+    #[serde(default)]
+    pub clean_remove_duplicates: bool,
+    /// Pre-training cleaning: drop rows whose assistant/answer text is shorter
+    /// than `clean_min_chars`, removing low-signal stubs from training.
+    #[serde(default)]
+    pub clean_remove_short: bool,
+    /// Minimum assistant/answer length (characters) when `clean_remove_short`
+    /// is on. Defaults to 30.
+    #[serde(default = "default_clean_min_chars")]
+    pub clean_min_chars: u32,
 }
 
 fn default_dataset_format() -> String {
     "sharegpt".to_string()
+}
+
+fn default_clean_min_chars() -> u32 {
+    30
 }
 
 fn default_dataset_private() -> bool {

@@ -186,6 +186,128 @@ pub fn dataset_info_hf(run: &Run) -> String {
     serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap()
 }
 
+/// Emit a self-contained Python script that cleans every dataset referenced by
+/// `dataset_info.json` *in place* before training, then repoints the config at
+/// the cleaned local files. Covers both data paths with one step:
+///   - generated runs (entries with `file_name`) → cleaned local jsonl
+///   - train-only runs (entries with `hf_hub_url`) → materialized from the Hub,
+///     cleaned, and rewritten to a local `file_name` so the trainer reads the
+///     cleaned copy instead of streaming the raw Hub data.
+///
+/// Cleaning is format-aware (sharegpt `messages` and alpaca `prompt/query/
+/// response`), removing exact-duplicate rows and/or rows whose assistant/answer
+/// text is shorter than `min_chars`. It prints `[clean] …` progress lines and a
+/// final per-dataset summary so the user sees exactly what was dropped.
+///
+/// `data_dir` is the absolute path that holds `dataset_info.json` (the trainer's
+/// `--dataset_dir`). Returns the script text to run with `python3 -c`.
+pub fn dataset_clean_script(
+    data_dir: &str,
+    remove_duplicates: bool,
+    remove_short: bool,
+    min_chars: u32,
+) -> String {
+    const TEMPLATE: &str = r#"
+import json, os, sys
+
+DATA_DIR = "__DATA_DIR__"
+REMOVE_DUP = __REMOVE_DUP__
+REMOVE_SHORT = __REMOVE_SHORT__
+MIN_CHARS = __MIN_CHARS__
+
+info_path = os.path.join(DATA_DIR, "dataset_info.json")
+with open(info_path, "r", encoding="utf-8") as f:
+    info = json.load(f)
+
+def answer_text(row, fmt):
+    # Extract the assistant/answer text used for the short-paragraph filter.
+    if fmt == "sharegpt":
+        msgs = row.get("messages") or []
+        parts = [m.get("content", "") for m in msgs if m.get("role") == "assistant"]
+        if not parts and msgs:
+            parts = [msgs[-1].get("content", "")]
+        return "\n".join(p for p in parts if p)
+    # alpaca-style
+    return str(row.get("output") or row.get("response") or "")
+
+def row_key(row, fmt):
+    # Stable identity for de-duplication.
+    return json.dumps(row, sort_keys=True, ensure_ascii=False)
+
+def load_rows(entry):
+    url = entry.get("hf_hub_url")
+    if url:
+        from datasets import load_dataset
+        ds = load_dataset(url, split="train")
+        return [dict(r) for r in ds]
+    fn = entry.get("file_name")
+    rows = []
+    path = os.path.join(DATA_DIR, fn)
+    if not os.path.exists(path):
+        return rows
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+changed = False
+for key, entry in list(info.items()):
+    fmt = entry.get("formatting", "sharegpt")
+    try:
+        rows = load_rows(entry)
+    except Exception as e:
+        print("[clean] %s: skipped (load failed: %s)" % (key, e), flush=True)
+        continue
+    total = len(rows)
+    kept = []
+    seen = set()
+    dropped_dup = 0
+    dropped_short = 0
+    for row in rows:
+        if REMOVE_SHORT and len(answer_text(row, fmt).strip()) < MIN_CHARS:
+            dropped_short += 1
+            continue
+        if REMOVE_DUP:
+            k = row_key(row, fmt)
+            if k in seen:
+                dropped_dup += 1
+                continue
+            seen.add(k)
+        kept.append(row)
+    out_name = key + "_clean.jsonl"
+    out_path = os.path.join(DATA_DIR, out_name)
+    with open(out_path, "w", encoding="utf-8") as fh:
+        for row in kept:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    # Repoint the dataset entry at the cleaned local file.
+    entry.pop("hf_hub_url", None)
+    entry["file_name"] = out_name
+    changed = True
+    print("[clean] %s: %d -> %d rows (removed %d duplicate, %d short)" % (
+        key, total, len(kept), dropped_dup, dropped_short), flush=True)
+
+if changed:
+    with open(info_path, "w", encoding="utf-8") as f:
+        json.dump(info, f, ensure_ascii=False, indent=2)
+    print("[clean] dataset_info.json updated to use cleaned files", flush=True)
+print("[clean] done", flush=True)
+"#;
+
+    TEMPLATE
+        .replace("__DATA_DIR__", data_dir)
+        .replace(
+            "__REMOVE_DUP__",
+            if remove_duplicates { "True" } else { "False" },
+        )
+        .replace(
+            "__REMOVE_SHORT__",
+            if remove_short { "True" } else { "False" },
+        )
+        .replace("__MIN_CHARS__", &min_chars.to_string())
+}
+
 /// LLaMA-Factory / Transformers cannot fine-tune directly from a GGUF repo —
 /// those snapshots only contain the quantised weights and no tokenizer files.
 /// If the user picked a `*-GGUF` repo as the student, fall back to the matching

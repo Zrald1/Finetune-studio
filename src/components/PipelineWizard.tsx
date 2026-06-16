@@ -34,6 +34,7 @@ import {
   ChevronLeft,
   Database,
   Cpu,
+  Filter,
   FileText,
   Sparkles,
   Loader2,
@@ -3179,6 +3180,25 @@ const [pipelineMode, setPipelineMode] = useState<PipelineMode>("rag");
 
   const [validatingDataset, setValidatingDataset] = useState(false);
   const [datasetValidationError, setDatasetValidationError] = useState<string | null>(null);
+  const [showCleanModal, setShowCleanModal] = useState(false);
+
+  // Validate opens the cleaning-options modal first; the modal's "Validate"
+  // button persists the chosen cleaning options into hubDataset and then runs
+  // the actual dataset validation.
+  const openValidateModal = () => {
+    if (trainingOnlyDatasets.length === 0) return;
+    setShowCleanModal(true);
+  };
+
+  const confirmCleanAndValidate = async (opts: {
+    cleanRemoveDuplicates: boolean;
+    cleanRemoveShort: boolean;
+    cleanMinChars: number;
+  }) => {
+    setHubDataset({ ...hubDataset, ...opts });
+    setShowCleanModal(false);
+    await validateDatasets();
+  };
 
   const validateDatasets = async () => {
     const datasets = trainingOnlyDatasets;
@@ -3512,8 +3532,21 @@ const [pipelineMode, setPipelineMode] = useState<PipelineMode>("rag");
         {step === 0 && <KnowledgeBaseStep gpuStatus={gpuStatus ?? null} samples={samples} loading={loadingKb} error={kbError} config={config} onConfigChange={onConfigChange} onSkip={() => setStep(1)} />}
         {step === 1 && <TeacherStep value={teacher} onChange={(t) => { setTeacher(t); onConfigChange({ teacher: t }); }} gpuStatus={gpuStatus} hfToken={config.hfToken || ""} checkingTeacher={checkingTeacher} teacherDeployed={teacherDeployed} deployedTeacherModel={deployedTeacherModel} deploying={deploying} deployLogs={deployLogs} deployError={deployError} onCheckStatus={() => checkDeployment(teacher)} onDeploy={startDeployment} onCancelDeploy={cancelDeployment} />}
         {step === 2 && !isTrainingOnly && <DatasetStep config={config} onConfigChange={onConfigChange} trainingOnly={isTrainingOnly} onSwitchToGenerateDataset={() => { setPipelineMode("rag"); setStep(0); }} topics={topics} onTopicsChange={setTopics} prompt={prompt} onPromptChange={handlePromptChange} maxPairsPerChunk={maxPairsPerChunk} onMaxPairsChange={setMaxPairsPerChunk} concurrency={concurrency} onConcurrencyChange={setConcurrency} maxChunks={maxChunks} onMaxChunksChange={setMaxChunks} hubDataset={hubDataset} onHubDatasetChange={setHubDataset} hfTokenSet={!!config.hfToken} hfUsername={hfUsername} hfDatasets={hfDatasets} hfLoading={hfLoading} hfError={hfError} onRefreshHf={refreshHf} generating={generatingDataset} generated={datasetGenerated} progress={generationProgress} logs={generationLogs} error={generationError} onGenerate={startDatasetGeneration} onCancel={cancelDatasetGeneration} sshHostSet={!!config.ssh.host} method={lora.method} enableVerification={enableVerification} onEnableVerificationChange={setEnableVerification} bundleWindow={bundleWindow} onBundleWindowChange={setBundleWindow} datasetFormat={datasetFormat} onDatasetFormatChange={setDatasetFormat} />}
-        {step === 3 && <TrainStep trainingOnly={isTrainingOnly} requiresCloudTrainingDataset={requiresCloudTrainingDataset} zraldUsesHf={zraldUsesHf} trainingDataset={(isTrainingOnly || zraldUsesHf) ? <DatasetStep config={config} onConfigChange={onConfigChange} trainingOnly={requiresCloudTrainingDataset} onSwitchToGenerateDataset={() => { setPipelineMode("rag"); setStep(0); }} topics={topics} onTopicsChange={setTopics} prompt={prompt} onPromptChange={handlePromptChange} maxPairsPerChunk={maxPairsPerChunk} onMaxPairsChange={setMaxPairsPerChunk} concurrency={concurrency} onConcurrencyChange={setConcurrency} maxChunks={maxChunks} onMaxChunksChange={setMaxChunks} hubDataset={hubDataset} onHubDatasetChange={setHubDataset} hfTokenSet={!!config.hfToken} hfUsername={hfUsername} hfDatasets={hfDatasets} hfLoading={hfLoading} hfError={hfError} onRefreshHf={refreshHf} generating={generatingDataset} generated={datasetGenerated} progress={generationProgress} logs={generationLogs} error={generationError} onGenerate={startDatasetGeneration} onCancel={cancelDatasetGeneration} sshHostSet={!!config.ssh.host} method={lora.method} enableVerification={enableVerification} onEnableVerificationChange={setEnableVerification} bundleWindow={bundleWindow} onBundleWindowChange={setBundleWindow} datasetFormat={datasetFormat} onDatasetFormatChange={setDatasetFormat} /> : null} runName={runName} onRunNameChange={setRunName} lora={lora} onLoraChange={setLora} studentModel={studentModel} onStudentChange={setStudentModel} studentModelOptions={studentModelOptions} hfLoading={hfLoading} hfTokenSet={!!config.hfToken} onRefreshModels={refreshModelPickers} hub={hub} onHubChange={setHub} hfUsername={hfUsername} canLaunch={!!canLaunch} launching={launching} launchError={launchError} onLaunch={launch} validatingDataset={validatingDataset} datasetsValidated={datasetsValidated} trainingOnlyDatasets={trainingOnlyDatasets} hubDatasetValidation={hubDataset.validationResult || {}} onValidateDatasets={validateDatasets} validateButtonRef={validateButtonRef} />}
+        {step === 3 && <TrainStep trainingOnly={isTrainingOnly} requiresCloudTrainingDataset={requiresCloudTrainingDataset} zraldUsesHf={zraldUsesHf} trainingDataset={(isTrainingOnly || zraldUsesHf) ? <DatasetStep config={config} onConfigChange={onConfigChange} trainingOnly={requiresCloudTrainingDataset} onSwitchToGenerateDataset={() => { setPipelineMode("rag"); setStep(0); }} topics={topics} onTopicsChange={setTopics} prompt={prompt} onPromptChange={handlePromptChange} maxPairsPerChunk={maxPairsPerChunk} onMaxPairsChange={setMaxPairsPerChunk} concurrency={concurrency} onConcurrencyChange={setConcurrency} maxChunks={maxChunks} onMaxChunksChange={setMaxChunks} hubDataset={hubDataset} onHubDatasetChange={setHubDataset} hfTokenSet={!!config.hfToken} hfUsername={hfUsername} hfDatasets={hfDatasets} hfLoading={hfLoading} hfError={hfError} onRefreshHf={refreshHf} generating={generatingDataset} generated={datasetGenerated} progress={generationProgress} logs={generationLogs} error={generationError} onGenerate={startDatasetGeneration} onCancel={cancelDatasetGeneration} sshHostSet={!!config.ssh.host} method={lora.method} enableVerification={enableVerification} onEnableVerificationChange={setEnableVerification} bundleWindow={bundleWindow} onBundleWindowChange={setBundleWindow} datasetFormat={datasetFormat} onDatasetFormatChange={setDatasetFormat} /> : null} runName={runName} onRunNameChange={setRunName} lora={lora} onLoraChange={setLora} studentModel={studentModel} onStudentChange={setStudentModel} studentModelOptions={studentModelOptions} hfLoading={hfLoading} hfTokenSet={!!config.hfToken} onRefreshModels={refreshModelPickers} hub={hub} onHubChange={setHub} hfUsername={hfUsername} canLaunch={!!canLaunch} launching={launching} launchError={launchError} onLaunch={launch} validatingDataset={validatingDataset} datasetsValidated={datasetsValidated} trainingOnlyDatasets={trainingOnlyDatasets} hubDatasetValidation={hubDataset.validationResult || {}} onValidateDatasets={openValidateModal} validateButtonRef={validateButtonRef} />}
       </div>
+
+      {showCleanModal && (
+        <DatasetCleanModal
+          initial={{
+            cleanRemoveDuplicates: hubDataset.cleanRemoveDuplicates ?? false,
+            cleanRemoveShort: hubDataset.cleanRemoveShort ?? false,
+            cleanMinChars: hubDataset.cleanMinChars ?? 30,
+          }}
+          datasetCount={trainingOnlyDatasets.length}
+          onCancel={() => setShowCleanModal(false)}
+          onConfirm={confirmCleanAndValidate}
+        />
+      )}
 
       <div className="border-t border-white/5 px-8 py-5 flex items-center justify-between bg-white/[0.01] rounded-b-2xl">
         <button disabled={isTrainingOnly || step === 0} onClick={() => setStep(step - 1)} className="flex items-center gap-2 px-6 py-2.5 rounded-xl border border-white/5 theme-surface-soft theme-muted hover:theme-text hover:border-theme-accent/30 disabled:opacity-0 transition-all font-black"><ChevronLeft className="w-5 h-5" /><span className="text-sm-fluid uppercase tracking-widest">Back</span></button>
@@ -3524,6 +3557,98 @@ const [pipelineMode, setPipelineMode] = useState<PipelineMode>("rag");
         {!isTrainingOnly && step < STEPS.length - 1 ? (
           <button disabled={(step === 1 && !teacherDeployed && !isTrainingOnly) || (step === 2 && (!datasetGenerated && lora.method !== "zrald_offline") && !isTrainingOnly)} onClick={() => setStep(step + 1)} className="flex items-center gap-2 px-8 py-2.5 rounded-xl theme-accent-bg text-black font-black uppercase tracking-widest hover:brightness-110 disabled:opacity-20 transition-all shadow-xl shadow-theme-accent/10 premium-button"><span className="text-sm-fluid">Next Phase</span><ChevronRight className="w-5 h-5" /></button>
         ) : (<div className="w-[140px]" />)}
+      </div>
+    </div>
+  );
+}
+
+/** Pop-up shown when the user clicks Validate. Lets them opt into pre-training
+ *  dataset cleaning (remove duplicates / remove short paragraphs) so only
+ *  high-quality samples are trained on. Choices are saved to the run config and
+ *  applied automatically on the GPU server right before training starts. */
+function DatasetCleanModal(props: {
+  initial: { cleanRemoveDuplicates: boolean; cleanRemoveShort: boolean; cleanMinChars: number };
+  datasetCount: number;
+  onCancel: () => void;
+  onConfirm: (opts: { cleanRemoveDuplicates: boolean; cleanRemoveShort: boolean; cleanMinChars: number }) => void;
+}) {
+  const [removeDup, setRemoveDup] = useState(props.initial.cleanRemoveDuplicates);
+  const [removeShort, setRemoveShort] = useState(props.initial.cleanRemoveShort);
+  const [minChars, setMinChars] = useState(props.initial.cleanMinChars || 30);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-6 bg-black/70 backdrop-blur-sm animate-premium" onClick={props.onCancel}>
+      <div className="premium-card rounded-2xl w-full max-w-lg overflow-hidden shadow-2xl" onClick={(e) => e.stopPropagation()}>
+        <div className="px-6 py-5 border-b border-white/5 bg-white/[0.02] flex items-start justify-between gap-4">
+          <div>
+            <div className="flex items-center gap-2.5 mb-1">
+              <Filter className="w-4 h-4 theme-accent" />
+              <h3 className="text-base-fluid font-black text-white tracking-tight">Dataset Quality Filters</h3>
+            </div>
+            <p className="text-xs-fluid theme-muted font-medium opacity-70 leading-relaxed">
+              Applied on the GPU server right before training so the model only learns from high-quality samples. Covers all {props.datasetCount} selected dataset{props.datasetCount === 1 ? "" : "s"}.
+            </p>
+          </div>
+          <button type="button" onClick={props.onCancel} className="p-1.5 rounded-lg border border-white/5 theme-surface-soft theme-muted hover:theme-text transition-all shrink-0">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        <div className="p-6 space-y-4">
+          <label className="flex items-start gap-3 p-4 rounded-xl border border-white/5 bg-white/[0.01] hover:bg-white/[0.03] transition-colors cursor-pointer group">
+            <div className={`mt-0.5 w-5 h-5 rounded border-2 transition-all flex items-center justify-center shrink-0 ${removeDup ? "bg-theme-accent border-theme-accent" : "border-white/20 group-hover:border-white/40"}`}>
+              {removeDup && <CheckCircle2 className="w-4 h-4 text-black" />}
+            </div>
+            <input type="checkbox" checked={removeDup} onChange={(e) => setRemoveDup(e.target.checked)} className="hidden" />
+            <div>
+              <span className="text-sm-fluid theme-text font-black font-mono tracking-tight group-hover:theme-accent transition-colors">Remove duplicate paragraphs</span>
+              <p className="text-[11px] theme-muted opacity-70 mt-1 leading-relaxed">Drops exact-duplicate rows so the model isn't over-weighted on repeated samples.</p>
+            </div>
+          </label>
+
+          <label className="flex items-start gap-3 p-4 rounded-xl border border-white/5 bg-white/[0.01] hover:bg-white/[0.03] transition-colors cursor-pointer group">
+            <div className={`mt-0.5 w-5 h-5 rounded border-2 transition-all flex items-center justify-center shrink-0 ${removeShort ? "bg-theme-accent border-theme-accent" : "border-white/20 group-hover:border-white/40"}`}>
+              {removeShort && <CheckCircle2 className="w-4 h-4 text-black" />}
+            </div>
+            <input type="checkbox" checked={removeShort} onChange={(e) => setRemoveShort(e.target.checked)} className="hidden" />
+            <div className="flex-1">
+              <span className="text-sm-fluid theme-text font-black font-mono tracking-tight group-hover:theme-accent transition-colors">Remove short paragraphs</span>
+              <p className="text-[11px] theme-muted opacity-70 mt-1 leading-relaxed">Drops rows whose answer text is below the minimum length, removing low-signal stubs.</p>
+            </div>
+          </label>
+
+          {removeShort && (
+            <div className="flex items-center gap-3 ml-1 animate-premium">
+              <label className="text-[10px] uppercase tracking-widest theme-muted font-black">Minimum answer length</label>
+              <input
+                type="number"
+                min={1}
+                value={minChars}
+                onChange={(e) => setMinChars(parseInt(e.target.value) || 30)}
+                className="w-24 px-3 py-2 premium-input rounded-lg text-sm-fluid font-mono text-white focus:outline-none shadow-inner bg-black/20"
+              />
+              <span className="text-[10px] theme-muted font-mono opacity-60">characters</span>
+            </div>
+          )}
+        </div>
+
+        <div className="px-6 py-4 border-t border-white/5 bg-white/[0.01] flex items-center justify-between gap-3">
+          <p className="text-[10px] theme-muted font-mono opacity-50">
+            {!removeDup && !removeShort ? "No filters — train on the dataset as-is." : "Filters run before training begins."}
+          </p>
+          <div className="flex items-center gap-2">
+            <button type="button" onClick={props.onCancel} className="px-4 py-2 rounded-xl border border-white/5 theme-surface-soft text-[10px] uppercase tracking-widest theme-muted hover:theme-text font-black transition-all">
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={() => props.onConfirm({ cleanRemoveDuplicates: removeDup, cleanRemoveShort: removeShort, cleanMinChars: minChars })}
+              className="flex items-center gap-2 px-5 py-2 rounded-xl theme-accent-bg text-black text-[10px] uppercase tracking-widest font-black hover:brightness-110 transition-all shadow-lg premium-button"
+            >
+              <ShieldAlert className="w-4 h-4" /> Validate Datasets
+            </button>
+          </div>
+        </div>
       </div>
     </div>
   );

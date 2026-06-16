@@ -325,7 +325,10 @@ export default function DeployPanel({ config }: Props) {
     maxNumBatchedTokens,
     enableChunkedPrefill,
     servingEngine: "vllm",
-    customServeCmd: buildExtraFlags() || undefined,
+    // Advanced flags are APPENDED to the managed `vllm serve <model> …` command,
+    // not used as the whole command. Using customServeCmd here would drop the
+    // `vllm serve <model>` prefix and crash with "--quantization: command not found".
+    extraServeArgs: buildExtraFlags() || undefined,
   }), [modelId, vllmPort, maxModelLen, dtype, gpuMemUtil, maxNumSeqs, maxNumBatchedTokens, enableChunkedPrefill, buildExtraFlags]);
 
   // Load HF models
@@ -827,7 +830,7 @@ export default function DeployPanel({ config }: Props) {
               <div className="flex items-center gap-2 mb-2">
                 <Layers className="w-3 h-3 theme-accent" />
                 <span className="text-[9px] uppercase tracking-widest font-mono font-bold theme-accent">vLLM Flags Preview</span>
-                <span className="text-[8px] theme-faint font-mono">— injected at deploy time via customServeCmd</span>
+                <span className="text-[8px] theme-faint font-mono">— appended to the managed vLLM serve command at deploy time</span>
               </div>
               {liveFlags ? (
                 <code className="text-[10px] font-mono text-emerald-200/80 leading-relaxed break-all">{liveFlags}</code>

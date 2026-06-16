@@ -33,6 +33,8 @@ export interface TeacherConfig {
   enableAutoToolChoice?: boolean;
   toolCallParser?: string | null;
   customServeCmd?: string;
+  /** Extra vLLM flags appended to the managed serve command (does not replace it). */
+  extraServeArgs?: string;
   servingEngine?: ServingEngine;
 }
 
@@ -518,6 +520,12 @@ export interface HubDatasetConfig {
   };
   /** Number of samples in the dataset (for training-only mode display). */
   sampleCount?: number;
+  /** Pre-training cleaning: drop exact-duplicate rows before training. */
+  cleanRemoveDuplicates?: boolean;
+  /** Pre-training cleaning: drop rows whose answer text is shorter than cleanMinChars. */
+  cleanRemoveShort?: boolean;
+  /** Minimum answer length (chars) when cleanRemoveShort is on. Default 30. */
+  cleanMinChars?: number;
   /** Dataset validation state (training-only mode). Keyed by repoId. */
   validationResult?: Record<string, {
     valid: boolean;
@@ -787,6 +795,9 @@ export const DEFAULT_HUB_DATASET: HubDatasetConfig = {
   private: true,
   everyN: 100,
   resumeFrom: "",
+  cleanRemoveDuplicates: false,
+  cleanRemoveShort: false,
+  cleanMinChars: 30,
 };
 
 export const DEFAULT_TEACHER: TeacherConfig = {
@@ -803,6 +814,7 @@ export const DEFAULT_TEACHER: TeacherConfig = {
   enableAutoToolChoice: false,
   toolCallParser: "",
   customServeCmd: "",
+  extraServeArgs: "",
   servingEngine: "vllm",
 };
 

@@ -1792,29 +1792,39 @@ async fn run_deploy_teacher_task(
         // ... (rest of the code for non-custom command)
 
         let mut tokenizer_arg = String::new();
-        let repo_id_lower = teacher.repo_id.to_lowercase();
-        if repo_id_lower.contains("gguf") {
-            let parts: Vec<&str> = teacher.repo_id.split('/').collect();
-            let base_repo = if parts.len() >= 2 {
-                format!(
-                    "{}/{}",
-                    parts[0],
-                    parts[1].split(':').next().unwrap_or(parts[1])
-                )
-            } else {
-                teacher
-                    .repo_id
-                    .split(':')
-                    .next()
-                    .unwrap_or(&teacher.repo_id)
-                    .to_string()
-            };
-            let base_model = base_repo
-                .replace("-GGUF", "")
-                .replace("-gguf", "")
-                .replace(".GGUF", "")
-                .replace(".gguf", "");
-            tokenizer_arg = format!("--tokenizer {}", base_model);
+        // The `--model` argument. For GGUF repos this is replaced below with the
+        // concrete local .gguf file path (vLLM can't load a bare GGUF repo).
+        let mut model_arg = teacher.repo_id.clone();
+        if teacher.is_gguf() {
+            let base_model = teacher.gguf_base_model();
+            // Base model supplies the tokenizer + a config vLLM can parse, since
+            // the GGUF repo ships no config.json.
+            tokenizer_arg = format!("--tokenizer {} --hf-config-path {}", base_model, base_model);
+            match pipeline::resolve_gguf_model_path(
+                &session,
+                docker_cfg.enabled,
+                &container_name,
+                &teacher.repo_id,
+                hf_token,
+            )
+            .await
+            {
+                Some(local_path) => {
+                    let _ = app.emit("deploy://log", serde_json::json!({
+                        "streamId": id,
+                        "kind": "info",
+                        "line": format!("[gguf] resolved {} -> {}\n", teacher.repo_id, local_path)
+                    }));
+                    model_arg = local_path;
+                }
+                None => {
+                    let _ = app.emit("deploy://log", serde_json::json!({
+                        "streamId": id,
+                        "kind": "warn",
+                        "line": format!("[gguf] could not resolve a .gguf file in {}; passing the repo id to vLLM as-is (it may fail to find config.json)\n", teacher.repo_id)
+                    }));
+                }
+            }
         }
 
         let vllm_env = {
@@ -1852,7 +1862,7 @@ async fn run_deploy_teacher_task(
              --max-model-len {} --dtype {} \
              --download-dir /root/hf-cache \
              --tensor-parallel-size {} --gpu-memory-utilization {} {} {}\n",
-            teacher.repo_id,
+            model_arg,
             port_to_check,
             teacher.max_model_len,
             teacher.dtype,
@@ -1884,7 +1894,7 @@ async fn run_deploy_teacher_task(
                --tensor-parallel-size {tp} --gpu-memory-utilization {gpu_mem} {tok_arg} {extra_args}",
             env = vllm_env,
             runtime_prepare = runtime_prepare,
-            model = teacher.repo_id,
+            model = pipeline::sh_quote(&model_arg),
             port = port_to_check,
             mml = teacher.max_model_len,
             dtype = teacher.dtype,

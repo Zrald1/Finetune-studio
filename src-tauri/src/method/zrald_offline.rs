@@ -104,29 +104,14 @@ pub fn build_train_cmd(run: &Run, lora: &LoraConfig, hf_export: &str) -> Result<
         format!("{hf_export}cd /app && {custom_cmd}")
     } else {
         let mut tokenizer_arg = String::new();
-        let repo_id_lower = run.teacher_cfg.repo_id.to_lowercase();
-        if repo_id_lower.contains("gguf") {
-            let parts: Vec<&str> = run.teacher_cfg.repo_id.split('/').collect();
-            let base_repo = if parts.len() >= 2 {
-                format!(
-                    "{}/{}",
-                    parts[0],
-                    parts[1].split(':').next().unwrap_or(parts[1])
-                )
-            } else {
-                run.teacher_cfg
-                    .repo_id
-                    .split(':')
-                    .next()
-                    .unwrap_or(&run.teacher_cfg.repo_id)
-                    .to_string()
-            };
-            let base_model = base_repo
-                .replace("-GGUF", "")
-                .replace("-gguf", "")
-                .replace(".GGUF", "")
-                .replace(".gguf", "");
-            tokenizer_arg = format!("--tokenizer {}", sh_quote(&base_model));
+        let mut model_eval = sh_quote(&run.teacher_cfg.repo_id);
+        if run.teacher_cfg.is_gguf() {
+            let base_model = run.teacher_cfg.gguf_base_model();
+            tokenizer_arg = format!("--tokenizer {} --hf-config-path {}", sh_quote(&base_model), sh_quote(&base_model));
+            model_eval = format!(
+                "$(python3 -c \"import sys; from huggingface_hub import HfApi, hf_hub_download; repo='{}'; api=HfApi(); files=[f for f in api.list_repo_files(repo) if f.lower().endswith('.gguf')]; pick='model.gguf' if 'model.gguf' in files else sorted(files)[0]; print(hf_hub_download(repo_id=repo, filename=pick))\")",
+                run.teacher_cfg.repo_id
+            );
         }
         let vllm_env = "export PYTHONUNBUFFERED=1; \
              export MASTER_ADDR=127.0.0.1; \
@@ -146,7 +131,7 @@ pub fn build_train_cmd(run: &Run, lora: &LoraConfig, hf_export: &str) -> Result<
              --max-model-len {max_model_len} --dtype {dtype} --download-dir /root/hf-cache \
              --tensor-parallel-size {tensor_parallel} --gpu-memory-utilization {gpu_memory_utilization} {tokenizer_arg} {extra_args}",
             runtime_prepare = run.teacher_cfg.vllm_runtime_prepare_cmd(),
-            model = sh_quote(&run.teacher_cfg.repo_id),
+            model = model_eval,
             port = teacher_port,
             max_model_len = run.teacher_cfg.max_model_len,
             dtype = sh_quote(&run.teacher_cfg.dtype),
