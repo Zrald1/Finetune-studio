@@ -537,10 +537,14 @@ export default function CredentialsPanel({
 
   const handleBrowseKey = async () => {
     try {
+      // No extension filter: SSH private keys are usually extensionless
+      // (id_rsa, id_ed25519). On macOS the native panel enforces filters
+      // strictly and "*" is not a wildcard, so a filtered dialog greys out
+      // exactly the files users need. An unfiltered dialog is universal and
+      // behaves identically across macOS, Windows, and Linux.
       const selected = await openFileDialog({
         multiple: false,
         directory: false,
-        filters: [{ name: "Private Key", extensions: ["pem", "key", "*"] }]
       });
       if (selected && typeof selected === "string") {
         const content = await api.readLocalFileText(selected);
