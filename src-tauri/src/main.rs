@@ -70,6 +70,8 @@ fn is_ingestable_extension(ext: &str) -> bool {
         "pdf"
             | "txt"
             | "md"
+            | "csv"
+            | "tsv"
             | "docx"
             | "pptx"
             | "ppt"

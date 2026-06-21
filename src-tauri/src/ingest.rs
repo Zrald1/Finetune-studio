@@ -165,6 +165,12 @@ pub fn read_file_text(path: &Path) -> Result<String> {
         "docx" => docx_lite::extract_text(path).map_err(|e| {
             AppError::pipeline(format!("docx extract {} failed: {}", path.display(), e))
         }),
+        "csv" | "tsv" => {
+            let raw = std::fs::read_to_string(path)
+                .map_err(|e| AppError::pipeline(format!("read {} failed: {}", path.display(), e)))?;
+            let delim = if ext == "tsv" { '\t' } else { ',' };
+            Ok(csv_to_text(&raw, delim))
+        }
         "pptx" | "ppt" => {
             let python_script = r#"
 import sys
@@ -832,6 +838,101 @@ pub fn chunk_text(text: &str, size: usize, overlap: usize) -> Vec<String> {
         start += step;
     }
     out
+}
+
+/// Flatten a CSV/TSV file into plain text suitable for chunking + embedding.
+///
+/// Parses RFC4180-style quoting (doubled `""` escapes, quoted fields may contain
+/// the delimiter and newlines) without pulling in an external crate. The header
+/// row, when present, is paired with each subsequent row as `header: value`
+/// fields so the embedded text keeps column semantics; rows are emitted one per
+/// line so chunking splits on logical record boundaries.
+fn csv_to_text(raw: &str, delim: char) -> String {
+    let rows = parse_csv_rows(raw, delim);
+    if rows.is_empty() {
+        return String::new();
+    }
+
+    // Treat the first row as a header only if it looks like labels (every cell
+    // non-empty). Otherwise fall back to plain delimiter-joined rows.
+    let header = &rows[0];
+    let use_header = header.len() > 1 && header.iter().all(|c| !c.trim().is_empty());
+
+    let mut out = String::new();
+    let body = if use_header { &rows[1..] } else { &rows[..] };
+    for row in body {
+        if row.iter().all(|c| c.trim().is_empty()) {
+            continue;
+        }
+        let line = if use_header {
+            row.iter()
+                .enumerate()
+                .filter(|(_, cell)| !cell.trim().is_empty())
+                .map(|(i, cell)| {
+                    let col = header.get(i).map(|h| h.trim()).unwrap_or("");
+                    if col.is_empty() {
+                        cell.trim().to_string()
+                    } else {
+                        format!("{}: {}", col, cell.trim())
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" | ")
+        } else {
+            row.iter()
+                .map(|c| c.trim())
+                .filter(|c| !c.is_empty())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        };
+        if !line.is_empty() {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Minimal RFC4180 record/field splitter. Handles quoted fields (which may span
+/// the delimiter and newlines) and `""` escapes. Accepts both `\n` and `\r\n`.
+fn parse_csv_rows(raw: &str, delim: char) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    let mut row = Vec::new();
+    let mut field = String::new();
+    let mut in_quotes = false;
+    let mut chars = raw.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    field.push('"');
+                    chars.next();
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                field.push(c);
+            }
+        } else if c == '"' {
+            in_quotes = true;
+        } else if c == delim {
+            row.push(std::mem::take(&mut field));
+        } else if c == '\n' {
+            row.push(std::mem::take(&mut field));
+            rows.push(std::mem::take(&mut row));
+        } else if c == '\r' {
+            // swallow; the following '\n' (if any) terminates the record
+        } else {
+            field.push(c);
+        }
+    }
+    // Flush trailing field/row when the file doesn't end with a newline.
+    if !field.is_empty() || !row.is_empty() {
+        row.push(field);
+        rows.push(row);
+    }
+    rows
 }
 
 fn collapse_whitespace(s: &str) -> String {

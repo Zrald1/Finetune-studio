@@ -825,7 +825,7 @@ function EmbedderCard({
       multiple: true,
       filters: [
         { name: "All Files", extensions: ["*"] },
-        { name: "Documents & Images", extensions: ["pdf", "txt", "md", "docx", "pptx", "ppt", "png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "tif"] }
+        { name: "Documents & Images", extensions: ["pdf", "txt", "md", "csv", "tsv", "docx", "pptx", "ppt", "png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "tif"] }
       ]
     });
     if (!sel) return;
