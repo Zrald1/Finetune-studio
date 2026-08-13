@@ -387,7 +387,7 @@ impl TeacherConfig {
         let repo = self.repo_id.to_lowercase();
 
         if repo.contains("deepseek-v4") || repo.contains("deepseek_v4") {
-            prepare.push_str("python3 -c \"from transformers.models.auto.configuration_auto import CONFIG_MAPPING; import sys; sys.exit(0 if \\\"deepseek_v4\\\" in CONFIG_MAPPING else 1)\" || { echo [compat] installing Transformers with DeepSeek V4 support; python3 -m pip install --no-cache-dir --upgrade git+https://github.com/huggingface/transformers.git || exit 42; }; ");
+            prepare.push_str("python3 -c \"from transformers.models.auto.configuration_auto import CONFIG_MAPPING; import sys; sys.exit(0 if \\\"deepseek_v4\\\" in CONFIG_MAPPING else 1)\" || { echo [compat] installing Transformers with DeepSeek V4 support; python3 -m pip install --no-cache-dir --upgrade 'transformers>=5.5.0' || exit 42; }; ");
         }
 
         let model_slug = self.repo_id.split('/').last().unwrap_or(&self.repo_id);
@@ -403,8 +403,8 @@ impl TeacherConfig {
                if mt and mt not in CONFIG_MAPPING: \
                  print(f'[compat] transformers does not recognize model_type={{mt!r}} — upgrading from source'); sys.exit(1); \
              \" 2>/dev/null && echo '[compat] transformers OK' || {{ \
-               echo '[compat] upgrading transformers from source for {model_slug}...'; \
-               python3 -m pip install --no-cache-dir --upgrade git+https://github.com/huggingface/transformers.git || exit 42; \
+               echo '[compat] upgrading transformers to >=5.5.0 for {model_slug}...'; \
+               python3 -m pip install --no-cache-dir --upgrade 'transformers>=5.5.0' || exit 42; \
              }}; ",
             repo = self.repo_id,
             model_slug = model_slug,

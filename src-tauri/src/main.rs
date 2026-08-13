@@ -2138,7 +2138,6 @@ async fn run_deploy_teacher_task(
                     || lower.contains("desired gpu memory utilization")
                     || lower.contains("does not recognize this architecture")
                     || lower.contains("ambiguousglobalperlayerattributeerror")
-                    || lower.contains("per-layer attribute")
                     || lower.contains("vllm_failed")
                     || lower.contains("out of memory")
                     || lower.contains("hip out of memory")
