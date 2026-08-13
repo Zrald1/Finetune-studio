@@ -487,7 +487,7 @@ impl Default for DockerConfig {
         Self {
             enabled: true,
             container_name: "rocm-vllm".to_string(),
-            image_name: "rocm/vllm:latest".to_string(),
+            image_name: "vllm/vllm-openai-rocm:latest".to_string(),
             start_args: "--device=/dev/kfd --device=/dev/dri --network=host --ipc=host --group-add video -v /root:/root".to_string(),
             bypass_terminal: false,
         }

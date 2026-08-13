@@ -990,6 +990,17 @@ async fn run_pipeline(
             "stage",
         );
 
+        let run_id_clone = run.id.clone();
+        let app_clone = app.clone();
+        container_name = ensure_vllm_compatible(
+            session_opt.as_ref().unwrap(),
+            &docker_cfg,
+            |msg: &str| {
+                emit_log(&app_clone, &run_id_clone, msg, "stage");
+            },
+        )
+        .await?;
+
         // ── Re-deploy ONE embedder for semantic search ─────────────────────
         // The cleanup above stopped PaddleOCR and the embedder vLLM to free VRAM
         // for the teacher. Dataset generation still needs to embed topic queries
@@ -1962,10 +1973,16 @@ else: print('NOT_FOUND')\
                                     engine_name
                                 )
                             } else if lower.contains("ambiguousglobalperlayerattributeerror")
-                                || lower.contains("per-layer attribute")
                             {
                                 format!(
                                     "{} crashed because the upgraded Transformers uses a per-layer attribute system that vLLM doesn't handle yet. The deploy command now installs a compatibility patch; deploy again to apply it.",
+                                    engine_name
+                                )
+                            } else if lower.contains("no module or parameter named")
+                                || lower.contains("engine core initialization failed")
+                            {
+                                format!(
+                                    "{} crashed because the installed vLLM version is too old to natively load this model architecture. The deploy command now auto-upgrades the Docker container to a compatible vLLM image; deploy again to apply it.",
                                     engine_name
                                 )
                             } else {
@@ -1990,7 +2007,24 @@ else: print('NOT_FOUND')\
                             runs::append_log_tail(run, &drain_r.stdout);
                             emit_log(app, &run.id, &drain_r.stdout, "teacher");
                         }
-                        emit_log(app, &run.id, "[ok] teacher ready\n", "stage");
+                        emit_log(app, &run.id, &format!(
+                            "[ok] teacher ready on port {}\n\
+                             [ok] ─────────────────────────────────────────────────────\n\
+                             [ok]  Model:  {}\n\
+                             [ok]  API URL: http://{}:{}\n\
+                             [ok]  OpenAI-compatible endpoints:\n\
+                             [ok]    GET  http://{}:{}/v1/models\n\
+                             [ok]    POST http://{}:{}/v1/chat/completions\n\
+                             [ok]    POST http://{}:{}/v1/completions\n\
+                             [ok]  Use this URL as the base URL in any OpenAI-compatible client.\n\
+                             [ok] ─────────────────────────────────────────────────────\n",
+                            port_to_check,
+                            t.repo_id,
+                            cfg.ssh.host, port_to_check,
+                            cfg.ssh.host, port_to_check,
+                            cfg.ssh.host, port_to_check,
+                            cfg.ssh.host, port_to_check
+                        ), "stage");
                         break;
                     }
 
@@ -5847,6 +5881,69 @@ pub async fn ensure_container(session: &SshSession, cfg: &DockerConfig) -> Resul
             cfg.container_name, r_run.stderr
         )));
     }
+    Ok(cfg.container_name.clone())
+}
+
+/// Checks if the vLLM inside the container is recent enough (>= 0.19.0) to
+/// have native support for modern architectures like Gemma 4.  If not, stops
+/// and recreates the container with the configured Docker image (which should
+/// be `vllm/vllm-openai-rocm:latest`).  The `/root` volume preserves HF cache
+/// across recreation.
+pub async fn ensure_vllm_compatible(
+    session: &SshSession,
+    cfg: &DockerConfig,
+    log_fn: impl Fn(&str),
+) -> Result<String> {
+    if !cfg.enabled {
+        return Ok(cfg.container_name.clone());
+    }
+
+    let version_check = format!(
+        "docker exec {cn} python3 -c \"import vllm; v=vllm.__version__; parts=v.split('.'); major=int(parts[0]) if parts else 0; exit(0 if major>=19 else 1)\" 2>/dev/null",
+        cn = cfg.container_name
+    );
+    let r = session.exec_blocking(&version_check).await?;
+    if r.exit_code == 0 {
+        return Ok(cfg.container_name.clone());
+    }
+
+    log_fn(&format!(
+        "[compat] vLLM in container '{}' is too old (< 0.19.0) — recreating with image '{}'...\n",
+        cfg.container_name, cfg.image_name
+    ));
+
+    let stop_cmd = format!("docker rm -f {} 2>/dev/null; true", cfg.container_name);
+    let _ = session.exec_blocking(&stop_cmd).await;
+
+    let pull_cmd = format!("docker pull {} 2>&1", cfg.image_name);
+    let pull_r = session.exec_blocking(&pull_cmd).await?;
+    for line in pull_r.stdout.lines() {
+        log_fn(&format!("[pull] {}\n", line.trim()));
+    }
+    if pull_r.exit_code != 0 {
+        return Err(AppError::ssh(format!(
+            "Failed to pull Docker image '{}': {}",
+            cfg.image_name, pull_r.stderr
+        )));
+    }
+
+    let run_cmd = format!(
+        "docker run -d --name {} {} --entrypoint sleep {} infinity",
+        cfg.container_name, cfg.start_args, cfg.image_name
+    );
+    let run_r = session.exec_blocking(&run_cmd).await?;
+    if run_r.exit_code != 0 {
+        return Err(AppError::ssh(format!(
+            "Failed to create container '{}': {}",
+            cfg.container_name, run_r.stderr
+        )));
+    }
+
+    log_fn(&format!(
+        "[compat] container recreated with {} — vLLM now supports modern architectures\n",
+        cfg.image_name
+    ));
+
     Ok(cfg.container_name.clone())
 }
 

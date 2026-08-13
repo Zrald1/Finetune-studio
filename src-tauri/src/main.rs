@@ -1471,6 +1471,28 @@ async fn run_deploy_teacher_task(
         }
     }
 
+    if docker_cfg.enabled {
+        let id_clone = id.to_string();
+        let app_clone = app.clone();
+        match pipeline::ensure_vllm_compatible(&session, &docker_cfg, |msg| {
+            let _ = app_clone.emit("deploy://log", serde_json::json!({
+                "streamId": id_clone,
+                "kind": "info",
+                "line": msg
+            }));
+        }).await {
+            Ok(name) => container_name = name,
+            Err(e) => {
+                let _ = app.emit("deploy://log", serde_json::json!({
+                    "streamId": id,
+                    "kind": "error",
+                    "line": format!("[DOCKER ERROR] {}\n", e)
+                }));
+                return Err(e);
+            }
+        }
+    }
+
     if teacher
         .custom_serve_cmd
         .as_ref()
@@ -2172,10 +2194,16 @@ async fn run_deploy_teacher_task(
                             engine_name
                         )
                     } else if lower.contains("ambiguousglobalperlayerattributeerror")
-                        || lower.contains("per-layer attribute")
                     {
                         format!(
                             "{} crashed because the upgraded Transformers uses a per-layer attribute system that vLLM doesn't handle yet. The deploy command now installs a compatibility patch; deploy again to apply it.",
+                            engine_name
+                        )
+                    } else if lower.contains("no module or parameter named")
+                        || lower.contains("engine core initialization failed")
+                    {
+                        format!(
+                            "{} crashed because the installed vLLM version is too old to natively load this model architecture. The deploy command now auto-upgrades the Docker container to a compatible vLLM image; deploy again to apply it.",
                             engine_name
                         )
                     } else {
@@ -2194,12 +2222,30 @@ async fn run_deploy_teacher_task(
             }
 
             if probe_code == "200" {
+                let api_base = format!("http://{}:{}", ssh.host, port_to_check);
                 let _ = app.emit(
                     "deploy://log",
                     serde_json::json!({
                         "streamId": id,
                         "kind": "ok",
-                        "line": format!("[ok] teacher model is serving on port {}\n", port_to_check)
+                        "line": format!(
+                            "[ok] teacher model is serving on port {}\n\
+                             [ok] ─────────────────────────────────────────────────────\n\
+                             [ok]  Model:  {}\n\
+                             [ok]  API URL: {}\n\
+                             [ok]  OpenAI-compatible endpoints:\n\
+                             [ok]    GET  {}/v1/models\n\
+                             [ok]    POST {}/v1/chat/completions\n\
+                             [ok]    POST {}/v1/completions\n\
+                             [ok]  Use this URL as the base URL in any OpenAI-compatible client.\n\
+                             [ok] ─────────────────────────────────────────────────────\n",
+                            port_to_check,
+                            teacher.repo_id,
+                            api_base,
+                            api_base,
+                            api_base,
+                            api_base
+                        )
                     }),
                 );
                 break;
