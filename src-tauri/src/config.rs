@@ -385,9 +385,31 @@ impl TeacherConfig {
         let mut prepare = "python3 -c 'import torchvision' 2>&1 | grep -E -q 'nms|operator' && python3 -m pip uninstall -y torchvision || true; ".to_string();
 
         let repo = self.repo_id.to_lowercase();
+
         if repo.contains("deepseek-v4") || repo.contains("deepseek_v4") {
             prepare.push_str("python3 -c \"from transformers.models.auto.configuration_auto import CONFIG_MAPPING; import sys; sys.exit(0 if \\\"deepseek_v4\\\" in CONFIG_MAPPING else 1)\" || { echo [compat] installing Transformers with DeepSeek V4 support; python3 -m pip install --no-cache-dir --upgrade git+https://github.com/huggingface/transformers.git || exit 42; }; ");
         }
+
+        let model_slug = self.repo_id.split('/').last().unwrap_or(&self.repo_id);
+        prepare.push_str(&format!(
+            "python3 -c \"\
+               import json,urllib.request,sys; \
+               url='https://huggingface.co/{repo}/raw/main/config.json'; \
+               req=urllib.request.Request(url, headers={{'User-Agent':'fine-tune'}}); \
+               cfg=json.load(urllib.request.urlopen(req, timeout=15)); \
+               mt=cfg.get('model_type',''); \
+               from transformers import AutoConfig; \
+               from transformers.models.auto.configuration_auto import CONFIG_MAPPING; \
+               if mt and mt not in CONFIG_MAPPING: \
+                 print(f'[compat] transformers does not recognize model_type={{mt!r}} — upgrading from source'); sys.exit(1); \
+             \" 2>/dev/null && echo '[compat] transformers OK' || {{ \
+               echo '[compat] upgrading transformers from source for {model_slug}...'; \
+               python3 -m pip install --no-cache-dir --upgrade git+https://github.com/huggingface/transformers.git || exit 42; \
+             }}; ",
+            repo = self.repo_id,
+            model_slug = model_slug,
+        ));
+
         prepare
     }
 }

@@ -1684,6 +1684,9 @@ else: print('NOT_FOUND')\
                         }
                     }
 
+                    let runtime_prepare = t.vllm_runtime_prepare_cmd();
+                    final_custom_cmd = format!("{}{}", runtime_prepare, final_custom_cmd);
+
                     let mut display_cmd = final_custom_cmd.clone();
                     if let Some(idx) = display_cmd.find("HF_TOKEN=") {
                         let after_token = &display_cmd[idx + 9..];
@@ -1951,11 +1954,10 @@ else: print('NOT_FOUND')\
                                      2. Ensure other GPU processes or containers (e.g. embedders) are stopped to free up VRAM.",
                                     engine_name
                                 )
-                            } else if lower.contains("deepseek_v4")
-                                || lower.contains("does not recognize this architecture")
+                            } else if lower.contains("does not recognize this architecture")
                             {
                                 format!(
-                                    "{} crashed because the container runtime does not support this model architecture yet. The deploy command now installs a Transformers build with DeepSeek V4 support before launching; deploy again to apply it.",
+                                    "{} crashed because the container's Transformers version does not recognize this model's architecture yet. The deploy command now auto-upgrades Transformers from source before launching; deploy again to apply it.",
                                     engine_name
                                 )
                             } else {
