@@ -180,10 +180,10 @@ pub async fn launch_embedder(
            mt=cfg.get('model_type',''); \
            from transformers.models.auto.configuration_auto import CONFIG_MAPPING; \
            if mt and mt not in CONFIG_MAPPING: \
-             print(f'[compat] transformers does not recognize model_type={{mt!r}} — upgrading from source'); sys.exit(1); \
+             print(f'[compat] transformers does not recognize model_type={{mt!r}} — upgrading'); sys.exit(1); \
          \" 2>/dev/null && echo '[compat] transformers OK' || {{ \
-           echo '[compat] upgrading transformers to >=5.5.0 for {slug}...'; \
-           python3 -m pip install --no-cache-dir --upgrade 'transformers>=5.5.0' || true; \
+           echo '[compat] upgrading transformers for {slug}...'; \
+           python3 -m pip install --no-cache-dir --upgrade 'transformers' || true; \
          }}; \
          python3 -c \"import site,os; p=os.path.join(site.getsitepackages()[0],'zz_finetune_hetero_fix.pth'); open(p,'w').write('import transformers.configuration_utils as _tc; _tc.PretrainedConfig.allow_global_per_layer_attribute_access=True\\n'); print('[compat] heterogeneity fix installed')\" 2>/dev/null; ",
         repo = embedder.model_id,

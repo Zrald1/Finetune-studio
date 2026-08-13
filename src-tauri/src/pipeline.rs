@@ -5885,9 +5885,9 @@ pub async fn ensure_container(session: &SshSession, cfg: &DockerConfig) -> Resul
 }
 
 /// Checks if the vLLM inside the container is recent enough (>= 0.19.0) to
-/// have native support for modern architectures like Gemma 4.  If not, stops
+/// have support for modern architectures like Gemma 4.  If not, stops
 /// and recreates the container with the configured Docker image (which should
-/// be `vllm/vllm-openai-rocm:latest`).  The `/root` volume preserves HF cache
+/// be `vllm/vllm-openai-rocm:nightly`).  The `/root` volume preserves HF cache
 /// across recreation.
 pub async fn ensure_vllm_compatible(
     session: &SshSession,
@@ -5898,19 +5898,34 @@ pub async fn ensure_vllm_compatible(
         return Ok(cfg.container_name.clone());
     }
 
+    // vLLM versions are 0.x.y (e.g. 0.19.0).  Check minor >= 19 when major == 0.
     let version_check = format!(
-        "docker exec {cn} python3 -c \"import vllm; v=vllm.__version__; parts=v.split('.'); major=int(parts[0]) if parts else 0; exit(0 if major>=19 else 1)\" 2>/dev/null",
+        "docker exec {cn} python3 -c \"import vllm; v=vllm.__version__; parts=v.split('.'); major=int(parts[0]) if parts else 0; minor=int(parts[1]) if len(parts)>1 else 0; exit(0 if (major>0 or minor>=19) else 1)\" 2>/dev/null",
         cn = cfg.container_name
     );
     let r = session.exec_blocking(&version_check).await?;
     if r.exit_code == 0 {
-        return Ok(cfg.container_name.clone());
+        // Even if version is OK, check if the image has the Gemma 4 weight loading fix (PR #49797).
+        // The fix handles 'audio_tower' params in TransformersMultiModalForCausalLM.
+        // Only present in nightly builds after 2025-08-10.  Check by testing if the fix exists.
+        let fix_check = format!(
+            "docker exec {cn} python3 -c \"import vllm.model_executor.models.utils as u; import inspect; src=inspect.getsource(u._load_module); exit(0 if 'input_max' in src or 'ffw_layer' in src or 'audio_tower' in src else 1)\" 2>/dev/null",
+            cn = cfg.container_name
+        );
+        let fr = session.exec_blocking(&fix_check).await?;
+        if fr.exit_code == 0 {
+            return Ok(cfg.container_name.clone());
+        }
+        log_fn(&format!(
+            "[compat] vLLM in container '{}' lacks Gemma 4 weight loading fix (PR #49797) — recreating with image '{}'...\n",
+            cfg.container_name, cfg.image_name
+        ));
+    } else {
+        log_fn(&format!(
+            "[compat] vLLM in container '{}' is too old (< 0.19.0) — recreating with image '{}'...\n",
+            cfg.container_name, cfg.image_name
+        ));
     }
-
-    log_fn(&format!(
-        "[compat] vLLM in container '{}' is too old (< 0.19.0) — recreating with image '{}'...\n",
-        cfg.container_name, cfg.image_name
-    ));
 
     let stop_cmd = format!("docker rm -f {} 2>/dev/null; true", cfg.container_name);
     let _ = session.exec_blocking(&stop_cmd).await;
