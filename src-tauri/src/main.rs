@@ -2137,6 +2137,8 @@ async fn run_deploy_teacher_task(
                     || lower.contains("valueerror")
                     || lower.contains("desired gpu memory utilization")
                     || lower.contains("does not recognize this architecture")
+                    || lower.contains("ambiguousglobalperlayerattributeerror")
+                    || lower.contains("per-layer attribute")
                     || lower.contains("vllm_failed")
                     || lower.contains("out of memory")
                     || lower.contains("hip out of memory")
@@ -2168,6 +2170,13 @@ async fn run_deploy_teacher_task(
                     {
                         format!(
                             "{} crashed because the container's Transformers version does not recognize this model's architecture yet. The deploy command now auto-upgrades Transformers from source before launching; deploy again to apply it.",
+                            engine_name
+                        )
+                    } else if lower.contains("ambiguousglobalperlayerattributeerror")
+                        || lower.contains("per-layer attribute")
+                    {
+                        format!(
+                            "{} crashed because the upgraded Transformers uses a per-layer attribute system that vLLM doesn't handle yet. The deploy command now installs a compatibility patch; deploy again to apply it.",
                             engine_name
                         )
                     } else {

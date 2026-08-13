@@ -410,6 +410,10 @@ impl TeacherConfig {
             model_slug = model_slug,
         ));
 
+        prepare.push_str(
+            "python3 -c \"import site,os; p=os.path.join(site.getsitepackages()[0],'zz_finetune_hetero_fix.pth'); open(p,'w').write('import transformers.configuration_utils as _tc; _tc.PretrainedConfig.allow_global_per_layer_attribute_access=True\\n'); print('[compat] heterogeneity fix installed')\" 2>/dev/null; ",
+        );
+
         prepare
     }
 }
