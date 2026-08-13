@@ -37,7 +37,7 @@ const DEFAULT_CONFIG: AppConfig = {
   docker: {
     enabled: true,
     containerName: "rocm-vllm",
-    imageName: "rocm/vllm:latest",
+    imageName: "vllm/vllm-openai-rocm:nightly",
     startArgs: "--device=/dev/kfd --device=/dev/dri --network=host --ipc=host --group-add video -v /root:/root",
     bypassTerminal: false,
   },

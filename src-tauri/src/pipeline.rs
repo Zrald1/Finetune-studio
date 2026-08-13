@@ -5241,7 +5241,7 @@ async fn preflight_gpu_health(
             "warn",
         );
         if docker_enabled {
-            emit_log(app, &run.id, "[fix] recreate the container with GPU access: docker run --device=/dev/kfd --device=/dev/dri --group-add video --group-add render --security-opt seccomp=unconfined --ipc=host --shm-size 16G ... rocm/vllm:latest\n", "warn");
+            emit_log(app, &run.id, "[fix] recreate the container with GPU access: docker run --device=/dev/kfd --device=/dev/dri --group-add video --group-add render --security-opt seccomp=unconfined --ipc=host --shm-size 16G ... vllm/vllm-openai-rocm:nightly\n", "warn");
             emit_log(app, &run.id, &format!("[fix] then verify: docker exec {container_name} rocm-smi (must list the card)\n"), "warn");
         } else {
             emit_log(app, &run.id, "[fix] confirm the host sees the GPU with `rocm-smi`, and that the user is in the `video` and `render` groups.\n", "warn");
@@ -5541,7 +5541,7 @@ fn diagnose_failure(log_text: &str) -> Option<(String, Vec<String>)> {
                 "the GPU is not visible inside the Docker container (rocm-smi returned nothing / training fell back to CPU). A PyTorch reinstall cannot fix this — the container is missing the GPU device nodes or render/video group access.".to_string(),
                 vec![
                     "On the host, confirm the GPU is healthy: `rocm-smi` (should list the card).".to_string(),
-                    "Recreate the container with GPU access: `docker run --device=/dev/kfd --device=/dev/dri --group-add video --group-add render --security-opt seccomp=unconfined --ipc=host --shm-size 16G ... rocm/vllm:latest`".to_string(),
+                    "Recreate the container with GPU access: `docker run --device=/dev/kfd --device=/dev/dri --group-add video --group-add render --security-opt seccomp=unconfined --ipc=host --shm-size 16G ... vllm/vllm-openai-rocm:nightly`".to_string(),
                     "Verify inside the container: `docker exec rocm rocm-smi` — it must show the GPU before training will use it.".to_string(),
                     "If running bare-metal (no Docker), disable the Docker toggle in Credentials so training runs directly on the host GPU.".to_string(),
                 ],
