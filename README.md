@@ -61,9 +61,6 @@ Current focus: validating dataset generation quality and moving the staged
 ZRALD Offline loop into repeatable post-training experiments on AMD ROCm GPU
 droplets.
 
-See [../method.md](../method.md) and
-[../docs/AMD-GPU-Credit-Request.md](../docs/AMD-GPU-Credit-Request.md) for the
-technical method notes and AMD GPU credit request narrative.
 
 ---
 
