@@ -304,6 +304,33 @@ fn is_qwen3_8_multimodal(repo_lower: &str) -> bool {
     repo_lower.contains("qwen3.8") || repo_lower.contains("qwen3_8")
 }
 
+/// True for hybrid checkpoints that mix full attention with linear-attention
+/// ("Mamba"-style) layers — Qwen3.5 and later, Jamba, and anything advertising
+/// a Gated DeltaNet.
+///
+/// This matters because vLLM warns that prefix caching over Mamba layers is
+/// **experimental**:
+///
+/// ```text
+/// WARNING [config.py:618] Mamba cache mode is set to 'align' for
+///         Qwen3_5ForConditionalGeneration by default when prefix caching is enabled
+/// INFO    [config.py:638] Prefix caching in Mamba cache 'align' mode is currently
+///         enabled. Its support for Mamba layers is experimental.
+/// ```
+///
+/// Silently opting the model into an experimental KV-reuse path risks quietly
+/// corrupting generated training data, which is worse than generating slowly.
+fn is_hybrid_linear_attention(repo_lower: &str) -> bool {
+    const MARKERS: [&str; 4] = ["mamba", "gdn", "jamba", "deltanet"];
+    if MARKERS.iter().any(|m| repo_lower.contains(m)) {
+        return true;
+    }
+    // Qwen3.5 and every later generation use the 3:1 linear/full layer mix.
+    ["qwen3.5", "qwen3.6", "qwen3.7", "qwen3.8", "qwen3_5", "qwen3_6", "qwen3_7", "qwen3_8"]
+        .iter()
+        .any(|m| repo_lower.contains(m))
+}
+
 /// The `chat_template_kwargs` object for a request to this teacher, or `None`
 /// when no effort is configured so the checkpoint's own default applies.
 ///
@@ -493,8 +520,14 @@ impl TeacherConfig {
 
         if self.serving_profile == ServingProfile::Optimized {
             // Dataset generation sends the same prompt template for every chunk,
-            // so prefix caching is the single largest throughput win here.
-            args.push("--enable-prefix-caching".to_string());
+            // so prefix caching would be the single largest throughput win — but
+            // vLLM marks it experimental for hybrid Mamba/linear-attention
+            // checkpoints, and Qwen3.5+ (including the default Qwen3.8-27B) is
+            // exactly that shape. Wrong KV reuse corrupts training data quietly,
+            // so it stays off unless the user opts in via `extra_serve_args`.
+            if !is_hybrid_linear_attention(&self.repo_id.to_lowercase()) {
+                args.push("--enable-prefix-caching".to_string());
+            }
             // FP8 KV cache is native on gfx942 (MI300X/MI325X) as the E4M3FNUZ
             // dialect and roughly doubles the KV pool, which is what lets the
             // raised --max-num-seqs actually stay resident.
@@ -529,44 +562,11 @@ impl TeacherConfig {
             prepare.push_str("python3 -c \"from transformers.models.auto.configuration_auto import CONFIG_MAPPING; import sys; sys.exit(0 if \\\"deepseek_v4\\\" in CONFIG_MAPPING else 1)\" || { echo [compat] installing Transformers with DeepSeek V4 support; python3 -m pip install --no-cache-dir --upgrade transformers || exit 42; }; ");
         }
 
-        // Qwen3.5+ checkpoints (including Qwen3.8-27B) declare model_type
-        // `qwen3_5_text` and were written by transformers 5.8.0. vLLM parses the
-        // text config itself, but the Qwen3-VL processor path needs a matching
-        // transformers, so enforce the floor explicitly rather than relying on
-        // the generic CONFIG_MAPPING probe below (which passes as soon as the
-        // type exists, even on an older release).
-        if repo.contains("qwen3.5")
-            || repo.contains("qwen3.6")
-            || repo.contains("qwen3.7")
-            || repo.contains("qwen3.8")
-            || repo.contains("qwen3_5")
-            || repo.contains("qwen3_6")
-            || repo.contains("qwen3_7")
-            || repo.contains("qwen3_8")
-        {
-            prepare.push_str(
-                "python3 -c \"import transformers,sys; p=[int(x) for x in transformers.__version__.split('.')[:2] if x.isdigit()]; sys.exit(0 if len(p)==2 and tuple(p)>=(5,8) else 1)\" 2>/dev/null || { echo '[compat] installing Transformers >= 5.8 for Qwen3.5+ (config.json was written by 5.8.0)'; python3 -m pip install --no-cache-dir --upgrade 'transformers>=5.8.0' || exit 42; }; ",
-            );
-        }
-
-        let model_slug = self.repo_id.split('/').last().unwrap_or(&self.repo_id);
-        prepare.push_str(&format!(
-            "python3 -c \"\
-               import json,urllib.request,sys; \
-               url='https://huggingface.co/{repo}/raw/main/config.json'; \
-               req=urllib.request.Request(url, headers={{'User-Agent':'fine-tune'}}); \
-               cfg=json.load(urllib.request.urlopen(req, timeout=15)); \
-               mt=cfg.get('model_type',''); \
-               from transformers.models.auto.configuration_auto import CONFIG_MAPPING; \
-               if mt and mt not in CONFIG_MAPPING: \
-                 print(f'[compat] transformers does not recognize model_type={{mt!r}} — upgrading'); sys.exit(1); \
-             \" 2>/dev/null && echo '[compat] transformers OK' || {{ \
-               echo '[compat] upgrading transformers for {model_slug}...'; \
-               python3 -m pip install --no-cache-dir --upgrade 'transformers' || exit 42; \
-             }}; ",
-            repo = self.repo_id,
-            model_slug = model_slug,
-        ));
+        // Reconcile the environment, then resolve whatever THIS checkpoint
+        // needs. The model-specific half is discovered at deploy time (config
+        // metadata, requirements.txt, vLLM's architecture registry), so a model
+        // the app has never seen still deploys without a code change.
+        prepare.push_str(&crate::deps::teacher_heal_cmd(&self.repo_id));
 
         prepare.push_str(
             "python3 -c \"import site,os; p=os.path.join(site.getsitepackages()[0],'zz_finetune_hetero_fix.pth'); open(p,'w').write('import transformers.configuration_utils as _tc; _tc.PretrainedConfig.allow_global_per_layer_attribute_access=True\\n'); print('[compat] heterogeneity fix installed')\" 2>/dev/null; ",
@@ -646,13 +646,42 @@ impl Default for DigitalOceanConfig {
     }
 }
 
+/// Docker arguments for the vLLM serving container.
+///
+/// Beyond the obvious device passthrough, this carries the two flags AMD lists
+/// as **mandatory** for ROCm containers:
+///
+/// * `--cap-add=SYS_PTRACE` — ROCm JIT compilation requires ptrace. vLLM
+///   compiles AITER kernels at startup, so without it the engine can die
+///   mid-warmup.
+/// * `--security-opt seccomp=unconfined` — ROCm's mmap variants are blocked by
+///   the default seccomp profile.
+///
+/// Both were verified unnecessary on the MI300X test droplet, but AMD documents
+/// them as required and the failure mode on a stricter host is an obscure JIT
+/// crash rather than a clear error, so they ship by default.
+pub fn default_docker_start_args() -> String {
+    "--device=/dev/kfd --device=/dev/dri --network=host --ipc=host \
+     --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+     -v /root:/root"
+        .to_string()
+}
+
+/// Pinned vLLM ROCm image. Deliberately a release tag rather than `nightly`:
+/// nightly changes daily, so a deploy that worked yesterday can break today
+/// with no change on our side, and it forces a fresh multi-gigabyte pull even
+/// when a known-good image is already on the host. v0.27.1 is verified
+/// end-to-end against Qwen3.8-27B on gfx942 (vLLM >= 0.17.0 and
+/// transformers >= 5.8.0 are the model's requirements).
+pub const DEFAULT_VLLM_IMAGE: &str = "vllm/vllm-openai-rocm:v0.27.1";
+
 impl Default for DockerConfig {
     fn default() -> Self {
         Self {
             enabled: true,
             container_name: "rocm-vllm".to_string(),
-            image_name: "vllm/vllm-openai-rocm:nightly".to_string(),
-            start_args: "--device=/dev/kfd --device=/dev/dri --network=host --ipc=host --group-add video -v /root:/root".to_string(),
+            image_name: DEFAULT_VLLM_IMAGE.to_string(),
+            start_args: default_docker_start_args(),
             bypass_terminal: false,
         }
     }
@@ -956,10 +985,50 @@ mod deploy_simulation {
         assert_eq!(t.max_model_len, 262144, "full native context on a 256 GB card");
         assert_eq!(t.max_num_batched_tokens, Some(16384));
         assert_eq!(t.max_num_seqs, Some(64));
-        assert!(has_arg(&t, "--enable-prefix-caching"));
         assert!(has_arg(&t, "--kv-cache-dtype fp8"));
         assert!(has_arg(&t, "--mm-encoder-tp-mode data"));
         assert!(has_arg(&t, "--reasoning-parser qwen3"));
+    }
+
+    #[test]
+    fn hybrid_models_do_not_get_prefix_caching_by_default() {
+        // vLLM reports prefix caching over Mamba/linear-attention layers as
+        // experimental, and Qwen3.5+ (including the default Qwen3.8-27B) is
+        // exactly that shape. Quietly corrupting training data would be worse
+        // than generating slowly, so it stays off unless opted into.
+        for repo in [
+            "Qwen/Qwen3.8-27B",
+            "Qwen/Qwen3.6-27B",
+            "Qwen/Qwen3.5-122B-A10B",
+            "ai21labs/Jamba-v2",
+        ] {
+            let t = teacher(repo, ServingProfile::Optimized).resolved_for_gpu(Some(256.0 * GB));
+            assert!(
+                !has_arg(&t, "--enable-prefix-caching"),
+                "{repo} is hybrid and must not enable prefix caching by default"
+            );
+        }
+    }
+
+    #[test]
+    fn non_hybrid_models_still_get_prefix_caching() {
+        let t = teacher("meta-llama/Llama-3.1-8B-Instruct", ServingProfile::Optimized)
+            .resolved_for_gpu(Some(256.0 * GB));
+        assert!(
+            has_arg(&t, "--enable-prefix-caching"),
+            "dense attention models should keep the throughput win"
+        );
+    }
+
+    #[test]
+    fn user_can_force_prefix_caching_via_extra_args() {
+        // The escape hatch matters: prefix caching is the biggest throughput
+        // win for dataset generation, so an informed user must be able to
+        // re-enable it after A/B-ing output equality themselves.
+        let mut t = qwen38(ServingProfile::Optimized);
+        t.extra_serve_args = Some("--enable-prefix-caching".to_string());
+        let t = t.resolved_for_gpu(Some(256.0 * GB));
+        assert!(has_arg(&t, "--enable-prefix-caching"));
     }
 
     #[test]
@@ -1197,6 +1266,118 @@ mod deploy_simulation {
         assert_eq!(t.serving_profile, ServingProfile::Standard);
         assert!(t.reasoning_effort.is_none());
         assert!(t.custom_serve_cmd.is_none());
+    }
+
+    #[test]
+    fn docker_image_is_pinned_not_nightly() {
+        // `nightly` changes daily, so a deploy that worked yesterday can break
+        // today with no change on our side — and it forces a fresh multi-GB
+        // pull even when a known-good image is already on the host.
+        let d = DockerConfig::default();
+        assert!(
+            !d.image_name.contains("nightly"),
+            "image must be a pinned release tag, got {}",
+            d.image_name
+        );
+        assert_eq!(d.image_name, DEFAULT_VLLM_IMAGE);
+        assert!(
+            d.image_name.contains("v0.27.1"),
+            "v0.27.1 is the version verified against Qwen3.8-27B on gfx942"
+        );
+    }
+
+    #[test]
+    fn docker_start_args_include_amd_mandatory_flags() {
+        // AMD lists both of these as mandatory for ROCm containers: JIT
+        // compilation needs ptrace, and ROCm's mmap variants are blocked by the
+        // default seccomp profile. Verified unnecessary on the MI300X test
+        // droplet, but the failure mode elsewhere is an obscure JIT crash.
+        let d = DockerConfig::default();
+        for required in [
+            "--device=/dev/kfd",
+            "--device=/dev/dri",
+            "--group-add video",
+            "--cap-add=SYS_PTRACE",
+            "--security-opt seccomp=unconfined",
+            "--ipc=host",
+            "--network=host",
+        ] {
+            assert!(
+                d.start_args.contains(required),
+                "start_args missing {required}: {}",
+                d.start_args
+            );
+        }
+    }
+
+    #[test]
+    fn deploy_page_serving_carries_the_universal_heal() {
+        // The Deploy page serves a model for production through exactly this
+        // prepare step, so production serving must heal like the wizard does.
+        for repo in [
+            "Qwen/Qwen3.8-27B",
+            "meta-llama/Llama-3.1-8B-Instruct",
+            "some-org/model-the-app-has-never-seen",
+        ] {
+            let t = teacher(repo, ServingProfile::Optimized);
+            let prep = t.vllm_runtime_prepare_cmd();
+            assert!(
+                prep.contains("reconciling environment"),
+                "{repo}: deploy must reconcile environment pins"
+            );
+            assert!(
+                prep.contains("base64 -d"),
+                "{repo}: deploy must run the model-agnostic resolver"
+            );
+            assert!(
+                prep.contains("pip check"),
+                "{repo}: deploy must report residual conflicts"
+            );
+            assert!(
+                !prep.contains('\n'),
+                "{repo}: prepare must stay a single logical line"
+            );
+        }
+    }
+
+    #[test]
+    fn deploy_page_flags_reach_the_serve_command() {
+        // Every Deploy-page tuning knob is threaded through extra_serve_args;
+        // if one silently stopped being emitted, the UI would lie about what
+        // the server is running.
+        let mut t = qwen38(ServingProfile::Optimized);
+        t.extra_serve_args = Some(
+            "--block-size 32 --swap-space 16 --scheduling-policy priority \
+             --preemption-mode swap --cpu-offload-gb 4 --quantization awq"
+                .to_string(),
+        );
+        let r = t.resolved_for_gpu(Some(256.0 * GB));
+        for flag in [
+            "--block-size 32",
+            "--swap-space 16",
+            "--scheduling-policy priority",
+            "--preemption-mode swap",
+            "--cpu-offload-gb 4",
+            "--quantization awq",
+        ] {
+            assert!(
+                has_arg(&r, flag),
+                "deploy setting {flag} did not reach the command: {}",
+                r.vllm_extra_args()
+            );
+        }
+    }
+
+    #[test]
+    fn docker_start_args_avoid_group_add_render() {
+        // `--group-add render` hard-fails `docker run` on hosts without a
+        // `render` group, and AMD only lists it as needed "on many hosts".
+        // Failing to start at all is worse than missing the group.
+        let d = DockerConfig::default();
+        assert!(
+            !d.start_args.contains("--group-add render"),
+            "render group would break hosts that lack it"
+        );
     }
 
     #[test]

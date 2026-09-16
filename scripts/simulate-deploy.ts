@@ -13,6 +13,7 @@
 
 import {
   autoTuneTeacherConfig,
+  isHybridLinearAttention,
   isQwen3Family,
   isVisionFamily,
   optimizedMaxModelLen,
@@ -208,13 +209,31 @@ for (const profile of ["standard", "optimized"] as ServingProfile[]) {
 // ── 8. Summary strings ──────────────────────────────────────────────────────
 
 {
-  const opt = optimizedProfileSummary(256);
+  const opt = optimizedProfileSummary(256, "Qwen/Qwen3.8-27B");
   check("optimized summary mentions FP8", opt.includes("FP8"), opt);
-  check("optimized summary mentions prefix caching", opt.toLowerCase().includes("prefix caching"), opt);
   check("optimized summary shows full context", opt.includes("262,144"), opt);
+  check(
+    "hybrid model summary omits prefix caching (vLLM marks it experimental)",
+    !opt.toLowerCase().includes("prefix caching"),
+    opt,
+  );
+
+  const dense = optimizedProfileSummary(256, "meta-llama/Llama-3.1-8B-Instruct");
+  check("non-hybrid summary keeps prefix caching", dense.toLowerCase().includes("prefix caching"), dense);
 
   const std = standardProfileSummary(teacher());
   check("standard summary mentions dtype", std.includes("bfloat16"), std);
+}
+
+// ── 9. Hybrid detection (mirrors is_hybrid_linear_attention in config.rs) ───
+
+{
+  for (const repo of ["Qwen/Qwen3.8-27B", "Qwen/Qwen3.6-27B", "ai21labs/Jamba-v2"]) {
+    check(`${repo} detected as hybrid`, isHybridLinearAttention(repo));
+  }
+  for (const repo of ["meta-llama/Llama-3.1-8B-Instruct", "Qwen/Qwen2.5-7B-Instruct", "mistralai/Mistral-7B"]) {
+    check(`${repo} not detected as hybrid`, !isHybridLinearAttention(repo));
+  }
 }
 
 // ── Report ──────────────────────────────────────────────────────────────────

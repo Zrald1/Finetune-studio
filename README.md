@@ -15,6 +15,7 @@ All heavy ML work runs on a **remote GPU droplet over SSH** (built and tested on
 - [What it does](#what-it-does)
 - [Teacher model](#teacher-model)
 - [Serving profiles](#serving-profiles)
+- [Self-healing dependencies](#self-healing-dependencies)
 - [Benchmarking](#benchmarking)
 - [ZRALD post-training](#zrald-post-training)
 - [Training methods](#training-methods)
@@ -95,6 +96,41 @@ The optimized context is **clamped by reported VRAM** so the same profile stays 
 Switching to Optimized shows a one-line summary of what changed, and a **Revert to Standard** link puts it back. Manual mode (Auto Tune off) and a custom serve command both bypass tuning entirely.
 
 FP8 KV cache is **native on gfx942** (MI300X / MI325X) as the E4M3FNUZ dialect, so it roughly doubles the KV pool at no emulation cost.
+
+---
+
+## Self-healing dependencies
+
+Serving a model requires a Python environment that agrees with it. That is harder than
+it sounds, because the components disagree with each other:
+
+| Consumer | Wants |
+|---|---|
+| Qwen3.8-27B teacher (vLLM) | `transformers >= 5.8.0` |
+| LLaMA-Factory 0.9.4 | `transformers >= 4.41.2, <= 4.58` |
+
+Those are **mutually exclusive**, so the app does not try to satisfy both in one place.
+It isolates and reconciles instead:
+
+- **Isolation.** The trainer runs in `<run>/.lf_venv`, created with
+  `--system-site-packages` so it inherits the container's ROCm-matched torch rather than
+  pulling its own. Only the conflicting packages land in the venv.
+- **Discovery, not assumptions.** Before serving anything, the app reads the checkpoint's
+  own `config.json`, honours the `transformers_version` it was written by, installs any
+  `requirements.txt` the repo ships, and asks vLLM's `ModelRegistry` whether it supports
+  the declared architectures. A model the app has never seen resolves its own
+  requirements — nothing about Qwen3.8 is hardcoded.
+- **Detect before installing.** A heal only runs when a check actually fails. Nothing
+  drifts to "latest" behind your back.
+- **Failures degrade.** An unreachable or malformed `config.json` warns and continues; the
+  model may load fine, and refusing to deploy over a metadata fetch would be worse.
+
+This applies to **every** serving path: the teacher wizard, the **Deploy** page for
+production serving, and all four student paths (inference test, benchmark, merge, and
+merge+convert). The student base model is user-chosen, so it gets the same resolver.
+
+The one thing that cannot self-heal is the **vLLM image** — architecture support lives in
+the container. The resolver says so plainly rather than pretending to fix it.
 
 ---
 
@@ -227,6 +263,7 @@ FineTune/
 │   ├── components/
 │   │   ├── PipelineWizard.tsx       # 4-step wizard + Teacher/Dataset/Train steps
 │   │   ├── DeployPanel.tsx          # Serving profiles, vLLM tuning, chat, metrics
+│   │   ├── BenchmarksPanel.tsx      # Benchmark history + optimization comparison
 │   │   ├── RunDashboard.tsx         # Run detail, logs, loss chart, student benchmark
 │   │   ├── CredentialsPanel.tsx     # SSH / Qdrant / HF / DO / AI agent entry
 │   │   ├── GpuServerManager.tsx     # DigitalOcean droplet provisioning + usage
@@ -255,9 +292,12 @@ FineTune/
         ├── main.rs                  # Tauri command surface + event wiring
         ├── lib.rs                   # Shared library (headless server reuses it)
         ├── config.rs                # Config load/save + serving-profile resolution
+        ├── deps.rs                  # Self-healing dependency reconciler
+        ├── bench.rs                 # Token-level inference benchmark (TTFT/TPOT/ITL)
+        ├── bench_store.rs           # Persistent benchmark history
+        ├── bench_pdf.rs             # Dependency-free PDF report writer
         ├── pipeline.rs              # State machine: ssh ▶ teacher ▶ generate ▶ train ▶ done
         ├── generator.rs             # Teacher prompt + OpenAI-compat call + parse
-        ├── bench.rs                 # Token-level inference benchmark (TTFT/TPOT/ITL)
         ├── ssh.rs                   # russh client (connect, exec, stream, GPU stats)
         ├── llamafactory.rs          # JSONL → ShareGPT, dataset_info.json, train.yaml
         ├── digitalocean.rs          # Droplet CRUD, plans, images, regions
@@ -348,6 +388,8 @@ No code changes are needed for new domains, models, or datasets.
 
 ## Testing
 
+**154 Rust tests and 343 frontend assertions**, all passing.
+
 There is no browser test framework. Verification is split between Rust unit tests and a Node-driven simulation of the frontend profile logic.
 
 ```bash
@@ -360,9 +402,10 @@ npm run lint           # tsc --noEmit
 
 | Suite | Count | Covers |
 |---|---|---|
-| `config::deploy_simulation` | 21 | Standard/Optimized resolution across 8 VRAM sizes, reasoning-effort mapping, shell safety of emitted flags, fresh-install defaults, legacy-config roundtrip |
-| `method::zrald_simulation` | 22 | Placeholder substitution, heredoc integrity, generated Python **compiled with a real interpreter**, generated shell **parsed with a real `bash -n`**, clamping, reward-endpoint fallback, venv isolation |
-| `scripts/simulate-deploy.ts` | 336 assertions | The frontend profile logic, imported from the same module the app uses — not a reimplementation |
+| `config::deploy_simulation` | 24 | Standard/Optimized resolution across 8 VRAM sizes, reasoning-effort mapping, shell safety of emitted flags, fresh-install defaults, legacy-config roundtrip |
+| `method::zrald_simulation` | 26 | Placeholder substitution, heredoc integrity, generated Python **compiled with a real interpreter**, generated shell **parsed with a real `bash -n`**, clamping, reward-endpoint fallback, venv isolation |
+| `deps` | 30 | Reconciler, universal resolver, student healer, shell safety |
+| `scripts/simulate-deploy.ts` | 343 assertions | The frontend profile logic, imported from the same module the app uses — not a reimplementation |
 
 The deploy simulation and the Rust tests assert the **same VRAM ladder**, so a change on one side that isn't mirrored on the other fails loudly instead of silently diverging at deploy time.
 
@@ -399,6 +442,10 @@ The webview's right-click context menu is suppressed so the app reads as a nativ
 | `422 This size is unavailable` | A retired `-devcloud` / `-contracted` slug | Slugs are normalised automatically; re-sync the account to refresh the plan list. |
 | `401 Unable to authenticate you` | A Developer Cloud host was set as **API Base** with a `dop_v1_` token | Clear the API Base field — DigitalOcean tokens are served by the standard control plane. |
 | Teacher output truncated mid-answer | Thinking consumed the token budget | Lower the thinking effort, or raise the generator's `max_tokens`. |
+| `error: unrecognized arguments: --swap-space` | Those flags were removed from vLLM | The Deploy page no longer emits them; update to this version. |
+| `RuntimeError: reshape_and_cache, cache_kernels.hip` | `--kv-cache-dtype fp8_e5m2` is broken on gfx942 | Use `fp8` (native E4M3FNUZ) or `auto`; the UI no longer offers e5m2. |
+| `ValueError: Free memory ... is less than desired GPU memory utilization` | Another model is still resident (often the teacher) | Unload it first — two vLLM engines cannot share the card. |
+| `huggingface-hub>=0.34.0,<1.0 is required ... found 1.31.0` | Something upgraded huggingface-hub past 1.0 | Self-healed: the trainer venv pins `<=0.99` and the reconciler never installs `--upgrade`. |
 
 ---
 

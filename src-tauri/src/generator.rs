@@ -324,10 +324,17 @@ impl GeneratorConfig {
             top_p: 0.9,
             // Stops reasoning chains from looping the same derivation line.
             repetition_penalty: 1.05,
-            // 4096 keeps room for board-exam style choices and explanations.
-            // Some reasoning teachers still leak hidden reasoning despite the
-            // prompt; parsing strips that output before the pair is persisted.
-            max_tokens: 4096,
+            // 8192, not 4096. Thinking tokens are counted against this budget
+            // even though the reasoning parser keeps them out of
+            // `message.content`: measured on a live Qwen3.8-27B, a board-exam
+            // MCQ response spent 457 completion tokens to produce 1101
+            // characters of visible content, and a trivial arithmetic prompt
+            // spent 78 to produce 10 tokens of answer. At 4096 a long response
+            // truncates mid-format, which the caller reports as "no QUESTION:
+            // marker in response" — an error that points at the prompt rather
+            // than at the budget. Lowering the teacher's thinking effort is the
+            // other lever, and it is user-visible in the Teacher step.
+            max_tokens: 8192,
             max_pairs_per_chunk: 1,
             concurrency: 4,
             api_key: None,

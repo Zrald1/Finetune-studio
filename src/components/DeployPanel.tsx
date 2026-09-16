@@ -71,7 +71,7 @@ interface ServingProfile {
 const SERVING_PROFILES: ServingProfile[] = [
   { key: "precision", label: "Precision Focus", icon: <Target className="w-4 h-4" />, gpuMemUtil: 0.70, maxNumSeqs: 32, maxNumBatchedTokens: 4096, enableChunkedPrefill: false, dtype: "bfloat16", blockSize: 16, swapSpaceGb: 4, preemptionMode: "recompute", description: "Conservative memory, strict dtype — optimized for accuracy. Best for research and low-concurrency tasks.", badgeText: "Low load", badgeClass: "text-emerald-300 bg-emerald-500/10 border-emerald-500/30", accentClass: "text-emerald-400", borderClass: "border-emerald-500/30", bgClass: "bg-emerald-500/5" },
   { key: "balanced", label: "Smart Balance", icon: <Scale className="w-4 h-4" />, gpuMemUtil: 0.85, maxNumSeqs: 128, maxNumBatchedTokens: 16384, enableChunkedPrefill: true, dtype: "auto", blockSize: 16, swapSpaceGb: 8, preemptionMode: "recompute", description: "Chunked prefill for mixed request sizes. Handles moderate concurrent users while maintaining quality.", badgeText: "Recommended", badgeClass: "text-theme-accent bg-theme-accent/10 border-theme-accent/30", accentClass: "text-theme-accent", borderClass: "border-theme-accent/30", bgClass: "bg-theme-accent/5" },
-  { key: "throughput", label: "Max Throughput", icon: <Zap className="w-4 h-4" />, gpuMemUtil: 0.95, maxNumSeqs: 512, maxNumBatchedTokens: 32768, enableChunkedPrefill: true, dtype: "auto", blockSize: 32, swapSpaceGb: 16, preemptionMode: "swap", description: "Maximizes GPU memory and block size. Swap preemption preserves partial work. Best for high-volume APIs.", badgeText: "Max users", badgeClass: "text-orange-300 bg-orange-500/10 border-orange-500/30", accentClass: "text-orange-400", borderClass: "border-orange-500/30", bgClass: "bg-orange-500/5" },
+  { key: "throughput", label: "Max Throughput", icon: <Zap className="w-4 h-4" />, gpuMemUtil: 0.95, maxNumSeqs: 512, maxNumBatchedTokens: 32768, enableChunkedPrefill: true, dtype: "auto", blockSize: 32, swapSpaceGb: 16, preemptionMode: "swap", description: "Maximizes GPU memory and block size for the largest concurrent load. Best for high-volume APIs.", badgeText: "Max users", badgeClass: "text-orange-300 bg-orange-500/10 border-orange-500/30", accentClass: "text-orange-400", borderClass: "border-orange-500/30", bgClass: "bg-orange-500/5" },
 ];
 
 // ── L6: Benchmark prompts ──────────────────────────────────────────────────────
@@ -259,6 +259,7 @@ export default function DeployPanel({ config }: Props) {
   const [benchResult, setBenchResult] = useState<BenchmarkResult | null>(null);
   const [benchBaseline, setBenchBaseline] = useState<BenchmarkResult | null>(null);
   const [benchError, setBenchError] = useState<string | null>(null);
+  const [benchSaved, setBenchSaved] = useState<string | null>(null);
   const [showBench, setShowBench] = useState(false);
   // L6: concurrent vs serial
   const [benchConcurrent, setBenchConcurrent] = useState(false);
@@ -288,19 +289,30 @@ export default function DeployPanel({ config }: Props) {
   const endpoint = activePort != null && config.ssh.host ? `http://${config.ssh.host}:${activePort}` : null;
   const detectedQuant = useMemo(() => detectQuant(modelId), [modelId]);
 
-  // Build extra vLLM flags
+  // Build extra vLLM flags.
+  //
+  // Two Deploy-page settings are deliberately absent because the server rejects
+  // them outright — verified against a live MI300X running vLLM 0.27.1:
+  //
+  //   * `--swap-space` / `--preemption-mode` — removed from vLLM; sending either
+  //     makes `vllm serve` exit immediately with `error: unrecognized arguments`.
+  //   * `--kv-cache-dtype fp8_e5m2` — accepted by the arg parser but crashes the
+  //     engine on gfx942 with `RuntimeError: reshape_and_cache,
+  //     cache_kernels.hip:77`. The plain `fp8` value works (it resolves to the
+  //     native E4M3FNUZ dialect on ROCm), so that is what the UI offers.
+  //
+  // Offering a setting that breaks the deploy is worse than omitting it, so the
+  // UI controls are hidden alongside these lines.
   const buildExtraFlags = useCallback((): string => {
     const f: string[] = [];
     if (detectedQuant) f.push(`--quantization ${detectedQuant.vllmFlag}`);
     if (blockSize !== 16) f.push(`--block-size ${blockSize}`);
     if (kvCacheDtype !== "auto") f.push(`--kv-cache-dtype ${kvCacheDtype}`);
-    if (swapSpaceGb > 0) f.push(`--swap-space ${swapSpaceGb}`);
     if (cpuOffloadGb > 0) f.push(`--cpu-offload-gb ${cpuOffloadGb}`);
     if (schedulingPolicy !== "fcfs") f.push(`--scheduling-policy ${schedulingPolicy}`);
-    if (preemptionMode !== "recompute") f.push(`--preemption-mode ${preemptionMode}`);
     if (enablePrefixCaching) f.push("--enable-prefix-caching");
     return f.join(" ");
-  }, [detectedQuant, blockSize, kvCacheDtype, swapSpaceGb, cpuOffloadGb, schedulingPolicy, preemptionMode, enablePrefixCaching]);
+  }, [detectedQuant, blockSize, kvCacheDtype, cpuOffloadGb, schedulingPolicy, enablePrefixCaching]);
 
   const applyProfile = useCallback((profile: ServingProfile) => {
     setActiveProfile(profile.key);
@@ -484,6 +496,47 @@ export default function DeployPanel({ config }: Props) {
     } catch (e) { setBenchError(errorMessage(e)); }
     finally { setBenchRunning(false); }
   }, [endpoint, modelId, benchRunning, benchConcurrent, activeProfile, detectedQuant, enablePrefixCaching, kvCacheDtype]);
+
+  // Persist the last deploy-page benchmark into the shared history so a
+  // serving-config change can be compared against the previous measurement.
+  const saveBenchToHistory = useCallback(async () => {
+    if (!benchResult || !endpoint) return;
+    try {
+      await api.benchSave({
+        id: "",
+        kind: "deployment",
+        label: `Deployment — ${benchResult.profile}`,
+        model: modelId,
+        endpoint,
+        config: {
+          servingProfile: activeProfile,
+          dtype,
+          maxModelLen,
+          gpuMemoryUtilization: gpuMemUtil,
+          maxNumSeqs,
+          maxNumBatchedTokens,
+          quantization: detectedQuant?.vllmFlag ?? null,
+          kvCacheDtype,
+          prefixCaching: enablePrefixCaching,
+          notes: [
+            blockSize !== 16 ? `block=${blockSize}` : "",
+          ].filter(Boolean),
+        },
+        metrics: {
+          medianTtftMs: benchResult.medianMs,
+          p95TtftMs: benchResult.p95Ms,
+          requestThroughput: benchResult.reqPerSec,
+          samples: benchResult.sampleCount,
+          concurrency: benchConcurrent ? 4 : 1,
+        },
+        capturedAt: "",
+      });
+      setBenchSaved("Saved to Benchmark history.");
+    } catch (e) {
+      setBenchSaved(null);
+      setBenchError(`Benchmark ran, but could not be saved: ${errorMessage(e)}`);
+    }
+  }, [benchResult, endpoint, modelId, activeProfile, dtype, maxModelLen, gpuMemUtil, maxNumSeqs, maxNumBatchedTokens, detectedQuant, kvCacheDtype, enablePrefixCaching, blockSize, benchConcurrent]);
 
   const saveAsBaseline = useCallback(() => { if (benchResult) setBenchBaseline(benchResult); }, [benchResult]);
 
@@ -700,11 +753,10 @@ export default function DeployPanel({ config }: Props) {
                     <select value={kvCacheDtype} onChange={(e) => setKvCacheDtype(e.target.value)} className="w-full px-2 py-1.5 theme-field border rounded text-[11px] font-mono text-white focus:outline-none focus:border-theme-accent">
                       <option value="auto">Auto — match model</option>
                       <option value="fp8">FP8 — 2× KV capacity</option>
-                      <option value="fp8_e5m2">FP8 E5M2 — wider range</option>
                     </select>
                   </Field>
                   <Field label="CPU Swap Space (GB)">
-                    <input type="number" min={0} max={64} value={swapSpaceGb} onChange={(e) => setSwapSpaceGb(Number(e.target.value))} className="w-full px-2 py-1.5 theme-field border rounded text-[11px] font-mono text-white focus:outline-none focus:border-theme-accent" />
+                    <div className="px-2 py-1.5 rounded border border-white/10 theme-faint text-[10px] font-mono italic" title="Removed in vLLM 0.22+; sending it makes vllm serve exit with 'unrecognized arguments'">not supported by vLLM 0.27</div>
                   </Field>
                   <Field label="CPU Offload (GB)">
                     <input type="number" min={0} max={256} value={cpuOffloadGb} onChange={(e) => setCpuOffloadGb(Number(e.target.value))} className="w-full px-2 py-1.5 theme-field border rounded text-[11px] font-mono text-white focus:outline-none focus:border-theme-accent" />
@@ -789,10 +841,7 @@ export default function DeployPanel({ config }: Props) {
                     </select>
                   </Field>
                   <Field label="Preemption Mode">
-                    <select value={preemptionMode} onChange={(e) => setPreemptionMode(e.target.value as "recompute" | "swap")} className="w-full px-2 py-1.5 theme-field border rounded text-[11px] font-mono text-white focus:outline-none focus:border-theme-accent">
-                      <option value="recompute">recompute — drop & refill KV blocks (fast)</option>
-                      <option value="swap">swap — move KV blocks to CPU (preserves work)</option>
-                    </select>
+                    <div className="px-2 py-1.5 rounded border border-white/10 theme-faint text-[10px] font-mono italic" title="Removed in vLLM 0.22+; sending it makes vllm serve exit with 'unrecognized arguments'">not supported by vLLM 0.27</div>
                   </Field>
                 </div>
               </div>
@@ -841,7 +890,7 @@ export default function DeployPanel({ config }: Props) {
                 <span className="text-[8px] font-mono px-1.5 py-0.5 rounded bg-violet-500/10 border border-violet-500/20 text-violet-300">paged-attn: block={blockSize}</span>
                 <span className={`text-[8px] font-mono px-1.5 py-0.5 rounded border ${enablePrefixCaching ? "bg-emerald-500/10 border-emerald-500/20 text-emerald-300" : "bg-white/5 border-white/10 text-white/30"}`}>prefix-cache: {enablePrefixCaching ? "on" : "off"}</span>
                 <span className="text-[8px] font-mono px-1.5 py-0.5 rounded bg-white/5 border border-white/10 text-white/40">kv-dtype: {kvCacheDtype}</span>
-                <span className="text-[8px] font-mono px-1.5 py-0.5 rounded bg-white/5 border border-white/10 text-white/40">preempt: {preemptionMode}</span>
+                
               </div>
             </div>
           </div>
@@ -961,6 +1010,8 @@ export default function DeployPanel({ config }: Props) {
                 {benchConcurrent ? "Concurrent" : "Serial"}
               </button>
               {benchResult && <button onClick={saveAsBaseline} className="flex items-center gap-1.5 px-3 py-2 rounded border border-white/20 theme-surface text-[10px] uppercase tracking-widest font-mono font-bold theme-muted hover:theme-text transition"><BookmarkPlus className="w-3.5 h-3.5" />Save as Baseline</button>}
+              {benchResult && <button onClick={saveBenchToHistory} className="flex items-center gap-1.5 px-3 py-2 rounded border border-theme-accent/40 bg-theme-accent/10 text-[10px] uppercase tracking-widest font-mono font-bold theme-accent transition"><BarChart3 className="w-3.5 h-3.5" />Save to History</button>}
+              {benchSaved && <span className="text-[9px] text-emerald-400 font-mono">{benchSaved}</span>}
               {!endpoint && <span className="text-[10px] theme-faint font-mono italic">Deploy a model first.</span>}
             </div>
             <p className="text-[9px] theme-faint font-mono leading-relaxed">

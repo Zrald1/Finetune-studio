@@ -1,6 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod bench;
+mod bench_pdf;
+mod bench_store;
+mod deps;
 mod config;
 mod digitalocean;
 mod droplet_usage;
@@ -1475,7 +1478,7 @@ async fn run_deploy_teacher_task(
     if docker_cfg.enabled {
         let id_clone = id.to_string();
         let app_clone = app.clone();
-        match pipeline::ensure_vllm_compatible(&session, &docker_cfg, |msg| {
+        match pipeline::ensure_vllm_compatible(&session, &docker_cfg, &container_name, |msg| {
             let _ = app_clone.emit("deploy://log", serde_json::json!({
                 "streamId": id_clone,
                 "kind": "info",
@@ -1806,14 +1809,18 @@ async fn run_deploy_teacher_task(
                 script = pipeline::sh_quote(&inner_script),
             )
         } else {
+            let launch = format!(
+                "cd /app && {custom_cmd} > {log} 2>&1",
+                custom_cmd = final_custom_cmd,
+                log = teacher_log,
+            );
             format!(
                 "mkdir -p /root/hf-cache; \
                  truncate -s 0 {teacher_log} 2>/dev/null || rm -f {teacher_log}; \
-                 nohup bash -lc 'cd /app && {custom_cmd} > {log} 2>&1' < /dev/null & \
+                 nohup bash -lc {launch} < /dev/null & \
                  echo TEACHER_LAUNCHED",
                 teacher_log = teacher_log,
-                custom_cmd = final_custom_cmd,
-                log = teacher_log,
+                launch = pipeline::sh_quote(&launch),
             )
         }
     } else {
@@ -1957,14 +1964,17 @@ async fn run_deploy_teacher_task(
                 script = pipeline::sh_quote(&inner_script),
             )
         } else {
+            // `serve_cmd_inner` embeds the prepare step, which contains single
+            // quotes. A hardcoded `bash -lc '…'` wrapper would close early and
+            // corrupt the argv — quote the whole script instead.
+            let launch = format!("{serve} > {log} 2>&1", serve = serve_cmd_inner, log = teacher_log);
             format!(
                 "mkdir -p /root/hf-cache; \
                  truncate -s 0 {teacher_log} 2>/dev/null || rm -f {teacher_log}; \
-                 nohup bash -lc '{serve} > {log} 2>&1' < /dev/null & \
+                 nohup bash -lc {launch} < /dev/null & \
                  echo TEACHER_LAUNCHED",
                 teacher_log = teacher_log,
-                serve = serve_cmd_inner,
-                log = teacher_log,
+                launch = pipeline::sh_quote(&launch),
             )
         }
     };
@@ -2504,6 +2514,45 @@ async fn benchmark_teacher(
     bench::benchmark_endpoint(&endpoint, &model, &opts).await
 }
 
+// ── Benchmark history ────────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn bench_list() -> Result<Vec<bench_store::BenchRecord>> {
+    bench_store::load_all().await
+}
+
+#[tauri::command]
+async fn bench_save(record: bench_store::BenchRecord) -> Result<bench_store::BenchRecord> {
+    bench_store::save(record).await
+}
+
+#[tauri::command]
+async fn bench_delete(id: String) -> Result<()> {
+    bench_store::delete(&id).await
+}
+
+#[tauri::command]
+async fn bench_clear() -> Result<()> {
+    bench_store::clear().await
+}
+
+/// Render the benchmark history to a PDF and write it to `dest`.
+/// Returns the path written so the UI can offer to reveal it.
+#[tauri::command]
+async fn bench_export_pdf(dest: String) -> Result<String> {
+    let records = bench_store::load_all().await?;
+    let stamp = chrono::Local::now().to_rfc3339();
+    let pdf = bench_pdf::render_report(&records, &stamp);
+    let path = std::path::PathBuf::from(dest.trim());
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+    }
+    tokio::fs::write(&path, pdf).await?;
+    Ok(path.to_string_lossy().to_string())
+}
+
 #[tauri::command]
 async fn test_trained_model(run_id: String, prompt: String) -> Result<String> {
     let cfg = config::load().await?;
@@ -2606,6 +2655,19 @@ PY"#,
         adapter_path = serde_json::to_string(&adapter_path).unwrap_or_else(|_| "\"\"".to_string()),
         prompt = serde_json::to_string(&prompt).unwrap_or_else(|_| "\"\"".to_string()),
     );
+    // Heal the student's serving environment before loading. The base model is
+    // user-chosen, so this runs the same model-agnostic resolution the teacher
+    // uses (config metadata, requirements.txt, vLLM registry) plus the two pins
+    // the adapter path needs. Placed before `set -e` in the script so a failed
+    // heal warns instead of aborting a run that might still have worked.
+    let script = format!(
+        "{}{}",
+        crate::deps::student_heal_cmd(&crate::llamafactory::resolve_trainable_repo(
+            &run.student_model,
+        )),
+        script,
+    );
+
     let cmd = if cfg.docker.enabled {
         pipeline::wrap_docker_cmd(&script, &container_name)
     } else {
@@ -2895,6 +2957,19 @@ PY"#,
             .unwrap_or(""),
         sample_size = sample_size,
     );
+    // Heal the student's serving environment before loading. The base model is
+    // user-chosen, so this runs the same model-agnostic resolution the teacher
+    // uses (config metadata, requirements.txt, vLLM registry) plus the two pins
+    // the adapter path needs. Placed before `set -e` in the script so a failed
+    // heal warns instead of aborting a run that might still have worked.
+    let script = format!(
+        "{}{}",
+        crate::deps::student_heal_cmd(&crate::llamafactory::resolve_trainable_repo(
+            &run.student_model,
+        )),
+        script,
+    );
+
     let cmd = if cfg.docker.enabled {
         pipeline::wrap_docker_cmd(&script, &container_name)
     } else {
@@ -3036,6 +3111,19 @@ PY"#,
         repo = serde_json::to_string(&repo).unwrap_or_else(|_| "\"\"".to_string()),
         private = private_flag,
     );
+    // Heal the student's serving environment before loading. The base model is
+    // user-chosen, so this runs the same model-agnostic resolution the teacher
+    // uses (config metadata, requirements.txt, vLLM registry) plus the two pins
+    // the adapter path needs. Placed before `set -e` in the script so a failed
+    // heal warns instead of aborting a run that might still have worked.
+    let script = format!(
+        "{}{}",
+        crate::deps::student_heal_cmd(&crate::llamafactory::resolve_trainable_repo(
+            &run.student_model,
+        )),
+        script,
+    );
+
     let cmd = if cfg.docker.enabled {
         pipeline::wrap_docker_cmd(&script, &container_name)
     } else {
@@ -3301,6 +3389,19 @@ PY"#,
         quantization = serde_json::to_string(&quantization).unwrap_or_else(|_| "\"\"".to_string()),
         private = private_flag,
     );
+    // Heal the student's serving environment before loading. The base model is
+    // user-chosen, so this runs the same model-agnostic resolution the teacher
+    // uses (config metadata, requirements.txt, vLLM registry) plus the two pins
+    // the adapter path needs. Placed before `set -e` in the script so a failed
+    // heal warns instead of aborting a run that might still have worked.
+    let script = format!(
+        "{}{}",
+        crate::deps::student_heal_cmd(&crate::llamafactory::resolve_trainable_repo(
+            &run.student_model,
+        )),
+        script,
+    );
+
 
     let cmd = if cfg.docker.enabled {
         pipeline::wrap_docker_cmd(&script, &container_name)
@@ -3505,6 +3606,11 @@ fn main() {
 ping_teacher,
             teacher_chat,
             benchmark_teacher,
+            bench_list,
+            bench_save,
+            bench_delete,
+            bench_clear,
+            bench_export_pdf,
             test_trained_model,
             run_inference_benchmark,
             merge_and_upload_model,

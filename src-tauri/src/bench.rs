@@ -128,6 +128,31 @@ fn mean(values: &[f64]) -> f64 {
     }
 }
 
+/// Split a streaming `delta` object into `(reasoning, content)`.
+///
+/// The thinking field has moved between vLLM releases: older builds (and
+/// DeepSeek-style parsers) emit `reasoning_content`, while vLLM 0.27.1 emits
+/// `reasoning` in both streaming deltas and the non-streaming message. Reading
+/// only one name makes the first *content* token look like the first token of
+/// all, which folds the whole thinking phase into TTFT and pins the reported
+/// thinking cost at 0 ms.
+fn delta_text(delta: Option<&serde_json::Value>) -> (&str, &str) {
+    let Some(delta) = delta else {
+        return ("", "");
+    };
+    let reasoning = delta
+        .get("reasoning_content")
+        .or_else(|| delta.get("reasoning"))
+        .or_else(|| delta.get("thinking"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let content = delta
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    (reasoning, content)
+}
+
 /// One streamed request. Returns `(ttft_ms, ttfc_ms, e2el_ms, prompt_tokens,
 /// output_tokens, itl_ms)`.
 async fn stream_one(
@@ -203,16 +228,7 @@ async fn stream_one(
                 .and_then(|c| c.get(0))
                 .and_then(|c| c.get("delta"));
 
-            // Thinking tokens arrive in `reasoning_content` once a reasoning
-            // parser is active; both fields count as generated output.
-            let reasoning = delta
-                .and_then(|d| d.get("reasoning_content"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let content = delta
-                .and_then(|d| d.get("content"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let (reasoning, content) = delta_text(delta);
 
             if !reasoning.is_empty() || !content.is_empty() {
                 let now = Instant::now();
@@ -373,4 +389,142 @@ pub async fn benchmark_endpoint(
         samples,
         captured_at: chrono::Local::now().to_rfc3339(),
     })
+}
+
+// ── Delta parsing ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod delta_tests {
+    use super::delta_text;
+    use serde_json::json;
+
+    fn delta(value: serde_json::Value) -> (String, String) {
+        let owned = value;
+        let (r, c) = delta_text(Some(&owned));
+        (r.to_string(), c.to_string())
+    }
+
+    #[test]
+    fn reads_the_new_reasoning_field() {
+        // vLLM 0.27.1: verified against a live Qwen3.8-27B deployment.
+        let (r, c) = delta(json!({"reasoning": "thinking hard"}));
+        assert_eq!(r, "thinking hard");
+        assert_eq!(c, "");
+    }
+
+    #[test]
+    fn reads_the_legacy_reasoning_content_field() {
+        let (r, c) = delta(json!({"reasoning_content": "older build"}));
+        assert_eq!(r, "older build");
+        assert_eq!(c, "");
+    }
+
+    #[test]
+    fn reads_thinking_field() {
+        let (r, _c) = delta(json!({"thinking": "alt spelling"}));
+        assert_eq!(r, "alt spelling");
+    }
+
+    #[test]
+    fn prefers_reasoning_content_when_both_present() {
+        let (r, _c) = delta(json!({"reasoning_content": "a", "reasoning": "b"}));
+        assert_eq!(r, "a");
+    }
+
+    #[test]
+    fn reads_content_independently_of_reasoning() {
+        let (r, c) = delta(json!({"content": "the answer"}));
+        assert_eq!(r, "");
+        assert_eq!(c, "the answer");
+    }
+
+    #[test]
+    fn handles_empty_and_missing_deltas() {
+        assert_eq!(delta(json!({})), (String::new(), String::new()));
+        assert_eq!(delta(json!({"content": ""})), (String::new(), String::new()));
+        let (r, c) = delta_text(None);
+        assert!(r.is_empty() && c.is_empty());
+    }
+
+    #[test]
+    fn ignores_non_string_fields() {
+        // Some servers send null for an idle field; that must not panic.
+        let (r, c) = delta(json!({"reasoning": null, "content": null}));
+        assert!(r.is_empty() && c.is_empty());
+    }
+
+    #[test]
+    fn role_only_opening_chunk_yields_nothing() {
+        // Observed as chunk0 on the live server: {"content":"","role":"assistant"}.
+        let (r, c) = delta(json!({"content": "", "role": "assistant"}));
+        assert!(r.is_empty() && c.is_empty());
+    }
+}
+
+// ── Live benchmark against a real deployment ─────────────────────────────────
+//
+// Ignored by default (needs a running vLLM teacher). Run explicitly:
+//
+//   FT_BENCH_ENDPOINT=http://HOST:PORT FT_BENCH_MODEL=Qwen/Qwen3.8-27B \
+//     cargo test --lib bench::live -- --ignored --nocapture
+#[cfg(test)]
+mod live {
+    use super::*;
+
+    fn env(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    }
+
+    #[test]
+    #[ignore = "requires a running vLLM teacher endpoint"]
+    fn benchmarks_a_live_teacher() {
+        let Some(endpoint) = env("FT_BENCH_ENDPOINT") else {
+            eprintln!("skipping: set FT_BENCH_ENDPOINT");
+            return;
+        };
+        let model = env("FT_BENCH_MODEL").unwrap_or_else(|| "Qwen/Qwen3.8-27B".to_string());
+        let effort = env("FT_BENCH_EFFORT");
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        for (label, concurrency) in [("serial", 1u32), ("concurrent x4", 4u32)] {
+            let opts = BenchOptions {
+                concurrency,
+                max_tokens: 256,
+                reasoning_effort: effort.clone(),
+                timeout_s: 300,
+            };
+            match rt.block_on(benchmark_endpoint(&endpoint, &model, &opts)) {
+                Ok(r) => {
+                    println!("\n=== {label} ===");
+                    println!("completed={} failed={}", r.completed, r.failed);
+                    println!("TTFT  mean={:.0}ms median={:.0}ms p95={:.0}ms",
+                        r.mean_ttft_ms, r.median_ttft_ms, r.p95_ttft_ms);
+                    println!("TPOT  mean={:.1}ms", r.mean_tpot_ms);
+                    println!("ITL   mean={:.1}ms", r.mean_itl_ms);
+                    println!("E2EL  mean={:.0}ms", r.mean_e2el_ms);
+                    println!("out   {:.1} tok/s   total {:.1} tok/s",
+                        r.output_tokens_per_s, r.total_tokens_per_s);
+                    println!("req   {:.2}/s   tokens out={} in={}",
+                        r.request_throughput, r.total_output_tokens, r.total_input_tokens);
+                    for s in &r.samples {
+                        println!("  #{:<2} ttft={:>6.0}ms think={:>6} tok={:>4} tpot={:>6.1}ms {:>6.1} tok/s",
+                            s.index,
+                            s.ttft_ms,
+                            s.ttfc_ms.map(|t| format!("{:.0}ms", (t - s.ttft_ms).max(0.0)))
+                                .unwrap_or_else(|| "-".to_string()),
+                            s.output_tokens,
+                            s.tpot_ms,
+                            s.output_tps);
+                    }
+                    if !r.errors.is_empty() {
+                        println!("errors: {:?}", r.errors);
+                    }
+                    assert!(r.completed > 0, "benchmark produced no completed requests");
+                    assert!(r.mean_ttft_ms > 0.0, "TTFT should be measurable");
+                    assert!(r.total_output_tokens > 0, "token counts should be populated");
+                }
+                Err(e) => panic!("{label} benchmark failed: {e}"),
+            }
+        }
+    }
 }

@@ -898,6 +898,59 @@ export interface TeacherBenchReport {
   capturedAt: string;
 }
 
+export type BenchKind = "teacher" | "student" | "deployment";
+
+/** Configuration snapshot a benchmark was measured under. */
+export interface BenchConfigSnapshot {
+  servingProfile?: string | null;
+  reasoningEffort?: string | null;
+  reasoningParser?: string | null;
+  dtype?: string | null;
+  maxModelLen?: number | null;
+  gpuMemoryUtilization?: number | null;
+  maxNumSeqs?: number | null;
+  maxNumBatchedTokens?: number | null;
+  tensorParallel?: number | null;
+  quantization?: string | null;
+  kvCacheDtype?: string | null;
+  prefixCaching?: boolean | null;
+  notes?: string[];
+}
+
+export interface BenchMetrics {
+  ttftMs?: number | null;
+  medianTtftMs?: number | null;
+  p95TtftMs?: number | null;
+  tpotMs?: number | null;
+  itlMs?: number | null;
+  e2elMs?: number | null;
+  outputTokensPerS?: number | null;
+  totalTokensPerS?: number | null;
+  requestThroughput?: number | null;
+  accuracy?: number | null;
+  samples?: number | null;
+  concurrency?: number | null;
+  totalOutputTokens?: number | null;
+}
+
+/**
+ * One stored benchmark run.
+ *
+ * The config snapshot travels with the numbers on purpose: it is what makes
+ * "Standard vs Optimized" answerable later, rather than showing an unlabelled
+ * set of figures with no record of what produced them.
+ */
+export interface BenchRecord {
+  id: string;
+  kind: BenchKind;
+  label: string;
+  model: string;
+  endpoint: string;
+  config: BenchConfigSnapshot;
+  metrics: BenchMetrics;
+  capturedAt: string;
+}
+
 export interface IngestStream {
   id: string;
   files: string[];

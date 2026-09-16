@@ -48,9 +48,28 @@ export function optimizedMaxNumSeqs(memoryGb: number): number {
   return memoryGb > 0 && memoryGb < 48 ? 8 : 64;
 }
 
-export function optimizedProfileSummary(memoryGb: number): string {
+/**
+ * True for hybrid checkpoints mixing full attention with linear-attention
+ * ("Mamba"-style) layers — Qwen3.5 and later, Jamba, and anything advertising a
+ * Gated DeltaNet.
+ *
+ * Mirrors `is_hybrid_linear_attention` in src-tauri/src/config.rs. vLLM reports
+ * prefix caching over Mamba layers as experimental, so the optimized profile
+ * leaves it off for these models rather than quietly risking corrupted
+ * training data.
+ */
+export function isHybridLinearAttention(repoId: string): boolean {
+  const repo = (repoId || "").toLowerCase();
+  if (["mamba", "gdn", "jamba", "deltanet"].some((m) => repo.includes(m))) return true;
+  return ["qwen3.5", "qwen3.6", "qwen3.7", "qwen3.8", "qwen3_5", "qwen3_6", "qwen3_7", "qwen3_8"].some((m) =>
+    repo.includes(m),
+  );
+}
+
+export function optimizedProfileSummary(memoryGb: number, repoId = ""): string {
   const context = optimizedMaxModelLen(memoryGb);
-  return `Optimized: FP8 KV cache, prefix caching, ${context.toLocaleString()} ctx, ${optimizedMaxNumSeqs(memoryGb)} seqs`;
+  const prefix = isHybridLinearAttention(repoId) ? "" : "prefix caching, ";
+  return `Optimized: FP8 KV cache, ${prefix}${context.toLocaleString()} ctx, ${optimizedMaxNumSeqs(memoryGb)} seqs`;
 }
 
 export function standardProfileSummary(config: TeacherConfig): string {

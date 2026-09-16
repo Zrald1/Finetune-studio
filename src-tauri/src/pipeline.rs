@@ -995,6 +995,7 @@ async fn run_pipeline(
         container_name = ensure_vllm_compatible(
             session_opt.as_ref().unwrap(),
             &docker_cfg,
+            &container_name,
             |msg: &str| {
                 emit_log(&app_clone, &run_id_clone, msg, "stage");
             },
@@ -1732,14 +1733,22 @@ else: print('NOT_FOUND')\
                         );
                         wrap_docker_cmd_detached(&inner_cmd, &container_name)
                     } else {
+                        // User-supplied commands routinely contain quotes, so
+                        // quote the whole script rather than wrapping it in a
+                        // hardcoded pair — that would close early and corrupt
+                        // the argv handed to the inner shell.
+                        let launch = format!(
+                            "cd /app && {custom_cmd} > {log} 2>&1",
+                            custom_cmd = final_custom_cmd,
+                            log = teacher_log,
+                        );
                         format!(
                             "mkdir -p /root/hf-cache; \
                      truncate -s 0 {teacher_log} 2>/dev/null || rm -f {teacher_log}; \
-                     nohup bash -lc 'cd /app && {custom_cmd} > {log} 2>&1' < /dev/null & \
+                     nohup bash -lc {launch} < /dev/null & \
                      echo TEACHER_LAUNCHED",
                             teacher_log = teacher_log,
-                            custom_cmd = final_custom_cmd,
-                            log = teacher_log,
+                            launch = sh_quote(&launch),
                         )
                     }
                 } else {
@@ -1860,15 +1869,19 @@ else: print('NOT_FOUND')\
                         );
                         wrap_docker_cmd_detached(&inner_cmd, &container_name)
                     } else {
-                        format!(
-                            "mkdir -p /root/hf-cache; \
-                             truncate -s 0 {teacher_log} 2>/dev/null || rm -f {teacher_log}; \
-                             nohup bash -lc 'cd /app && {env}{runtime_prepare}vllm serve {model} --port {port} --host 0.0.0.0 \
-                                --max-model-len {mml} --dtype {dtype} --download-dir /root/hf-cache \
-                                --tensor-parallel-size {tp} --gpu-memory-utilization {gpu_mem} {tok_arg} {extra_args} \
-                                > {log} 2>&1' < /dev/null & \
-                             echo TEACHER_LAUNCHED",
-                            teacher_log = teacher_log,
+                        // The prepare step contains single quotes (`python3 -c
+                        // 'import torchvision'`), so the launch line cannot use a
+                        // hardcoded `bash -lc '…'` wrapper — those quotes would
+                        // close the wrapper early and hand the inner shell a
+                        // mangled argv (observed as `torchvision: line 1: cd:
+                        // /app: No such file or directory`). Quote the whole
+                        // script instead, which is what the docker path already
+                        // does via `wrap_docker_cmd`.
+                        let launch = format!(
+                            "cd /app && {env}{runtime_prepare}vllm serve {model} --port {port} --host 0.0.0.0 \
+                             --max-model-len {mml} --dtype {dtype} --download-dir /root/hf-cache \
+                             --tensor-parallel-size {tp} --gpu-memory-utilization {gpu_mem} {tok_arg} {extra_args} \
+                             > {log} 2>&1",
                             env = vllm_env,
                             runtime_prepare = runtime_prepare,
                             model = sh_quote(&model_arg),
@@ -1880,6 +1893,14 @@ else: print('NOT_FOUND')\
                             tok_arg = tokenizer_arg,
                             extra_args = extra_args,
                             log = teacher_log,
+                        );
+                        format!(
+                            "mkdir -p /root/hf-cache; \
+                             truncate -s 0 {teacher_log} 2>/dev/null || rm -f {teacher_log}; \
+                             nohup bash -lc {launch} < /dev/null & \
+                             echo TEACHER_LAUNCHED",
+                            teacher_log = teacher_log,
+                            launch = sh_quote(&launch),
                         )
                     }
                 };
@@ -2482,8 +2503,9 @@ else: print('NOT_FOUND')\
                     temperature: 0.25,
                     top_p: 0.9,
                     repetition_penalty: 1.05,
-                    // Match generator.rs default — reasoning teachers truncate at 1024.
-                    max_tokens: 4096,
+                    // Match generator.rs default — thinking tokens count against
+                    // this budget even with a reasoning parser installed.
+                    max_tokens: 8192,
                     max_pairs_per_chunk: run_cfg.max_pairs_per_chunk.max(1),
                     concurrency: run_cfg.concurrency.max(1),
                     api_key: None,
@@ -5246,7 +5268,7 @@ async fn preflight_gpu_health(
             "warn",
         );
         if docker_enabled {
-            emit_log(app, &run.id, "[fix] recreate the container with GPU access: docker run --device=/dev/kfd --device=/dev/dri --group-add video --group-add render --security-opt seccomp=unconfined --ipc=host --shm-size 16G ... vllm/vllm-openai-rocm:nightly\n", "warn");
+            emit_log(app, &run.id, "[fix] recreate the container with GPU access: docker run --device=/dev/kfd --device=/dev/dri --group-add video --group-add render --security-opt seccomp=unconfined --ipc=host --shm-size 16G ... vllm/vllm-openai-rocm:v0.27.1\n", "warn");
             emit_log(app, &run.id, &format!("[fix] then verify: docker exec {container_name} rocm-smi (must list the card)\n"), "warn");
         } else {
             emit_log(app, &run.id, "[fix] confirm the host sees the GPU with `rocm-smi`, and that the user is in the `video` and `render` groups.\n", "warn");
@@ -5546,7 +5568,7 @@ fn diagnose_failure(log_text: &str) -> Option<(String, Vec<String>)> {
                 "the GPU is not visible inside the Docker container (rocm-smi returned nothing / training fell back to CPU). A PyTorch reinstall cannot fix this — the container is missing the GPU device nodes or render/video group access.".to_string(),
                 vec![
                     "On the host, confirm the GPU is healthy: `rocm-smi` (should list the card).".to_string(),
-                    "Recreate the container with GPU access: `docker run --device=/dev/kfd --device=/dev/dri --group-add video --group-add render --security-opt seccomp=unconfined --ipc=host --shm-size 16G ... vllm/vllm-openai-rocm:nightly`".to_string(),
+                    "Recreate the container with GPU access: `docker run --device=/dev/kfd --device=/dev/dri --group-add video --group-add render --security-opt seccomp=unconfined --ipc=host --shm-size 16G ... vllm/vllm-openai-rocm:v0.27.1`".to_string(),
                     "Verify inside the container: `docker exec rocm rocm-smi` — it must show the GPU before training will use it.".to_string(),
                     "If running bare-metal (no Docker), disable the Docker toggle in Credentials so training runs directly on the host GPU.".to_string(),
                 ],
@@ -5801,6 +5823,17 @@ async fn write_file_auto(
     Ok(())
 }
 
+/// True when `container` runs a vLLM new enough for the modern architectures
+/// this app targets (>= 0.19.0). Used to decide whether a pre-existing,
+/// differently-named container is worth reusing.
+pub async fn container_has_compatible_vllm(session: &SshSession, container: &str) -> bool {
+    let probe = format!(
+        "docker exec {cn} python3 -c \"import vllm; v=vllm.__version__; parts=v.split('.'); major=int(parts[0]) if parts else 0; minor=int(parts[1]) if len(parts)>1 else 0; exit(0 if (major>0 or minor>=19) else 1)\" 2>/dev/null",
+        cn = container
+    );
+    matches!(session.exec_blocking(&probe).await, Ok(r) if r.exit_code == 0)
+}
+
 pub async fn ensure_container(session: &SshSession, cfg: &DockerConfig) -> Result<String> {
     if !cfg.enabled {
         return Ok(cfg.container_name.clone());
@@ -5855,6 +5888,19 @@ pub async fn ensure_container(session: &SshSession, cfg: &DockerConfig) -> Resul
         return Ok(name.clone());
     }
 
+    // Image tags are unreliable: the DigitalOcean ROCm + vLLM 1-Click runs its
+    // container with the image `rocm:latest`, which carries no "vllm" marker at
+    // all. Ask the containers themselves instead of guessing from the tag — but
+    // only reuse one whose vLLM is genuinely new enough, so we never end up
+    // deleting a container we did not create in order to "upgrade" it.
+    if target_is_vllm {
+        for (name, _img) in &running {
+            if container_has_compatible_vllm(session, name).await {
+                return Ok(name.clone());
+            }
+        }
+    }
+
     // Check if exists but stopped
     let check_exists = "docker ps -a --format '{{.Names}}'";
     let r_exists = session.exec_blocking(check_exists).await?;
@@ -5892,21 +5938,29 @@ pub async fn ensure_container(session: &SshSession, cfg: &DockerConfig) -> Resul
 /// Checks if the vLLM inside the container is recent enough (>= 0.19.0) to
 /// have support for modern architectures like Gemma 4.  If not, stops
 /// and recreates the container with the configured Docker image (which should
-/// be `vllm/vllm-openai-rocm:nightly`).  The `/root` volume preserves HF cache
+/// be `vllm/vllm-openai-rocm:v0.27.1`).  The `/root` volume preserves HF cache
 /// across recreation.
+///
+/// `container_name` is the container that `ensure_container` actually resolved,
+/// which may not be `cfg.container_name` — it deliberately reuses a
+/// differently-named container when one is already running. Probing the
+/// configured name instead of the resolved one would run `docker exec` against
+/// a container that does not exist, read the failure as "vLLM too old", and
+/// then pull a multi-gigabyte image to build a redundant sibling.
 pub async fn ensure_vllm_compatible(
     session: &SshSession,
     cfg: &DockerConfig,
+    container_name: &str,
     log_fn: impl Fn(&str),
 ) -> Result<String> {
     if !cfg.enabled {
-        return Ok(cfg.container_name.clone());
+        return Ok(container_name.to_string());
     }
 
     // vLLM versions are 0.x.y (e.g. 0.19.0).  Check minor >= 19 when major == 0.
     let version_check = format!(
         "docker exec {cn} python3 -c \"import vllm; v=vllm.__version__; parts=v.split('.'); major=int(parts[0]) if parts else 0; minor=int(parts[1]) if len(parts)>1 else 0; exit(0 if (major>0 or minor>=19) else 1)\" 2>/dev/null",
-        cn = cfg.container_name
+        cn = container_name
     );
     let r = session.exec_blocking(&version_check).await?;
     if r.exit_code == 0 {
@@ -5915,24 +5969,37 @@ pub async fn ensure_vllm_compatible(
         // Only present in nightly builds after 2025-08-10.  Check by testing if the fix exists.
         let fix_check = format!(
             "docker exec {cn} python3 -c \"import vllm.model_executor.models.utils as u; import inspect; src=inspect.getsource(u._load_module); exit(0 if 'input_max' in src or 'ffw_layer' in src or 'audio_tower' in src else 1)\" 2>/dev/null",
-            cn = cfg.container_name
+            cn = container_name
         );
         let fr = session.exec_blocking(&fix_check).await?;
         if fr.exit_code == 0 {
-            return Ok(cfg.container_name.clone());
+            return Ok(container_name.to_string());
         }
         log_fn(&format!(
             "[compat] vLLM in container '{}' lacks Gemma 4 weight loading fix (PR #49797) — recreating with image '{}'...\n",
-            cfg.container_name, cfg.image_name
+            container_name, cfg.image_name
         ));
     } else {
         log_fn(&format!(
             "[compat] vLLM in container '{}' is too old (< 0.19.0) — recreating with image '{}'...\n",
-            cfg.container_name, cfg.image_name
+            container_name, cfg.image_name
         ));
     }
 
-    let stop_cmd = format!("docker rm -f {} 2>/dev/null; true", cfg.container_name);
+    // Only ever destroy a container this app manages. A reused, differently
+    // named container may be the user's own — the DigitalOcean 1-Click ships a
+    // JupyterLab image that happens to bundle vLLM — and `docker rm -f` would
+    // take their whole environment with it.
+    if container_name != cfg.container_name {
+        return Err(AppError::ssh(format!(
+            "Container '{}' has a vLLM too old for the models this app targets, but it is not \
+             managed by this app — leaving it untouched. Either point the container name at it \
+             and update its image yourself, or stop it so a fresh '{}' can be created.",
+            container_name, cfg.container_name
+        )));
+    }
+
+    let stop_cmd = format!("docker rm -f {} 2>/dev/null; true", container_name);
     let _ = session.exec_blocking(&stop_cmd).await;
 
     let pull_cmd = format!("docker pull {} 2>&1", cfg.image_name);

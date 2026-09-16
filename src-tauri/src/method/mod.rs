@@ -828,4 +828,94 @@ mod zrald_simulation {
         let json = serde_json::to_string(&RunStatus::Training).expect("serialize");
         assert_eq!(json, "\"training\"");
     }
+
+    /// Dump every method's real train command to `FT_DUMP_DIR`, one file each.
+    ///
+    /// Used to drive the on-GPU test matrix: the commands executed on the
+    /// droplet are byte-for-byte what the app would send, so a method that
+    /// works here works in the app.
+    #[test]
+    #[ignore = "writes files; run explicitly with FT_DUMP_DIR set"]
+    fn dump_all_method_commands() {
+        let Some(dir) = std::env::var("FT_DUMP_DIR").ok().filter(|d| !d.trim().is_empty()) else {
+            eprintln!("skipping: set FT_DUMP_DIR");
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).expect("dump dir");
+
+        let methods = [
+            "lora", "qlora", "dora", "loraplus", "pissa", "unsloth",
+            "full", "freeze", "galore", "badam",
+        ];
+        for method in methods {
+            let mut lora = base_lora();
+            lora.method = method.to_string();
+            let run = run_with(method, lora.clone());
+            match build_train_cmd(method, &run, &lora, "") {
+                Ok(cmd) => {
+                    let path = dir.join(format!("{method}.sh"));
+                    std::fs::write(&path, &cmd).expect("write");
+                    println!("wrote {}", path.display());
+                }
+                Err(e) => println!("{method}: build failed: {e}"),
+            }
+        }
+    }
+
+    /// Every non-RL method must produce a command that a real shell parses.
+    #[test]
+    fn every_training_method_emits_a_parseable_command() {
+        for method in [
+            "lora", "qlora", "dora", "loraplus", "pissa", "unsloth",
+            "full", "freeze", "galore", "badam", "custom",
+        ] {
+            let mut lora = base_lora();
+            lora.method = method.to_string();
+            if method == "custom" {
+                // `custom` refuses to build without at least one command.
+                lora.custom_commands = vec!["llamafactory-cli train {train_yaml}".to_string()];
+                lora.custom_method_name = "my-method".to_string();
+            }
+            let run = run_with(method, lora.clone());
+            let cmd = build_train_cmd(method, &run, &lora, "").unwrap_or_else(|e| {
+                panic!("{method}: build_train_cmd failed: {e}")
+            });
+            assert!(!cmd.trim().is_empty(), "{method} produced an empty command");
+            assert_eq!(
+                cmd.matches('\'').count() % 2,
+                0,
+                "{method}: unbalanced single quotes would break the wrapper"
+            );
+            // `custom` runs arbitrary user commands, so it has no train.yaml.
+            if method != "custom" {
+                assert!(
+                    cmd.contains("train.yaml") || cmd.contains("llamafactory"),
+                    "{method}: expected a LLaMA-Factory invocation"
+                );
+            }
+        }
+    }
+
+    /// Every method must route through the isolated trainer venv.
+    #[test]
+    fn every_llamafactory_method_uses_the_isolated_venv() {
+        for method in [
+            "lora", "qlora", "dora", "loraplus", "pissa", "unsloth",
+            "full", "freeze", "galore", "badam",
+        ] {
+            let mut lora = base_lora();
+            lora.method = method.to_string();
+            let run = run_with(method, lora.clone());
+            let cmd = build_train_cmd(method, &run, &lora, "").expect("build");
+            assert!(
+                cmd.contains(".lf_venv"),
+                "{method} must not install into the shared container env"
+            );
+            assert!(
+                !cmd.contains("which llamafactory-cli"),
+                "{method} still probes the system CLI instead of the venv"
+            );
+        }
+    }
 }

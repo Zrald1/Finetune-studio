@@ -1556,7 +1556,7 @@ export default function CredentialsPanel({
                 <label className="text-[10px] uppercase tracking-widest theme-muted font-black ml-1">Docker Image</label>
                 <input
                   type="text"
-                  placeholder="vllm/vllm-openai-rocm:nightly"
+                  placeholder="vllm/vllm-openai-rocm:v0.27.1"
                   value={docker?.imageName ?? ""}
                   onChange={(e) => patchDocker({ imageName: e.target.value })}
                   className="w-full px-4 py-3 premium-input rounded-xl text-sm-fluid font-mono placeholder-white/10 focus:outline-none shadow-inner"

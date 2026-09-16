@@ -2,7 +2,7 @@ use crate::error::Result;
 use crate::llamafactory;
 use crate::runs::{LoraConfig, Run};
 
-use super::common::sh_quote;
+use super::common::{rocm_prelude, sh_quote};
 use super::{CommandKind, LlamaFactoryYamlOptions, MethodOptions};
 
 pub const KEY: &str = "zrald";
@@ -740,9 +740,8 @@ print("[zrald] LoRA saved to", OUTPUT_DIR, flush=True)
     // container's system Python.
     let install_prefix = format!(
         "set -o pipefail; \
-         {hf_export} cd {dir} && \
-         export UNSLOTH_IS_ROCM=1 PYTORCH_ROCM_ARCH=${{PYTORCH_ROCM_ARCH:-gfx950}} \
-                PYTHONUNBUFFERED=1 && \
+         {rocm_prelude}{hf_export} cd {dir} && \
+         export UNSLOTH_IS_ROCM=1 PYTHONUNBUFFERED=1 && \
          (test -d {venv}/bin || python3 -m venv {venv}) && \
          . {venv}/bin/activate && \
          ({probe} || \
@@ -758,6 +757,7 @@ print("[zrald] LoRA saved to", OUTPUT_DIR, flush=True)
         hf_export = hf_export,
         dir = sh_quote(&run.remote_dir),
         venv = sh_quote(&venv_dir),
+        rocm_prelude = rocm_prelude(),
         torch_probe = torch_hip_probe,
         rocm_torch = rocm_torch_install,
         probe = zrald_probe,

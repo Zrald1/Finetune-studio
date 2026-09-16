@@ -5,6 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AppConfig,
+  BenchRecord,
   Chunk,
   GPUState,
   HfDatasetRepo,
@@ -189,6 +190,13 @@ export const api = {
       reasoningEffort: opts?.reasoningEffort ?? null,
       timeoutS: opts?.timeoutS ?? null,
     }),
+  // Benchmark history
+  benchList: () => invoke<BenchRecord[]>("bench_list"),
+  benchSave: (record: BenchRecord) => invoke<BenchRecord>("bench_save", { record }),
+  benchDelete: (id: string) => invoke<void>("bench_delete", { id }),
+  benchClear: () => invoke<void>("bench_clear"),
+  benchExportPdf: (dest: string) => invoke<string>("bench_export_pdf", { dest }),
+
   testTrainedModel: (runId: string, prompt: string) =>
     invoke<string>("test_trained_model", { runId, prompt }),
   runInferenceBenchmark: (runId: string, sampleSize?: number) =>

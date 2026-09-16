@@ -4,7 +4,7 @@ use crate::error::Result;
 use crate::llamafactory;
 use crate::runs::{LoraConfig, Run};
 
-use super::common::sh_quote;
+use super::common::{rocm_prelude, sh_quote};
 use super::{CommandKind, LlamaFactoryYamlOptions, MethodOptions};
 
 pub const KEY: &str = "zrald_offline";
@@ -967,7 +967,7 @@ export PYTHONUNBUFFERED=1
 # loads in ROCm mode. Without UNSLOTH_IS_ROCM=1, unsloth falls back to CUDA/CPU,
 # fails to find the AMD GPU, and the process is killed with SIGTERM (exit 143).
 export UNSLOTH_IS_ROCM=1
-export PYTORCH_ROCM_ARCH="${{PYTORCH_ROCM_ARCH:-gfx1100}}"
+{rocm_prelude}
 LOCAL_REWARD_TEACHER={local_reward_teacher}
 TEACHER_PORT={teacher_port}
 TEACHER_LOG={teacher_log}
@@ -1107,6 +1107,7 @@ stop_teacher
 trap - EXIT
 "#,
         local_reward_teacher = if local_reward_teacher { "1" } else { "0" },
+        rocm_prelude = rocm_prelude(),
         venv_dir = sh_quote(&venv_dir),
         teacher_port = teacher_port,
         teacher_log = sh_quote(&teacher_log),
@@ -1176,9 +1177,8 @@ trap - EXIT
     // run skips reinstall and starts training immediately.
     let install_prefix = format!(
         "set -eo pipefail; \
-         {hf_export} cd {dir} && \
-         export UNSLOTH_IS_ROCM=1 PYTORCH_ROCM_ARCH=${{PYTORCH_ROCM_ARCH:-gfx950}} \
-                PYTHONUNBUFFERED=1 && \
+         {rocm_prelude}{hf_export} cd {dir} && \
+         export UNSLOTH_IS_ROCM=1 PYTHONUNBUFFERED=1 && \
          (test -d {venv}/bin || python3 -m venv {venv}) && \
          . {venv}/bin/activate && \
          ({probe} || \
@@ -1193,6 +1193,7 @@ trap - EXIT
          mkdir -p {output_dir} && \
          : > {dir}/log.txt && : > {dir}/errorlog.txt && : > {dir}/train.log",
         hf_export = hf_export,
+        rocm_prelude = rocm_prelude(),
         dir = sh_quote(&run.remote_dir),
         venv = sh_quote(&venv_dir),
         torch_probe = torch_hip_probe,

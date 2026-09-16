@@ -1989,6 +1989,7 @@ function TeacherStep({
   const [benchRunning, setBenchRunning] = useState(false);
   const [benchReport, setBenchReport] = useState<TeacherBenchReport | null>(null);
   const [benchError, setBenchError] = useState<string | null>(null);
+  const [benchSaved, setBenchSaved] = useState<string | null>(null);
   const [benchConcurrent, setBenchConcurrent] = useState(false);
 
   const runBenchmark = useCallback(async () => {
@@ -2005,12 +2006,63 @@ function TeacherStep({
         reasoningEffort: value.reasoningEffort ?? null,
       });
       setBenchReport(report);
+
+      // Persist to the benchmark history so this run can be compared against a
+      // later one on a different serving profile — that comparison is the whole
+      // reason the history exists.
+      try {
+        const saved = await api.benchSave({
+          id: "",
+          kind: "teacher",
+          label: `Teacher — ${value.servingProfile === "optimized" ? "Optimized" : "Standard"}${
+            benchConcurrent ? " (concurrent ×4)" : ""
+          }`,
+          model: value.repoId,
+          endpoint: teacherEndpoint,
+          config: {
+            servingProfile: value.servingProfile ?? "standard",
+            reasoningEffort: value.reasoningEffort ?? null,
+            reasoningParser: value.reasoningParser ?? null,
+            dtype: value.dtype,
+            maxModelLen: value.maxModelLen,
+            gpuMemoryUtilization: value.gpuMemoryUtilization ?? null,
+            maxNumSeqs: value.maxNumSeqs ?? null,
+            maxNumBatchedTokens: value.maxNumBatchedTokens ?? null,
+            tensorParallel: value.tensorParallel,
+            prefixCaching: null,
+            notes: [
+              gpuStatus?.gpuName ? `gpu=${gpuStatus.gpuName}` : "",
+              gpuStatus?.memoryTotal ? `vram=${Math.round(gpuStatus.memoryTotal / 1024)}GB` : "",
+              benchConcurrent ? "mode=concurrent" : "mode=serial",
+            ].filter(Boolean),
+          },
+          metrics: {
+            ttftMs: report.meanTtftMs,
+            medianTtftMs: report.medianTtftMs,
+            p95TtftMs: report.p95TtftMs,
+            tpotMs: report.meanTpotMs,
+            itlMs: report.meanItlMs,
+            e2elMs: report.meanE2elMs,
+            outputTokensPerS: report.outputTokensPerS,
+            totalTokensPerS: report.totalTokensPerS,
+            requestThroughput: report.requestThroughput,
+            samples: report.completed,
+            concurrency: report.concurrency,
+            totalOutputTokens: report.totalOutputTokens,
+          },
+          capturedAt: "",
+        });
+        setBenchSaved(`Saved to Benchmark history as "${saved.label}".`);
+      } catch (saveErr: any) {
+        setBenchSaved(null);
+        setBenchError(`Benchmark ran, but could not be saved to history: ${saveErr}`);
+      }
     } catch (e: any) {
       setBenchError(String(e));
     } finally {
       setBenchRunning(false);
     }
-  }, [benchRunning, teacherEndpoint, value.repoId, value.reasoningEffort, benchConcurrent]);
+  }, [benchRunning, teacherEndpoint, value.repoId, value.reasoningEffort, benchConcurrent, value, gpuStatus]);
 
   const deployLogRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
@@ -2139,7 +2191,7 @@ function TeacherStep({
                 {!value.autoTune
                   ? "Manual vLLM parameters are active"
                   : value.servingProfile === "optimized"
-                    ? optimizedProfileSummary((gpuStatus?.memoryTotal || 0) / 1024)
+                    ? optimizedProfileSummary((gpuStatus?.memoryTotal || 0) / 1024, value.repoId)
                     : standardProfileSummary(value)}
               </div>
             </div>
@@ -2429,6 +2481,13 @@ function TeacherStep({
 
               {benchError && !benchRunning && (
                 <div className="px-5 py-4 text-[10px] text-red-400 font-mono uppercase tracking-widest">✕ {benchError}</div>
+              )}
+
+              {benchSaved && !benchRunning && !benchError && (
+                <div className="px-5 py-3 text-[10px] text-emerald-400 font-mono border-b border-white/5 flex items-center gap-2">
+                  <CheckCircle2 className="w-3.5 h-3.5" />
+                  {benchSaved} — see the <span className="theme-accent font-black">Benchmarks</span> tab to compare profiles.
+                </div>
               )}
 
               {benchReport && !benchRunning && (

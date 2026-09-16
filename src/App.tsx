@@ -14,6 +14,7 @@ import RunDashboard from "./components/RunDashboard";
 import DeployPanel from "./components/DeployPanel";
 
 import ThemeSwitcher from "./components/ThemeSwitcher";
+import BenchmarksPanel from "./components/BenchmarksPanel";
 import {
   Layers,
   Sparkles,
@@ -22,10 +23,11 @@ import {
   Wrench,
   Server,
   Rocket,
+  BarChart3,
   Bot,
 } from "lucide-react";
 
-type Tab = "pipeline" | "gpu" | "credentials" | "terminal" | "runs" | "deploy" | "robotVision";
+type Tab = "pipeline" | "gpu" | "credentials" | "terminal" | "runs" | "deploy" | "benchmarks" | "robotVision";
 
 const DEFAULT_CONFIG: AppConfig = {
   ssh: { host: "", port: 22, username: "root" },
@@ -37,7 +39,7 @@ const DEFAULT_CONFIG: AppConfig = {
   docker: {
     enabled: true,
     containerName: "rocm-vllm",
-    imageName: "vllm/vllm-openai-rocm:nightly",
+    imageName: "vllm/vllm-openai-rocm:v0.27.1",
     startArgs: "--device=/dev/kfd --device=/dev/dri --network=host --ipc=host --group-add video -v /root:/root",
     bypassTerminal: false,
   },
@@ -400,6 +402,7 @@ export default function App() {
           <TabButton active={tab === "credentials"} onClick={() => setTab("credentials")} icon={<Wrench className="w-3.5 h-3.5" />} label="Credentials" />
           <TabButton active={tab === "runs"} onClick={() => setTab("runs")} icon={<ListChecks className="w-3.5 h-3.5" />} label="Runs" />
           <TabButton active={tab === "deploy"} onClick={() => setTab("deploy")} icon={<Rocket className="w-3.5 h-3.5" />} label="Deploy" />
+          <TabButton active={tab === "benchmarks"} onClick={() => setTab("benchmarks")} icon={<BarChart3 className="w-3.5 h-3.5" />} label="Benchmarks" />
           <TabButton active={tab === "robotVision"} onClick={() => setTab("robotVision")} icon={<Bot className="w-3.5 h-3.5" />} label="Robot Vision" />
         </div>
 
@@ -470,6 +473,9 @@ export default function App() {
             </div>
             <div style={{ display: tab === "deploy" ? "" : "none" }} className="w-full lg:h-full lg:overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-white/10">
               <DeployPanel config={config} />
+            </div>
+            <div style={{ display: tab === "benchmarks" ? "" : "none" }} className="w-full lg:h-full lg:overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-white/10">
+              <BenchmarksPanel />
             </div>
           </section>
 

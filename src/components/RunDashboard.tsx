@@ -548,6 +548,46 @@ const mergeAndUpload = async () => {
       const parsed = JSON.parse(output);
       setBenchResult(parsed);
       setBenchLogs((prev) => [...prev, `Benchmark complete: ${parsed.accuracy}% accuracy`]);
+
+      // Persist to the shared benchmark history so a student model can be
+      // compared across training methods or LoRA settings.
+      try {
+        await api.benchSave({
+          id: "",
+          kind: "student",
+          label: `Student — ${run.lora?.method ?? "lora"}`,
+          model: run.studentModel,
+          endpoint: run.remoteDir ?? "",
+          config: {
+            dtype: "bfloat16",
+            maxModelLen: run.lora?.cutoffLen ?? null,
+            quantization: run.lora?.method ?? null,
+            notes: [
+              `method=${run.lora?.method ?? "lora"}`,
+              run.lora?.r != null ? `rank=${run.lora.r}` : "",
+              run.lora?.alpha != null ? `alpha=${run.lora.alpha}` : "",
+              run.lora?.epochs != null ? `epochs=${run.lora.epochs}` : "",
+              `samples=${benchSampleSize}`,
+            ].filter(Boolean),
+          },
+          metrics: {
+            accuracy: parsed.accuracy,
+            ttftMs: parsed.perf?.mean_ttft_ms ?? null,
+            tpotMs: parsed.perf?.mean_tpot_ms ?? parsed.generation?.tpot_ms ?? null,
+            e2elMs: parsed.perf?.mean_e2el_ms ?? parsed.generation?.mean_ms ?? null,
+            outputTokensPerS:
+              parsed.generation?.output_tokens_per_s ?? parsed.perf?.output_tokens_per_s ?? null,
+            samples: parsed.total,
+            totalOutputTokens:
+              parsed.generation?.total_output_tokens ?? parsed.perf?.total_output_tokens ?? null,
+            concurrency: 1,
+          },
+          capturedAt: "",
+        });
+        setBenchLogs((prev) => [...prev, "Saved to Benchmark history."]);
+      } catch (saveErr: any) {
+        setBenchLogs((prev) => [...prev, `Benchmark ran, but history save failed: ${saveErr}`]);
+      }
     } catch (e: any) {
       setBenchError(e.message || String(e));
       setBenchLogs((prev) => [...prev, `Error: ${e.message}`]);
