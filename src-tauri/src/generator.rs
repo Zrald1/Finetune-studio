@@ -84,9 +84,9 @@ RULES:
 - Answer should be 2-5 sentences, direct and complete.
 - If the source is unrelated to '{topic}', respond EXACTLY: SKIP: off-topic
 
-OUTPUT FORMAT (strict):
-QUESTION:
-ANSWER:
+OUTPUT FORMAT (strict — replace the angle brackets, emit no preamble):
+QUESTION: <a specific question, one sentence>
+ANSWER: <a complete self-contained answer of 2-5 sentences that names the entities involved and explains the mechanism, not a bare term>
 
 Source material:
 """
@@ -108,10 +108,10 @@ RULES:
 - Reasoning should be 3-7 sentences using words like "because", "therefore", "since", or "this means".
 - If source is unrelated to '{topic}', respond EXACTLY: SKIP: off-topic
 
-OUTPUT FORMAT (strict):
-QUESTION:
-REASONING:
-ANSWER:
+OUTPUT FORMAT (strict — replace the angle brackets, emit no preamble):
+QUESTION: <a specific question, one sentence>
+REASONING: <3-6 sentences that work through the problem step by step, naming the evidence each step relies on>
+ANSWER: <a complete self-contained conclusion of 2-4 sentences>
 
 Source material:
 """
@@ -172,14 +172,14 @@ RULES:
 - Use formulas, equations, or rule citations where applicable.
 - If unrelated to '{topic}', respond EXACTLY: SKIP: off-topic
 
-OUTPUT FORMAT (strict):
-PROBLEM:
+OUTPUT FORMAT (strict — replace the angle brackets, emit no preamble):
+PROBLEM: <the problem statement>
 SOLUTION:
-Step 1:
-Step 2:
-Step 3:
+Step 1: <the step, with the reasoning that justifies it>
+Step 2: <the step, with the reasoning that justifies it>
+Step 3: <the step, with the reasoning that justifies it>
 [continue as needed]
-FINAL ANSWER:
+FINAL ANSWER: <the answer as a complete sentence, not a bare value>
 
 Source material:
 """
@@ -201,10 +201,10 @@ RULES:
 - Vary instruction types: summarize, explain, classify, extract, compare, calculate.
 - If unrelated to '{topic}', respond EXACTLY: SKIP: off-topic
 
-OUTPUT FORMAT (strict):
-INSTRUCTION:
-INPUT:
-OUTPUT:
+OUTPUT FORMAT (strict — replace the angle brackets, emit no preamble):
+INSTRUCTION: <what the user wants done>
+INPUT: <the data to act on, quoted from the source>
+OUTPUT: <the completed result, in full>
 
 Source material:
 """
@@ -228,11 +228,11 @@ RULES:
 - Keep tone natural and helpful. No reasoning leakage.
 - If unrelated to '{topic}', respond EXACTLY: SKIP: off-topic
 
-OUTPUT FORMAT (strict):
-USER:
-ASSISTANT:
-USER:
-ASSISTANT:
+OUTPUT FORMAT (strict — replace the angle brackets, emit no preamble):
+USER: <the learner's first question>
+ASSISTANT: <a complete reply of 2-4 sentences>
+USER: <a natural follow-up>
+ASSISTANT: <a complete reply of 2-4 sentences>
 
 Source material:
 """
@@ -1260,6 +1260,17 @@ pub enum QualityReject {
     ChoicesTooShort,
     AnswerNotInChoices,
     QuestionTooShort,
+    /// The answer is too short to carry training signal. Measured live: 12–13
+    /// character answers ("ATP and NADPH.") used to pass.
+    AnswerTooShort { actual: usize, floor: usize },
+    /// A reasoning block that is present but perfunctory.
+    ReasoningTooShort { actual: usize, floor: usize },
+    /// The answer's vocabulary is largely absent from the source chunk — the
+    /// hallucination gate from the provenance-gating literature.
+    NotGrounded { score: f32 },
+    /// Figures in the answer that appear nowhere in the source. Numeric
+    /// fabrication is the most damaging and the cheapest to detect exactly.
+    UngroundedNumbers { numbers: Vec<String> },
 }
 
 impl QualityReject {
@@ -1270,11 +1281,76 @@ impl QualityReject {
             Self::ChoicesTooShort => "one or more choices too short".into(),
             Self::AnswerNotInChoices => "answer letter not in A-D".into(),
             Self::QuestionTooShort => "question too short to be meaningful".into(),
+            Self::AnswerTooShort { .. } => "answer too short to teach anything".into(),
+            Self::ReasoningTooShort { .. } => "reasoning too short for its format".into(),
+            Self::NotGrounded { .. } => "answer not supported by the source chunk".into(),
+            Self::UngroundedNumbers { .. } => "answer contains figures absent from the source".into(),
+        }
+    }
+
+    /// Stable key for the coverage report. Kept separate from `label()` so
+    /// rewording a message never silently reshapes the report's buckets.
+    pub fn key(&self) -> &'static str {
+        match self {
+            Self::NoReasoningKeywords => "no-reasoning-keywords",
+            Self::ChoicesDuplicated => "choices-duplicated",
+            Self::ChoicesTooShort => "choices-too-short",
+            Self::AnswerNotInChoices => "answer-not-in-choices",
+            Self::QuestionTooShort => "question-too-short",
+            Self::AnswerTooShort { .. } => "answer-too-short",
+            Self::ReasoningTooShort { .. } => "reasoning-too-short",
+            Self::NotGrounded { .. } => "not-grounded",
+            Self::UngroundedNumbers { .. } => "ungrounded-number",
+        }
+    }
+
+    /// Extra detail for the run log, when the variant carries any.
+    pub fn detail(&self) -> Option<String> {
+        match self {
+            Self::AnswerTooShort { actual, floor } => Some(format!("{actual} < {floor} chars")),
+            Self::ReasoningTooShort { actual, floor } => Some(format!("{actual} < {floor} chars")),
+            Self::NotGrounded { score } => Some(format!("grounding {score:.2}")),
+            Self::UngroundedNumbers { numbers } => Some(format!("not in source: {}", numbers.join(", "))),
+            _ => None,
         }
     }
 }
 
 pub fn validate_quality(pair: &GeneratedPair) -> std::result::Result<(), QualityReject> {
+    // 0. Grounding and length gates run first: they apply to every format, and
+    //    a hallucinated answer is not made acceptable by well-formed choices.
+    //
+    //    Provenance is exact — `source_text` is the chunk that induced this
+    //    pair, captured at generation time, so the gate observes the real
+    //    evidence relation rather than approximating it with retrieval.
+    if !pair.source_text.trim().is_empty() {
+        let fabricated = crate::quality::ungrounded_numbers(&pair.answer, &pair.source_text);
+        if !fabricated.is_empty() {
+            return Err(QualityReject::UngroundedNumbers { numbers: fabricated });
+        }
+        let score = crate::quality::grounding_score(&pair.answer, &pair.source_text);
+        if score.is_finite() && score < crate::quality::MIN_GROUNDING {
+            return Err(QualityReject::NotGrounded { score });
+        }
+    }
+
+    let answer_floor = crate::quality::min_answer_chars(pair.format);
+    let answer_len = pair.answer.trim().chars().count();
+    if answer_len < answer_floor {
+        return Err(QualityReject::AnswerTooShort { actual: answer_len, floor: answer_floor });
+    }
+
+    let reasoning_floor = crate::quality::min_reasoning_chars(pair.format);
+    if reasoning_floor > 0 && !pair.reasoning.trim().is_empty() {
+        let reasoning_len = pair.reasoning.trim().chars().count();
+        if reasoning_len < reasoning_floor {
+            return Err(QualityReject::ReasoningTooShort {
+                actual: reasoning_len,
+                floor: reasoning_floor,
+            });
+        }
+    }
+
     // 1. Question length
     if pair.question.split_whitespace().count() < 6 {
         return Err(QualityReject::QuestionTooShort);

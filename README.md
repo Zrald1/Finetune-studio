@@ -16,6 +16,7 @@ All heavy ML work runs on a **remote GPU droplet over SSH** (built and tested on
 - [Teacher model](#teacher-model)
 - [Serving profiles](#serving-profiles)
 - [Self-healing dependencies](#self-healing-dependencies)
+- [Dataset quality](#dataset-quality)
 - [Benchmarking](#benchmarking)
 - [ZRALD post-training](#zrald-post-training)
 - [Training methods](#training-methods)
@@ -131,6 +132,96 @@ merge+convert). The student base model is user-chosen, so it gets the same resol
 
 The one thing that cannot self-heal is the **vLLM image** — architecture support lives in
 the container. The resolver says so plainly rather than pretending to fix it.
+
+---
+
+## Dataset quality
+
+Synthetic data fails quietly. A bad pair does not crash a run — it teaches the model
+something wrong, and you find out months later. The gates here follow the published
+practice rather than inventing heuristics:
+
+- **LIMA** (Zhou et al., 2023): 1,000 filtered examples beat 50,000 noisy ones, because
+  fine-tuning teaches *format* far more readily than knowledge. Filtering matters more
+  than volume.
+- **Provenance-preserving gating** (arXiv 2606.11127): gating against the exact source
+  chunk beats post-hoc retrieval, and hallucination gates and reward gates reject
+  **disjoint** failure populations — so both are needed.
+- **Self-Instruct** (Wang et al., 2022): deduplicate with an overlap filter. Alpaca
+  shipped ~20% near-duplicates without one.
+
+### The gates
+
+| Gate | Catches | Threshold |
+|---|---|---|
+| **Grounding** | Answers whose vocabulary the source never used | ≥ 0.35 of content words traceable |
+| **Numeric fabrication** | Invented figures — the most damaging hallucination, and the cheapest to detect exactly | every number must appear in the source |
+| **Answer length** | Terse answers that teach nothing (measured live: 12–13 chars passing) | 30–60 chars by format |
+| **Reasoning length** | Perfunctory reasoning blocks | 80–120 chars where the format has one |
+| **Near-duplicate** | The Alpaca failure mode | token similarity + length ratio |
+| **Structural** | Malformed choices, invalid answer letters, missing reasoning | — |
+
+Provenance is exact: `source_text` is the chunk that induced the pair, captured at
+generation time, so the grounding gate observes the real evidence relation instead of
+approximating it with retrieval.
+
+### Prompt shape matters more than the filter
+
+Measured against a live Qwen3.8-27B, the single largest quality lever was not a gate at
+all — it was the output-format block. A bare `ANSWER:` with nothing after it gave the
+model no length signal:
+
+| Format block | Answer length | Yield |
+|---|---|---|
+| `ANSWER:` | **7 chars** (`RuBisCO`) | **0/6** |
+| `ANSWER: <a complete self-contained answer of 2-5 sentences that names the entities involved…>` | **202–302 chars** | **6/6** |
+
+Every built-in prompt now shows the expected *shape* of each field. A length floor alone
+would have rejected the entire run rather than fixing it. Training loss on the same source
+fell from **1.2281 to 0.4087** once answers carried real content.
+
+**Known limitation:** the teacher tends to cover one concept per chunk repeatedly rather than
+spanning the source. All four test pairs addressed the same fact, so the trained student
+answered that fact correctly and hallucinated an untested one. The fix is to vary the
+extraction angle across calls on the same chunk; until then, `question diversity` in the
+coverage report is the signal to watch.
+
+### Custom templates
+
+Any format's prompt can be overridden per topic. Two things are enforced, because they
+decide whether the output is usable at all:
+
+1. **The template must contain `{chunk_text}`.** Without it the teacher answers from its
+   own memory, and nothing downstream can tell.
+2. **The template must ask for the markers the parser reads** (`QUESTION:`, `ANSWER:`, …).
+   A template requesting prose gets prose, the parser finds nothing, and the run
+   "succeeds" with an empty dataset. That failure is caught at validation, not after a
+   long generation.
+
+A template that fails validation falls back to the built-in with the reason in the run
+log — a broken override can never silently produce nothing. Starter presets are provided
+for exam-style and clinical MCQs, and for Socratic reasoning that must cite the source.
+
+### Trainer compatibility
+
+LLaMA-Factory truncates an example that overruns `cutoff_len` **after** applying the chat
+template, so what disappears is the tail of the answer — or the closing control tokens. The
+maintainers' own description of the resulting run: *"get a bad result, and have zero idea
+why."*
+
+The app measures the real requirement and says so:
+
+```
+[quality] WARNING: 2 of 4 example(s) (50%) exceed cutoff_len=128 and will be silently
+          truncated by the trainer — the tail of the answer is what gets cut.
+          Raise cutoff_len to at least 150 in the Train step to train on them intact.
+```
+
+### Coverage reporting
+
+A rejection count alone is not actionable. Each run reports what it kept, *why* it
+dropped the rest, mean grounding, mean answer length, distinct sources and topics, and
+question diversity — the difference between "it ran" and "the dataset is usable".
 
 ---
 
@@ -292,6 +383,8 @@ FineTune/
         ├── main.rs                  # Tauri command surface + event wiring
         ├── lib.rs                   # Shared library (headless server reuses it)
         ├── config.rs                # Config load/save + serving-profile resolution
+        ├── quality.rs               # Dataset quality gates + coverage report
+        ├── template.rs              # Custom dataset templates + validation
         ├── deps.rs                  # Self-healing dependency reconciler
         ├── bench.rs                 # Token-level inference benchmark (TTFT/TPOT/ITL)
         ├── bench_store.rs           # Persistent benchmark history
@@ -388,7 +481,7 @@ No code changes are needed for new domains, models, or datasets.
 
 ## Testing
 
-**154 Rust tests and 343 frontend assertions**, all passing.
+**197 Rust tests and 343 frontend assertions**, all passing.
 
 There is no browser test framework. Verification is split between Rust unit tests and a Node-driven simulation of the frontend profile logic.
 
@@ -405,6 +498,8 @@ npm run lint           # tsc --noEmit
 | `config::deploy_simulation` | 24 | Standard/Optimized resolution across 8 VRAM sizes, reasoning-effort mapping, shell safety of emitted flags, fresh-install defaults, legacy-config roundtrip |
 | `method::zrald_simulation` | 26 | Placeholder substitution, heredoc integrity, generated Python **compiled with a real interpreter**, generated shell **parsed with a real `bash -n`**, clamping, reward-endpoint fallback, venv isolation |
 | `deps` | 30 | Reconciler, universal resolver, student healer, shell safety |
+| `quality` | 27 | Grounding, numeric fabrication, length floors, trainer-compatibility, coverage reporting |
+| `template` | 16 | Custom-template validation, placeholder handling, preset integrity |
 | `scripts/simulate-deploy.ts` | 343 assertions | The frontend profile logic, imported from the same module the app uses — not a reimplementation |
 
 The deploy simulation and the Rust tests assert the **same VRAM ladder**, so a change on one side that isn't mirrored on the other fails loudly instead of silently diverging at deploy time.
@@ -442,6 +537,11 @@ The webview's right-click context menu is suppressed so the app reads as a nativ
 | `422 This size is unavailable` | A retired `-devcloud` / `-contracted` slug | Slugs are normalised automatically; re-sync the account to refresh the plan list. |
 | `401 Unable to authenticate you` | A Developer Cloud host was set as **API Base** with a `dop_v1_` token | Clear the API Base field — DigitalOcean tokens are served by the standard control plane. |
 | Teacher output truncated mid-answer | Thinking consumed the token budget | Lower the thinking effort, or raise the generator's `max_tokens`. |
+| Answers are a single word | The prompt's format block gave no length signal | Fixed in this version; if using a custom template, show the expected shape after each marker. |
+| `[template] … rejected — using the built-in` | A custom template cannot work (no `{chunk_text}`, or missing parser markers) | The reason is in the log; the run continues with the built-in. |
+| Most pairs rejected as `not-grounded` | The teacher is answering from memory, not the source | Check the chunk actually reaches the prompt, and that retrieval is returning relevant text. |
+| `[quality] WARNING: … exceed cutoff_len` | LLaMA-Factory will silently truncate those examples | Raise `cutoff_len` in the Train step to the reported value. |
+| Student answers correctly on one fact, invents another | The dataset covered only part of the source | Watch `question diversity`; the fix is varying the extraction angle per chunk. |
 | `error: unrecognized arguments: --swap-space` | Those flags were removed from vLLM | The Deploy page no longer emits them; update to this version. |
 | `RuntimeError: reshape_and_cache, cache_kernels.hip` | `--kv-cache-dtype fp8_e5m2` is broken on gfx942 | Use `fp8` (native E4M3FNUZ) or `auto`; the UI no longer offers e5m2. |
 | `ValueError: Free memory ... is less than desired GPU memory utilization` | Another model is still resident (often the teacher) | Unload it first — two vLLM engines cannot share the card. |

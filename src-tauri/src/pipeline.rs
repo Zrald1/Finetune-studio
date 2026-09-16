@@ -2168,12 +2168,13 @@ else: print('NOT_FOUND')\
             }
         }
 
-        let base_prompt = run_cfg.prompt_template.clone().unwrap_or_else(|| {
-            let fmt = run_cfg
-                .dataset_format
-                .unwrap_or(generator::DatasetFormat::MultipleChoice);
-            fmt.default_prompt().to_string()
-        });
+        let dataset_format = run_cfg
+            .dataset_format
+            .unwrap_or(generator::DatasetFormat::MultipleChoice);
+        let base_prompt = run_cfg
+            .prompt_template
+            .clone()
+            .unwrap_or_else(|| dataset_format.default_prompt().to_string());
 
         // Resolve the effective list of topic loops. Single-topic UI fills this
         // with one element; multi-topic UI fills it with N rows.
@@ -2453,6 +2454,38 @@ else: print('NOT_FOUND')\
                     .clone()
                     .filter(|p| !p.trim().is_empty())
                     .unwrap_or_else(|| base_prompt.clone());
+                // A per-topic template is a custom template, so it gets the same
+                // gate: without `{chunk_text}` the teacher answers from memory,
+                // and without the format's markers the parser finds nothing and
+                // the run "succeeds" with an empty dataset. `resolve` falls back
+                // to the built-in when the override cannot work, and the reason
+                // is surfaced below rather than swallowed.
+                let (effective_prompt, template_check) = crate::template::resolve(
+                    dataset_format,
+                    Some(effective_prompt.as_str()),
+                );
+                if let Some(ref chk) = template_check {
+                    if !chk.is_ok() {
+                        emit_log(
+                            app,
+                            &run.id,
+                            &format!(
+                                "[template] topic '{}' template rejected — using the built-in {}. {}\n",
+                                topic_value,
+                                dataset_format.display_name(),
+                                chk.summary()
+                            ),
+                            "reject",
+                        );
+                    } else if !chk.warnings.is_empty() {
+                        emit_log(
+                            app,
+                            &run.id,
+                            &format!("[template] topic '{}': {}\n", topic_value, chk.summary()),
+                            "info",
+                        );
+                    }
+                }
                 let prompt_with_topic = effective_prompt.replace("{topic}", &topic_value);
                 let topic_cap = topic_target.total_questions;
                 let mut topic_tag = topic_target
@@ -3569,6 +3602,69 @@ else: print('NOT_FOUND')\
             )
             .await?;
             if let Ok(qa_jsonl) = fs::read_to_string(&local_jsonl_path).await {
+                // Trainer-compatibility check. LLaMA-Factory truncates an
+                // example that overruns `cutoff_len` *after* applying the chat
+                // template, so the tail of the answer is what disappears — the
+                // maintainers' own description is "get a bad result, and have
+                // zero idea why". Measuring the real requirement here turns
+                // that silent corruption into a number the user can act on.
+                let examples: Vec<(String, String, String)> = qa_jsonl
+                    .lines()
+                    .filter_map(|line| {
+                        let row: serde_json::Value = serde_json::from_str(line).ok()?;
+                        let msgs = row.get("messages")?.as_array()?;
+                        let user = msgs
+                            .iter()
+                            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+                            .and_then(|m| m.get("content"))
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("");
+                        let assistant = msgs
+                            .iter()
+                            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+                            .and_then(|m| m.get("content"))
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("");
+                        Some((user.to_string(), assistant.to_string(), String::new()))
+                    })
+                    .collect();
+                if !examples.is_empty() {
+                    let need = crate::quality::required_cutoff_len(&examples);
+                    let have = run.lora.cutoff_len as usize;
+                    if have > 0 && need > have {
+                        let over = crate::quality::truncation_rate(&examples, have);
+                        emit_log(
+                            app,
+                            &run.id,
+                            &format!(
+                                "[quality] WARNING: {} of {} example(s) ({:.0}%) exceed cutoff_len={}                                  and will be silently truncated by the trainer — the tail of the                                  answer is what gets cut. Raise cutoff_len to at least {} in the                                  Train step to train on them intact.
+",
+                                examples
+                                    .iter()
+                                    .filter(|(q, a, r)| !crate::quality::fits_cutoff(q, a, r, have))
+                                    .count(),
+                                examples.len(),
+                                over * 100.0,
+                                have,
+                                need
+                            ),
+                            "warn",
+                        );
+                    } else {
+                        emit_log(
+                            app,
+                            &run.id,
+                            &format!(
+                                "[quality] all {} example(s) fit cutoff_len={} (longest needs ~{} tokens)
+",
+                                examples.len(),
+                                have,
+                                need
+                            ),
+                            "stage",
+                        );
+                    }
+                }
                 write_file_auto(
                     session,
                     cfg.docker.enabled,

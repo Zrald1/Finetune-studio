@@ -16,11 +16,13 @@ mod llamafactory;
 mod manifest;
 mod method;
 mod pipeline;
+mod quality;
 mod qdrant;
 mod research;
 mod robot;
 mod runs;
 mod serve;
+mod template;
 mod ssh;
 
 use crate::config::{
