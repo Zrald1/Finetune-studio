@@ -4,14 +4,15 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
 const API_BASE: &str = "https://api.digitalocean.com/v2";
-// AMD Instinct MI-series GPU droplets are NOT served by the standard control
-// plane. They live on the AMD Developer Cloud endpoint and use size slugs with
-// a `-devcloud` suffix (e.g. `gpu-mi300x1-192gb-devcloud`). On the standard host
-// these sizes appear in `/sizes` with an empty `regions` array and every create
-// returns `422 "Size is not available in this region."`. Routing GPU `/sizes`
-// and droplet creation to this host (with the devcloud slug) is what actually
-// lets the create succeed. Verified end-to-end against a live AMD-team token.
-const AMD_API_BASE: &str = "https://api-amd.digitalocean.com/v2";
+// The legacy AMD Developer Cloud host `api-amd.digitalocean.com` now answers
+// every request with `301 Moved Permanently` pointing at
+// `https://api.devcloud.amd.com/v2`, and that host rejects DigitalOcean
+// personal access tokens (`dop_v1_*`) with `401 Unable to authenticate you`.
+// AMD-team tokens are therefore served by the standard control plane, which
+// lists the AMD Instinct MI-series sizes and accepts plain (non-`-devcloud`)
+// slugs. This host is kept only as an opt-in override for tenants holding a
+// Developer Cloud-native token rather than a DigitalOcean PAT.
+const AMD_DEVCLOUD_API_BASE: &str = "https://api.devcloud.amd.com/v2";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -255,10 +256,40 @@ fn token(cfg: &DigitalOceanConfig) -> Result<&str> {
     Ok(token)
 }
 
+/// Effective control-plane base URL. Defaults to the standard DigitalOcean host
+/// (which serves AMD, NVIDIA, and CPU plans alike, including AMD-team tokens);
+/// an explicit `api_base` override wins so tenants on a different Developer
+/// Cloud host can point the app at it without a code change.
+fn api_base(cfg: &DigitalOceanConfig) -> String {
+    let override_base = cfg.api_base.trim().trim_end_matches('/');
+    if override_base.is_empty() {
+        API_BASE.to_string()
+    } else {
+        override_base.to_string()
+    }
+}
+
+/// Hosts to probe when discovering GPU plans. The override (if any) is tried
+/// first, then the standard control plane, then the AMD Developer Cloud host.
+/// Failures are tolerated so a token that only works on one host still lists
+/// plans from that host.
+fn discovery_bases(cfg: &DigitalOceanConfig) -> Vec<String> {
+    let mut bases = vec![api_base(cfg)];
+    push_unique(&mut bases, API_BASE.to_string());
+    push_unique(&mut bases, AMD_DEVCLOUD_API_BASE.to_string());
+    bases
+}
+
 fn client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .user_agent("fine-tune-studio/0.1")
         .timeout(std::time::Duration::from_secs(30))
+        // Control-plane hosts do not legitimately redirect. Following one would
+        // rewrite the create POST into a GET (per RFC 9110) and silently return
+        // a droplet *list* instead of provisioning — or, for the retired AMD
+        // host, land on a different API that rejects the token with 401. Not
+        // following keeps the failure explicit and the redirect visible.
+        .redirect(reqwest::redirect::Policy::none())
         .build()?)
 }
 
@@ -298,7 +329,7 @@ async fn get_json<T: for<'de> Deserialize<'de>>(
     action: &str,
 ) -> Result<T> {
     let res = client()?
-        .get(format!("{API_BASE}{path}"))
+        .get(format!("{}{path}", api_base(cfg)))
         .bearer_auth(token(cfg)?)
         .send()
         .await?;
@@ -368,76 +399,40 @@ async fn fetch_all_sizes(cfg: &DigitalOceanConfig, base: &str) -> Result<Vec<DoS
 }
 
 pub async fn list_gpu_sizes(cfg: &DigitalOceanConfig) -> Result<Vec<DoSize>> {
-    let mut sizes = fetch_all_sizes(cfg, API_BASE).await?;
+    let bases = discovery_bases(cfg);
+    let mut sizes = fetch_all_sizes(cfg, &bases[0]).await?;
 
-    // AMD MI-series GPU sizes only appear (with real regions and the creatable
-    // `-devcloud` slug) on the AMD Developer Cloud endpoint. Merge them in;
-    // tolerate failure so a standard-host-only token still lists CPU/NVIDIA GPUs.
-    if let Ok(amd_sizes) = fetch_all_sizes(cfg, AMD_API_BASE).await {
-        for size in amd_sizes {
-            if !sizes.iter().any(|existing| existing.slug == size.slug) {
-                sizes.push(size);
+    // AMD plans are served by whichever host the token is entitled on, so merge
+    // in extras from the remaining hosts. Failures are tolerated so a token that
+    // only works on one host still lists that host's plans.
+    for base in bases.iter().skip(1) {
+        if let Ok(extra) = fetch_all_sizes(cfg, base).await {
+            for size in extra {
+                if !sizes.iter().any(|existing| existing.slug == size.slug) {
+                    sizes.push(size);
+                }
             }
         }
     }
 
     sizes.retain(is_amd_gpu_size);
 
+    // Fallback catalog, used only for plans the control plane fails to report.
+    // Specs, prices, and regions mirror the live AMD Instinct catalog: the
+    // MI300X generation is no longer provisionable for current AMD teams, and
+    // the MI350X/MI355X plans are spot-only. The retired `-devcloud` and
+    // `-contracted` slugs are deliberately absent — sending them now yields
+    // `422 "This size is unavailable."`.
     let hardcoded_sizes = vec![
         DoSize {
-            slug: "gpu-mi300x1-192gb".to_string(),
-            memory: 245760,
-            vcpus: 20,
-            disk: 720,
-            transfer: 15000.0,
-            price_monthly: Some(1432.8),
-            price_hourly: Some(1.99),
-            regions: vec!["atl1".to_string()],
-            available: true,
-            description: "AMD Instinct MI300X (1 GPU)".to_string(),
-            gpu_info: Some(DoGpuInfo {
-                count: Some(1),
-                model: Some("AMD Instinct MI300X".to_string()),
-                vram: Some(DoAmount {
-                    amount: Some(192.0),
-                    unit: Some("GB".to_string()),
-                }),
-            }),
-        },
-        DoSize {
-            slug: "gpu-mi300x8-1536gb".to_string(),
-            memory: 1966080,
-            vcpus: 160,
-            disk: 2046,
-            transfer: 60000.0,
-            price_monthly: Some(11462.4),
-            price_hourly: Some(15.92),
-            regions: vec!["atl1".to_string()],
-            available: true,
-            description: "AMD Instinct MI300X (8 GPUs)".to_string(),
-            gpu_info: Some(DoGpuInfo {
-                count: Some(8),
-                model: Some("AMD Instinct MI300X".to_string()),
-                vram: Some(DoAmount {
-                    amount: Some(1536.0),
-                    unit: Some("GB".to_string()),
-                }),
-            }),
-        },
-        DoSize {
             slug: "gpu-mi325x1-256gb".to_string(),
-            memory: 167936,
+            memory: 163840,
             vcpus: 20,
             disk: 720,
             transfer: 15000.0,
-            price_monthly: Some(1648.8),
-            price_hourly: Some(2.29),
-            regions: vec![
-                "atl1".to_string(),
-                "nyc2".to_string(),
-                "sfo3".to_string(),
-                "tor1".to_string(),
-            ],
+            price_monthly: Some(2827.2),
+            price_hourly: Some(3.8),
+            regions: vec!["nyc2".to_string(), "tor1".to_string()],
             available: true,
             description: "AMD Instinct MI325X (1 GPU)".to_string(),
             gpu_info: Some(DoGpuInfo {
@@ -451,18 +446,13 @@ pub async fn list_gpu_sizes(cfg: &DigitalOceanConfig) -> Result<Vec<DoSize>> {
         },
         DoSize {
             slug: "gpu-mi325x8-2048gb".to_string(),
-            memory: 1341440,
+            memory: 1310720,
             vcpus: 160,
             disk: 2046,
             transfer: 60000.0,
-            price_monthly: Some(13190.4),
-            price_hourly: Some(18.32),
-            regions: vec![
-                "atl1".to_string(),
-                "nyc2".to_string(),
-                "sfo3".to_string(),
-                "tor1".to_string(),
-            ],
+            price_monthly: Some(22617.6),
+            price_hourly: Some(30.4),
+            regions: vec!["nyc2".to_string()],
             available: true,
             description: "AMD Instinct MI325X (8 GPUs)".to_string(),
             gpu_info: Some(DoGpuInfo {
@@ -475,19 +465,19 @@ pub async fn list_gpu_sizes(cfg: &DigitalOceanConfig) -> Result<Vec<DoSize>> {
             }),
         },
         DoSize {
-            slug: "gpu-mi350x1-288gb".to_string(),
+            slug: "gpu-mi355x1-288gb-spot".to_string(),
             memory: 262144,
             vcpus: 24,
             disk: 720,
             transfer: 15000.0,
-            price_monthly: Some(3168.0),
-            price_hourly: Some(4.4),
-            regions: vec!["atl1".to_string(), "ric1".to_string()],
+            price_monthly: Some(3348.0),
+            price_hourly: Some(4.5),
+            regions: vec!["mem1".to_string()],
             available: true,
-            description: "AMD Instinct MI350X (1 GPU)".to_string(),
+            description: "AMD Instinct MI355X (1 GPU, Spot)".to_string(),
             gpu_info: Some(DoGpuInfo {
                 count: Some(1),
-                model: Some("AMD Instinct MI350X".to_string()),
+                model: Some("AMD Instinct MI355X".to_string()),
                 vram: Some(DoAmount {
                     amount: Some(288.0),
                     unit: Some("GB".to_string()),
@@ -495,19 +485,19 @@ pub async fn list_gpu_sizes(cfg: &DigitalOceanConfig) -> Result<Vec<DoSize>> {
             }),
         },
         DoSize {
-            slug: "gpu-mi350x8-2304gb".to_string(),
+            slug: "gpu-mi355x8-2304gb-spot".to_string(),
             memory: 2097152,
             vcpus: 192,
-            disk: 2048,
+            disk: 2046,
             transfer: 60000.0,
-            price_monthly: Some(25344.0),
-            price_hourly: Some(35.2),
-            regions: vec!["atl1".to_string(), "ric1".to_string()],
+            price_monthly: Some(26784.0),
+            price_hourly: Some(36.0),
+            regions: vec!["mem1".to_string()],
             available: true,
-            description: "AMD Instinct MI350X (8 GPUs)".to_string(),
+            description: "AMD Instinct MI355X (8 GPUs, Spot)".to_string(),
             gpu_info: Some(DoGpuInfo {
                 count: Some(8),
-                model: Some("AMD Instinct MI350X".to_string()),
+                model: Some("AMD Instinct MI355X".to_string()),
                 vram: Some(DoAmount {
                     amount: Some(2304.0),
                     unit: Some("GB".to_string()),
@@ -534,7 +524,7 @@ pub async fn list_gpu_sizes(cfg: &DigitalOceanConfig) -> Result<Vec<DoSize>> {
 
 pub async fn list_droplets(cfg: &DigitalOceanConfig) -> Result<Vec<DoDroplet>> {
     let mut droplets = Vec::new();
-    let mut url = format!("{API_BASE}/droplets?per_page=200");
+    let mut url = format!("{}/droplets?per_page=200", api_base(cfg));
     loop {
         let page = get_url::<DropletsResponse>(cfg, &url, "list droplets").await?;
         droplets.extend(page.droplets);
@@ -548,7 +538,7 @@ pub async fn list_droplets(cfg: &DigitalOceanConfig) -> Result<Vec<DoDroplet>> {
 
 pub async fn list_gpu_droplets(cfg: &DigitalOceanConfig) -> Result<Vec<DoDroplet>> {
     let mut droplets = Vec::new();
-    let mut url = format!("{API_BASE}/droplets?type=gpus&per_page=200");
+    let mut url = format!("{}/droplets?type=gpus&per_page=200", api_base(cfg));
     loop {
         let page = get_url::<DropletsResponse>(cfg, &url, "list GPU droplets").await?;
         droplets.extend(page.droplets);
@@ -563,7 +553,7 @@ pub async fn list_gpu_droplets(cfg: &DigitalOceanConfig) -> Result<Vec<DoDroplet
 
 pub async fn list_regions(cfg: &DigitalOceanConfig) -> Result<Vec<DoRegion>> {
     let mut regions = Vec::new();
-    let mut url = format!("{API_BASE}/regions?per_page=200");
+    let mut url = format!("{}/regions?per_page=200", api_base(cfg));
     loop {
         let page = get_url::<RegionsResponse>(cfg, &url, "list regions").await?;
         regions.extend(page.regions);
@@ -579,7 +569,7 @@ pub async fn list_regions(cfg: &DigitalOceanConfig) -> Result<Vec<DoRegion>> {
 
 pub async fn list_images(cfg: &DigitalOceanConfig) -> Result<Vec<DoImage>> {
     let mut images = Vec::new();
-    let mut url = format!("{API_BASE}/images?per_page=200");
+    let mut url = format!("{}/images?per_page=200", api_base(cfg));
     loop {
         let page = get_url::<ImagesResponse>(cfg, &url, "list images").await?;
         images.extend(page.images);
@@ -604,7 +594,7 @@ pub async fn list_images(cfg: &DigitalOceanConfig) -> Result<Vec<DoImage>> {
 
 pub async fn list_ssh_keys(cfg: &DigitalOceanConfig) -> Result<Vec<DoSshKey>> {
     let mut keys = Vec::new();
-    let mut url = format!("{API_BASE}/account/keys?per_page=200");
+    let mut url = format!("{}/account/keys?per_page=200", api_base(cfg));
     loop {
         let page = get_url::<SshKeysResponse>(cfg, &url, "list SSH keys").await?;
         keys.extend(page.ssh_keys);
@@ -618,7 +608,7 @@ pub async fn list_ssh_keys(cfg: &DigitalOceanConfig) -> Result<Vec<DoSshKey>> {
 
 pub async fn list_projects(cfg: &DigitalOceanConfig) -> Result<Vec<DoProject>> {
     let mut projects = Vec::new();
-    let mut url = format!("{API_BASE}/projects?per_page=200");
+    let mut url = format!("{}/projects?per_page=200", api_base(cfg));
     loop {
         let page = get_url::<ProjectsResponse>(cfg, &url, "list projects").await?;
         projects.extend(page.projects);
@@ -646,7 +636,8 @@ async fn assign_project(cfg: &DigitalOceanConfig, droplet: &DoDroplet) -> Result
         .unwrap_or_else(|| format!("do:droplet:{}", droplet.id));
     let res = client()?
         .post(format!(
-            "{API_BASE}/projects/{}/resources",
+            "{}/projects/{}/resources",
+            api_base(cfg),
             cfg.project_id.trim()
         ))
         .bearer_auth(token(cfg)?)
@@ -665,11 +656,10 @@ async fn create_once(
     cfg: &DigitalOceanConfig,
     req: &CreateDropletRequest,
 ) -> std::result::Result<DoDroplet, CreateAttemptError> {
-    // Route to the host that can serve the size being requested. The size field
-    // here already carries the `-devcloud` suffix for AMD candidates, so this
-    // picks the AMD Developer Cloud endpoint for them and the standard control
-    // plane for everything else.
-    let base = size_api_base(&req.size);
+    // Every create goes to the effective control plane. AMD MI-series plans are
+    // served there too — the old AMD-only host now redirects to a different API
+    // that rejects DigitalOcean tokens.
+    let base = api_base(cfg);
     let res = client()
         .map_err(|e| CreateAttemptError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -725,12 +715,10 @@ async fn matching_size_regions(cfg: &DigitalOceanConfig) -> Vec<String> {
     if raw.is_empty() {
         return Vec::new();
     }
-    // For AMD slugs the authoritative regions live on the AMD host under the
-    // `-devcloud` slug, so match both the raw and devcloud names there. Non-AMD
-    // sizes are queried on the standard host as before.
-    let base = size_api_base(raw);
-    let devcloud = devcloud_amd_gpu_slug(raw);
-    let mut url = format!("{base}/sizes?per_page=200");
+    // Slugs saved by older builds may still carry a retired `-devcloud` /
+    // `-contracted` suffix, so match the normalized form too.
+    let normalized = normalize_amd_gpu_slug(raw);
+    let mut url = format!("{}/sizes?per_page=200", api_base(cfg));
     loop {
         let page = match get_url::<SizesResponse>(cfg, &url, "list sizes").await {
             Ok(page) => page,
@@ -739,7 +727,7 @@ async fn matching_size_regions(cfg: &DigitalOceanConfig) -> Vec<String> {
         if let Some(size) = page
             .sizes
             .iter()
-            .find(|s| s.slug == raw || devcloud.as_deref() == Some(s.slug.as_str()))
+            .find(|s| s.slug == raw || s.slug == normalized)
         {
             return size.regions.clone();
         }
@@ -775,51 +763,31 @@ fn is_amd_gpu_slug(slug: &str) -> bool {
             .unwrap_or(false)
 }
 
-/// The API host that can actually serve the configured size. AMD MI-series GPU
-/// droplets are only creatable through the AMD Developer Cloud endpoint; every
-/// other resource (and every non-AMD size) uses the standard control plane.
-fn size_api_base(size: &str) -> &'static str {
-    if is_amd_gpu_slug(size) {
-        AMD_API_BASE
-    } else {
-        API_BASE
+/// Strip suffixes older builds appended to AMD MI-series slugs. The `-devcloud`
+/// and `-contracted` variants were retired platform-wide — the control plane
+/// now accepts the bare slug (`gpu-mi325x1-256gb`) and answers the suffixed
+/// forms with `422 "This size is unavailable."` — so slugs saved by an older
+/// build are normalized before use instead of being sent as-is.
+fn normalize_amd_gpu_slug(slug: &str) -> String {
+    let mut clean = slug.trim();
+    for suffix in ["-devcloud", "-contracted"] {
+        if let Some(stripped) = clean.strip_suffix(suffix) {
+            clean = stripped;
+            break;
+        }
     }
-}
-
-fn contracted_amd_gpu_slug(slug: &str) -> Option<String> {
-    let clean = slug.trim();
-    if !is_amd_gpu_slug(clean) || clean.ends_with("-contracted") || clean.contains("-fabric-") {
-        return None;
-    }
-    Some(format!("{clean}-contracted"))
-}
-
-/// AMD MI-series sizes must be requested with the `-devcloud` slug on the AMD
-/// endpoint. Returns `None` for non-AMD slugs or ones already carrying the
-/// suffix so we never double-append it.
-fn devcloud_amd_gpu_slug(slug: &str) -> Option<String> {
-    let clean = slug.trim();
-    if !is_amd_gpu_slug(clean) || clean.ends_with("-devcloud") {
-        return None;
-    }
-    // Strip a stale `-contracted` suffix first so we don't produce
-    // `...-contracted-devcloud`, which is not a real slug.
-    let core = strip_contracted_suffix(clean);
-    Some(format!("{core}-devcloud"))
+    clean.to_string()
 }
 
 fn size_create_candidates(size: &str) -> Vec<String> {
-    // Order matters: the `-devcloud` slug on the AMD endpoint is the one that
-    // actually provisions AMD GPUs, so try it first. The bare and `-contracted`
-    // slugs stay as fallbacks for any account/region where DO accepts them.
+    // The bare slug is the live, creatable form, so it is tried first. The
+    // configured value is kept as a second candidate so a tenant on a host that
+    // still expects a suffixed slug is not left without a fallback.
     let mut candidates = Vec::new();
-    if let Some(devcloud) = devcloud_amd_gpu_slug(size) {
-        push_unique(&mut candidates, devcloud);
+    if is_amd_gpu_slug(size) {
+        push_unique(&mut candidates, normalize_amd_gpu_slug(size));
     }
     push_unique(&mut candidates, size.trim().to_string());
-    if let Some(contracted) = contracted_amd_gpu_slug(size) {
-        push_unique(&mut candidates, contracted);
-    }
     candidates
 }
 
@@ -834,6 +802,13 @@ fn create_rejection_message(body: &str) -> String {
         .unwrap_or_else(|| body.to_string())
 }
 
+fn all_attempts_contain(attempts: &[CreateAttemptLog], needle: &str) -> bool {
+    !attempts.is_empty()
+        && attempts
+            .iter()
+            .all(|attempt| create_rejection_message(&attempt.body).to_ascii_lowercase().contains(needle))
+}
+
 fn all_size_unavailable(attempts: &[CreateAttemptLog]) -> bool {
     !attempts.is_empty()
         && attempts.iter().all(|attempt| {
@@ -844,6 +819,24 @@ fn all_size_unavailable(attempts: &[CreateAttemptLog]) -> bool {
                 || msg.contains("invalid size")
                 || msg.ends_with(" is unavailable.")
         })
+}
+
+/// Plans from the live catalog that publish at least one region, i.e. the ones
+/// the control plane is actually willing to provision. Surfaced on failure so
+/// the error names a working alternative instead of only reporting that
+/// everything was rejected.
+async fn creatable_alternatives(cfg: &DigitalOceanConfig, exclude: &str) -> Vec<String> {
+    let exclude = normalize_amd_gpu_slug(exclude);
+    match list_gpu_sizes(cfg).await {
+        Ok(sizes) => sizes
+            .into_iter()
+            .filter(|size| {
+                !size.regions.is_empty() && normalize_amd_gpu_slug(&size.slug) != exclude
+            })
+            .map(|size| format!("{} [{}]", size.slug, size.regions.join(", ")))
+            .collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 fn summarize_attempts(attempts: &[CreateAttemptLog], limit: usize) -> String {
@@ -868,21 +861,19 @@ fn summarize_attempts(attempts: &[CreateAttemptLog], limit: usize) -> String {
     lines.join(" | ")
 }
 
-fn strip_contracted_suffix(slug: &str) -> &str {
-    slug.trim()
-        .strip_suffix("-contracted")
-        .unwrap_or(slug.trim())
-}
-
-// GPU size regions are sometimes missing from /v2/sizes even when DigitalOcean
-// documents the plan. Keep this list narrow so creation failures point at the
-// real account/capacity problem instead of burying it in irrelevant regions.
+// GPU plan regions are sometimes missing from /v2/sizes even when the plan is
+// provisionable, so fall back to the documented region set. This mirrors the
+// live AMD Instinct catalog; keep it narrow so a failure points at the real
+// account/capacity problem instead of burying it in irrelevant regions. Retired
+// generations map to no region at all, which stops the caller from fanning out
+// across every image region for a plan that can never be provisioned.
 fn documented_amd_gpu_regions(size: &str) -> &'static [&'static str] {
-    match strip_contracted_suffix(size) {
-        "gpu-mi300x1-192gb" | "gpu-mi300x8-1536gb" => &["atl1"],
-        "gpu-mi325x1-256gb" | "gpu-mi325x8-2048gb" => &["atl1", "nyc2", "sfo3", "tor1"],
-        "gpu-mi350x1-288gb" | "gpu-mi350x8-2304gb" => &["atl1", "ric1"],
-        _ => &["atl1"],
+    match normalize_amd_gpu_slug(size).as_str() {
+        "gpu-mi325x1-256gb" => &["nyc2", "tor1"],
+        "gpu-mi325x8-2048gb" => &["nyc2"],
+        "gpu-mi355x1-288gb-spot" => &["mem1"],
+        "gpu-mi355x8-2304gb-spot" => &["mem1"],
+        _ => &[],
     }
 }
 
@@ -907,41 +898,40 @@ async fn candidate_create_regions(cfg: &DigitalOceanConfig) -> (Vec<String>, Vec
         Err(_) => Vec::new(),
     };
 
+    let amd_gpu = is_amd_gpu_slug(&cfg.size);
+
     // 1. Size's own published regions are most authoritative when present.
     for region in &size_regions {
         push_unique(&mut candidates, region.clone());
     }
 
-    // 2. For AMD GPU sizes, always include known AMD-host regions. /v2/sizes often
-    //    omits AMD GPU sizes for tokens that can still book them via the special
-    //    AMD allocation, so size_regions can legitimately be empty.
-    if is_amd_gpu_slug(&cfg.size) {
+    if amd_gpu {
+        // 2. AMD GPU plans are capacity-constrained and their region lists are
+        //    frequently omitted, so fall back to the documented region set. Do
+        //    NOT fan out across every region the image supports: that produces a
+        //    burst of creates for a plan that is often simply not entitled, and
+        //    buries the real account-level refusal in noise.
         for region in documented_amd_gpu_regions(&cfg.size) {
             push_unique(&mut candidates, (*region).to_string());
         }
-    }
-
-    // 3. Intersect with image regions where possible, then add the rest.
-    for region in &image_regions {
-        if size_regions.is_empty() || size_regions.iter().any(|r| r == region) {
-            push_unique(&mut candidates, region.clone());
+    } else {
+        // 3. Non-AMD plans: intersect with the image's regions where the plan
+        //    publishes any, then add the rest.
+        for region in &image_regions {
+            if size_regions.is_empty() || size_regions.iter().any(|r| r == region) {
+                push_unique(&mut candidates, region.clone());
+            }
         }
-    }
-    for region in image_regions {
-        push_unique(&mut candidates, region);
-    }
+        for region in image_regions {
+            push_unique(&mut candidates, region);
+        }
 
-    // 4. Account-listed regions are useful for non-GPU fallback, but AMD GPU
-    //    creates should stay on documented GPU regions. Trying every CPU region
-    //    creates noise and can mask an account-level GPU API refusal.
-    if !is_amd_gpu_slug(&cfg.size) {
+        // 4. Account-listed regions are a useful fallback for non-AMD plans.
         for region in account_regions {
             push_unique(&mut candidates, region);
         }
-    }
 
-    // 5. Try trailing-digit-stripped aliases (some accounts accept "nyc" for "nyc3").
-    if !is_amd_gpu_slug(&cfg.size) {
+        // 5. Try trailing-digit-stripped aliases (some accounts accept "nyc" for "nyc3").
         let expanded = candidates.clone();
         for region in expanded {
             if let Some(prefix) = region_prefix(&region) {
@@ -1031,7 +1021,12 @@ pub async fn create_droplet(cfg: &DigitalOceanConfig) -> Result<DoDroplet> {
             req.size = size.clone();
             match create_once(cfg, &req).await {
                 Ok(droplet) => {
-                    assign_project(cfg, &droplet).await?;
+                    // The Droplet now exists and is billing. A project-assignment
+                    // failure (e.g. the project belongs to a different team, which
+                    // AMD Developer Cloud resources cannot be moved into) must not
+                    // be reported as a failed create, or the caller never learns
+                    // the id of the server it is paying for.
+                    let _ = assign_project(cfg, &droplet).await;
                     crate::droplet_usage::record_created(cfg, &droplet)?;
                     return Ok(droplet);
                 }
@@ -1051,7 +1046,7 @@ pub async fn create_droplet(cfg: &DigitalOceanConfig) -> Result<DoDroplet> {
             req.region = Some(region.clone());
             match create_once(cfg, &req).await {
                 Ok(droplet) => {
-                    assign_project(cfg, &droplet).await?;
+                    let _ = assign_project(cfg, &droplet).await;
                     crate::droplet_usage::record_created(cfg, &droplet)?;
                     return Ok(droplet);
                 }
@@ -1065,20 +1060,42 @@ pub async fn create_droplet(cfg: &DigitalOceanConfig) -> Result<DoDroplet> {
         }
     }
 
-    if is_amd_gpu_slug(&cfg.size) && size_regions.is_empty() && all_size_unavailable(&attempts) {
+    let context = create_context(cfg).await;
+    let alternatives = creatable_alternatives(cfg, &cfg.size).await;
+    let alternatives_hint = if alternatives.is_empty() {
+        "No GPU plan in this team's catalog currently publishes a creatable region.".to_string()
+    } else {
+        format!(
+            "Plans that do publish a creatable region: {}.",
+            alternatives.join("; ")
+        )
+    };
+
+    if all_attempts_contain(&attempts, "exceed your gpu limit") {
         return Err(AppError::other(format!(
-            "DigitalOcean rejected AMD GPU Droplet creation for '{size}' on the AMD Developer Cloud endpoint ({amd_base}). \
-             AMD MI-series GPUs are served there under the '-devcloud' slug in [{documented_regions}], and this app already \
-             retried that endpoint, slug, and region set — every attempt came back 'size unavailable', which means there is no \
-             AMD GPU capacity available for this team right now (or the team is not entitled to this size). \
-             This is a capacity/entitlement issue, not a request-format problem. \
-             Try a different AMD GPU size or region, or create the Droplet from the DigitalOcean control panel and click Sync Account + Use IP. \
-             If the dashboard also reports no capacity, ask DigitalOcean support about AMD GPU availability for size '{size}' on team '{team}'. \
-             Size slugs tried: [{size_candidates}]. First attempts: {attempts}",
+            "DigitalOcean refused '{size}' for this team because it would exceed the account GPU limit ({context}). \
+             AMD Developer Cloud credits allow one 8-GPU Droplet or up to eight single-GPU Droplets, and the 8-GPU plans \
+             additionally require the multi-node allocation to be enabled for the team. \
+             {alternatives_hint} Reduce the plan to a single-GPU size, or ask DigitalOcean support to raise the GPU limit \
+             for this team. Attempts: {attempts}",
             size = cfg.size.trim(),
-            amd_base = AMD_API_BASE,
-            team = create_context(cfg).await,
-            documented_regions = documented_amd_gpu_regions(&cfg.size).join(", "),
+            attempts = summarize_attempts(&attempts, 8),
+        )));
+    }
+
+    if is_amd_gpu_slug(&cfg.size) && all_size_unavailable(&attempts) {
+        return Err(AppError::other(format!(
+            "DigitalOcean will not provision '{size}' for this team ({context}). \
+             Every attempt came back 'size unavailable / not available in this region', which means the plan is retired, \
+             not entitled for this account, or out of capacity in the regions tried — re-sending the same slug will not \
+             change the result. {alternatives_hint} \
+             Region slugs tried: [{regions}]. Size slugs tried: [{size_candidates}]. First attempts: {attempts}",
+            size = cfg.size.trim(),
+            regions = if candidates.is_empty() {
+                "auto".to_string()
+            } else {
+                candidates.join(", ")
+            },
             size_candidates = size_candidates.join(", "),
             attempts = summarize_attempts(&attempts, 8),
         )));
@@ -1087,8 +1104,7 @@ pub async fn create_droplet(cfg: &DigitalOceanConfig) -> Result<DoDroplet> {
     Err(AppError::other(format!(
         "DigitalOcean create droplet failed in every candidate region ({context}). \
          Size '{size}' is published as available in: [{published}]. \
-         Note: AMD MI-series GPU sizes may report an empty regions list even when the dashboard can create them; \
-         this app tried the known AMD GPU regions and any matching contracted AMD slug. \
+         {alternatives_hint} \
          Size slugs tried: [{size_candidates}]. Attempts: {attempts}",
         size = cfg.size.trim(),
         size_candidates = size_candidates.join(", "),
@@ -1098,13 +1114,12 @@ pub async fn create_droplet(cfg: &DigitalOceanConfig) -> Result<DoDroplet> {
             size_regions.join(", ")
         },
         attempts = summarize_attempts(&attempts, 32),
-        context = create_context(cfg).await
     )))
 }
 
 pub async fn destroy_droplet(cfg: &DigitalOceanConfig, droplet_id: u64) -> Result<()> {
     let res = client()?
-        .delete(format!("{API_BASE}/droplets/{droplet_id}"))
+        .delete(format!("{}/droplets/{droplet_id}", api_base(cfg)))
         .bearer_auth(token(cfg)?)
         .send()
         .await?;

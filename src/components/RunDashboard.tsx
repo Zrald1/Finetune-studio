@@ -507,7 +507,31 @@ const mergeAndUpload = async () => {
   };
 
   const [benchRunning, setBenchRunning] = useState(false);
-  const [benchResult, setBenchResult] = useState<{total: number; correct: number; partial: number; missed: number; accuracy: number; samples: any[]} | null>(null);
+  const [benchResult, setBenchResult] = useState<{
+    total: number;
+    correct: number;
+    partial: number;
+    missed: number;
+    accuracy: number;
+    perf?: {
+      samples: { prompt: string; ttft_ms: number; e2el_ms: number; output_tokens: number; tpot_ms: number; output_tps: number }[];
+      mean_ttft_ms: number;
+      mean_tpot_ms: number;
+      mean_e2el_ms: number;
+      output_tokens_per_s: number;
+      total_output_tokens: number;
+      concurrency: number;
+    } | null;
+    generation?: {
+      requests: number;
+      total_output_tokens: number;
+      total_ms: number;
+      mean_ms: number;
+      output_tokens_per_s: number;
+      tpot_ms: number;
+    } | null;
+    samples: any[];
+  } | null>(null);
   const [benchError, setBenchError] = useState<string | null>(null);
   const [benchSampleSize, setBenchSampleSize] = useState(100);
   const [benchLogs, setBenchLogs] = useState<string[]>([]);
@@ -833,23 +857,62 @@ const mergeAndUpload = async () => {
                 </button>
               </div>
               {benchResult && (
-                <div className="grid grid-cols-4 gap-2">
-                  <div className="bg-black/40 border border-emerald-500/20 rounded-lg p-2 text-center">
-                    <div className="text-lg font-mono font-black text-emerald-400">{benchResult.accuracy}%</div>
-                    <div className="text-[8px] uppercase tracking-widest text-emerald-400/60 font-mono mt-1">Accuracy</div>
+                <div className="space-y-2">
+                  <div className="grid grid-cols-4 gap-2">
+                    <div className="bg-black/40 border border-emerald-500/20 rounded-lg p-2 text-center">
+                      <div className="text-lg font-mono font-black text-emerald-400">{benchResult.accuracy}%</div>
+                      <div className="text-[8px] uppercase tracking-widest text-emerald-400/60 font-mono mt-1">Accuracy</div>
+                    </div>
+                    <div className="bg-black/40 border border-emerald-500/20 rounded-lg p-2 text-center">
+                      <div className="text-lg font-mono font-black text-emerald-300">{benchResult.correct}</div>
+                      <div className="text-[8px] uppercase tracking-widest text-emerald-400/60 font-mono mt-1">Correct</div>
+                    </div>
+                    <div className="bg-black/40 border border-amber-500/20 rounded-lg p-2 text-center">
+                      <div className="text-lg font-mono font-black text-amber-300">{benchResult.partial}</div>
+                      <div className="text-[8px] uppercase tracking-widest text-amber-400/60 font-mono mt-1">Partial</div>
+                    </div>
+                    <div className="bg-black/40 border border-red-500/20 rounded-lg p-2 text-center">
+                      <div className="text-lg font-mono font-black text-red-300">{benchResult.missed}</div>
+                      <div className="text-[8px] uppercase tracking-widest text-red-400/60 font-mono mt-1">Missed</div>
+                    </div>
                   </div>
-                  <div className="bg-black/40 border border-emerald-500/20 rounded-lg p-2 text-center">
-                    <div className="text-lg font-mono font-black text-emerald-300">{benchResult.correct}</div>
-                    <div className="text-[8px] uppercase tracking-widest text-emerald-400/60 font-mono mt-1">Correct</div>
-                  </div>
-                  <div className="bg-black/40 border border-amber-500/20 rounded-lg p-2 text-center">
-                    <div className="text-lg font-mono font-black text-amber-300">{benchResult.partial}</div>
-                    <div className="text-[8px] uppercase tracking-widest text-amber-400/60 font-mono mt-1">Partial</div>
-                  </div>
-                  <div className="bg-black/40 border border-red-500/20 rounded-lg p-2 text-center">
-                    <div className="text-lg font-mono font-black text-red-300">{benchResult.missed}</div>
-                    <div className="text-[8px] uppercase tracking-widest text-red-400/60 font-mono mt-1">Missed</div>
-                  </div>
+                  {(benchResult.perf || benchResult.generation) && (
+                    <div className="grid grid-cols-4 gap-2">
+                      {[
+                        {
+                          label: "TTFT",
+                          value: benchResult.perf ? `${benchResult.perf.mean_ttft_ms.toFixed(0)}ms` : "—",
+                        },
+                        {
+                          label: "TPOT",
+                          value: benchResult.perf
+                            ? `${benchResult.perf.mean_tpot_ms.toFixed(1)}ms`
+                            : benchResult.generation
+                              ? `${benchResult.generation.tpot_ms.toFixed(1)}ms`
+                              : "—",
+                        },
+                        {
+                          label: "Gen tok/s",
+                          value: benchResult.generation
+                            ? benchResult.generation.output_tokens_per_s.toFixed(1)
+                            : benchResult.perf
+                              ? benchResult.perf.output_tokens_per_s.toFixed(1)
+                              : "—",
+                        },
+                        {
+                          label: "Out tokens",
+                          value: String(
+                            benchResult.generation?.total_output_tokens ?? benchResult.perf?.total_output_tokens ?? 0,
+                          ),
+                        },
+                      ].map((m) => (
+                        <div key={m.label} className="bg-black/40 border border-theme-accent/20 rounded-lg p-2 text-center">
+                          <div className="text-sm font-mono font-black theme-accent">{m.value}</div>
+                          <div className="text-[8px] uppercase tracking-widest theme-faint font-mono mt-1">{m.label}</div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
               {(benchRunning || benchLogs.length > 0 || benchError) && (

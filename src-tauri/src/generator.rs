@@ -304,6 +304,11 @@ pub struct GeneratorConfig {
     pub enable_verification: bool,
     #[serde(default)]
     pub verifier_model: Option<String>,
+    /// `chat_template_kwargs` sent with every generation request. Carries the
+    /// teacher's reasoning-effort setting so thinking can be tuned or disabled
+    /// without redeploying the server.
+    #[serde(default)]
+    pub chat_template_kwargs: Option<serde_json::Value>,
 }
 
 impl GeneratorConfig {
@@ -328,6 +333,7 @@ impl GeneratorConfig {
             api_key: None,
             enable_verification: false,
             verifier_model: None,
+            chat_template_kwargs: None,
         }
     }
 }
@@ -382,7 +388,7 @@ async fn ask_teacher_once(cfg: &GeneratorConfig, prompt: &str) -> Result<String>
         "{}/v1/chat/completions",
         cfg.teacher_endpoint.trim_end_matches('/')
     );
-    let body = json!({
+    let mut body = json!({
         "model": cfg.teacher_model,
         "messages": [
             { "role": "user", "content": prompt }
@@ -392,6 +398,9 @@ async fn ask_teacher_once(cfg: &GeneratorConfig, prompt: &str) -> Result<String>
         "repetition_penalty": cfg.repetition_penalty,
         "max_tokens": cfg.max_tokens,
     });
+    if let Some(kwargs) = cfg.chat_template_kwargs.as_ref() {
+        body["chat_template_kwargs"] = kwargs.clone();
+    }
     let mut req = http().post(url).json(&body);
     if let Some(ref key) = cfg.api_key {
         if !key.trim().is_empty() {

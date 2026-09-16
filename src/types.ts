@@ -19,6 +19,29 @@ export interface QdrantConfig {
 
 export type ServingEngine = "vllm";
 
+export type ServingProfile = "standard" | "optimized";
+
+/**
+ * Reasoning-effort levels offered for the teacher.
+ *
+ * Qwen3.8's chat template accepts only `xhigh`, `medium`, and `low` — it calls
+ * `raise_exception` for anything else, which vLLM surfaces as HTTP 500 rather
+ * than a 4xx, so an unsupported value must never be sent. `none` is this app's
+ * sentinel for `enable_thinking: false`, not a template value.
+ *
+ * `high` is deliberately absent for that reason: it is the OpenAI/Anthropic
+ * spelling, not a Qwen3.8 one. If it ever lands in a config file the backend
+ * folds it into `xhigh` rather than forwarding it.
+ */
+export type ReasoningEffort = "xhigh" | "medium" | "low" | "none";
+
+export const REASONING_EFFORT_OPTIONS: { value: ReasoningEffort; label: string; hint: string }[] = [
+  { value: "xhigh", label: "XHigh", hint: "Deepest thinking — best quality, slowest" },
+  { value: "medium", label: "Medium", hint: "Balanced thinking depth" },
+  { value: "low", label: "Low", hint: "Brief thinking, fastest with thinking on" },
+  { value: "none", label: "No Thinking", hint: "Skip thinking entirely — fastest, lowest cost" },
+];
+
 export interface TeacherConfig {
   repoId: string;
   vllmPort: number;
@@ -36,6 +59,12 @@ export interface TeacherConfig {
   /** Extra vLLM flags appended to the managed serve command (does not replace it). */
   extraServeArgs?: string;
   servingEngine?: ServingEngine;
+  /** "standard" = conservative baseline; "optimized" = vendor serving recipe. */
+  servingProfile?: ServingProfile;
+  /** vLLM --reasoning-parser value; required for Qwen3.5+ hybrid-thinking models. */
+  reasoningParser?: string | null;
+  /** Thinking depth: "xhigh" | "medium" | "low" | "none" (thinking disabled). */
+  reasoningEffort?: string | null;
 }
 
 export interface StudentConfig {
@@ -55,6 +84,7 @@ export interface DockerConfig {
 
 export interface DigitalOceanConfig {
   apiKey: string;
+  apiBase: string;
   dropletName: string;
   region: string;
   size: string;
@@ -238,6 +268,7 @@ export const DEFAULT_AI_AGENT: AIAgentConfig = {
 
 export const DEFAULT_DIGITAL_OCEAN: DigitalOceanConfig = {
   apiKey: "",
+  apiBase: "",
   dropletName: "",
   region: "",
   size: "",
@@ -801,7 +832,7 @@ export const DEFAULT_HUB_DATASET: HubDatasetConfig = {
 };
 
 export const DEFAULT_TEACHER: TeacherConfig = {
-  repoId: "deepseek-ai/DeepSeek-V3",
+  repoId: "Qwen/Qwen3.8-27B",
   vllmPort: 8000,
   maxModelLen: 32768,
   dtype: "bfloat16",
@@ -816,7 +847,56 @@ export const DEFAULT_TEACHER: TeacherConfig = {
   customServeCmd: "",
   extraServeArgs: "",
   servingEngine: "vllm",
+  servingProfile: "standard",
+  reasoningParser: "",
+  reasoningEffort: "xhigh",
 };
+
+export interface TeacherBenchSample {
+  index: number;
+  prompt: string;
+  ttftMs: number;
+  /** Time to the first *content* token; the gap from ttftMs is the thinking cost. */
+  ttfcMs?: number | null;
+  e2elMs: number;
+  promptTokens: number;
+  outputTokens: number;
+  tpotMs: number;
+  outputTps: number;
+}
+
+/**
+ * Token-level benchmark report for a deployed teacher.
+ *
+ * Field names and definitions follow vLLM's `vllm bench serve` so results are
+ * comparable with upstream tooling: TTFT (time to first token), TPOT (time per
+ * output token, decode only), ITL (inter-token latency), E2EL (end-to-end
+ * latency per request), and output-token throughput.
+ */
+export interface TeacherBenchReport {
+  endpoint: string;
+  model: string;
+  completed: number;
+  failed: number;
+  errors: string[];
+  durationS: number;
+  concurrency: number;
+  maxTokens: number;
+  reasoningEffort?: string | null;
+  meanTtftMs: number;
+  medianTtftMs: number;
+  p95TtftMs: number;
+  meanTpotMs: number;
+  meanItlMs: number;
+  meanE2elMs: number;
+  outputTokensPerS: number;
+  totalTokensPerS: number;
+  requestThroughput: number;
+  totalOutputTokens: number;
+  totalInputTokens: number;
+  samples: TeacherBenchSample[];
+  capturedAt: string;
+}
 
 export interface IngestStream {
   id: string;

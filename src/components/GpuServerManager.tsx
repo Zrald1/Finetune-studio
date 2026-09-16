@@ -97,14 +97,16 @@ function validHourlyRate(rate: number | null | undefined): rate is number {
 }
 
 function knownHourlyRate(slug: string) {
-  const normalized = slug.trim().replace(/-devcloud$/i, "");
+  const normalized = slug.trim().replace(/-devcloud$/i, "").replace(/-contracted$/i, "");
   const rates: Record<string, number> = {
-    "gpu-mi300x1-192gb": 1.99,
-    "gpu-mi300x8-1536gb": 15.92,
-    "gpu-mi325x1-256gb": 2.29,
-    "gpu-mi325x8-2048gb": 18.32,
-    "gpu-mi350x1-288gb": 4.4,
-    "gpu-mi350x8-2304gb": 35.2,
+    "gpu-mi300x1-192gb": 2.59,
+    "gpu-mi300x8-1536gb": 20.72,
+    "gpu-mi325x1-256gb": 3.8,
+    "gpu-mi325x8-2048gb": 30.4,
+    "gpu-mi350x1-288gb-spot": 4.0,
+    "gpu-mi350x8-2304gb-spot": 32.0,
+    "gpu-mi355x1-288gb-spot": 4.5,
+    "gpu-mi355x8-2304gb-spot": 36.0,
   };
   return rates[normalized] ?? null;
 }
@@ -265,8 +267,19 @@ export default function GpuServerManager({ config, onConfigChange }: Props) {
       setProjects(nextProjects);
       setDroplets(nextDroplets);
 
-      const currentCustomSize = customGpuSize(digitalOcean.size);
-      const nextSize = nextSizes.find((size) => size.slug === digitalOcean.size) || currentCustomSize || nextSizes[0];
+      // Prefer a plan from the live catalog. `customGpuSize` fabricates an entry
+      // for any `gpu-mi*` slug, so trusting it here would pin the config to a
+      // retired plan (e.g. `gpu-mi300x1-192gb`) forever and every create would
+      // come back "size unavailable". Prefer a plan that also reports a
+      // creatable region, and fall back to the synthetic entry only when the
+      // catalog is empty.
+      const liveSize = nextSizes.find((size) => size.slug === digitalOcean.size);
+      const nextSize =
+        liveSize ||
+        nextSizes.find((size) => size.regions.length > 0) ||
+        nextSizes[0] ||
+        customGpuSize(digitalOcean.size);
+      const sizeChanged = !!nextSize && nextSize.slug !== digitalOcean.size;
       const nextImage =
         nextImages.find((image) => imageValue(image) === digitalOcean.image) ||
         quickStartImage(digitalOcean.image) ||
@@ -277,16 +290,24 @@ export default function GpuServerManager({ config, onConfigChange }: Props) {
       const nextHourlyRate = validHourlyRate(digitalOcean.hourlyRateUsd)
         ? digitalOcean.hourlyRateUsd
         : nextSize?.priceHourly ?? knownHourlyRate(nextSize?.slug || digitalOcean.size);
+      // Fill a blank region from the chosen plan so the create does not have to
+      // probe every region the plan might live in.
+      const nextRegion = digitalOcean.region.trim() || nextSize?.regions[0] || "";
       patchDigitalOcean({
         size: nextSize?.slug || digitalOcean.size,
         hourlyRateUsd: nextHourlyRate,
-        region: digitalOcean.region,
+        region: nextRegion,
         image: nextImage ? ("value" in nextImage ? nextImage.value : imageValue(nextImage)) : digitalOcean.image,
         sshKeys: digitalOcean.sshKeys || nextKeys[0]?.id?.toString() || "",
         projectId: nextProject,
       });
       await refreshUsage();
-      setMessageWithNotification(`Loaded DigitalOcean data: ${nextSizes.length} AMD GPU plans, ${nextImages.length} ROCm images, ${nextKeys.length} SSH keys, and ${nextDroplets.length} GPU droplets.`);
+      const summary = `Loaded DigitalOcean data: ${nextSizes.length} AMD GPU plans, ${nextImages.length} ROCm images, ${nextKeys.length} SSH keys, and ${nextDroplets.length} GPU droplets.`;
+      setMessageWithNotification(
+        sizeChanged
+          ? `${summary} Plan "${digitalOcean.size}" is no longer offered by DigitalOcean — switched to "${nextSize?.slug}".`
+          : summary,
+      );
     } catch (e: any) {
       setMessageWithNotification(String(e));
     } finally {

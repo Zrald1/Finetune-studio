@@ -41,6 +41,7 @@ import type {
   RobotCaptureInput,
   ModelManifest,
   ModelManifestStore,
+  TeacherBenchReport,
   TeacherDeploymentStatus,
 } from "../types";
 
@@ -163,8 +164,31 @@ export const api = {
     invoke<string>("read_run_log", { runId, maxBytes }),
   pingTeacher: (endpoint: string) =>
     invoke<boolean>("ping_teacher", { endpoint }),
-  teacherChat: (endpoint: string, model: string, messages: unknown[]) =>
-    invoke<string>("teacher_chat", { endpoint, model, messages }),
+  teacherChat: (endpoint: string, model: string, messages: unknown[], reasoningEffort?: string | null) =>
+    invoke<string>("teacher_chat", {
+      endpoint,
+      model,
+      messages,
+      reasoningEffort: reasoningEffort ?? null,
+    }),
+  benchmarkTeacher: (
+    endpoint: string,
+    model: string,
+    opts?: {
+      concurrency?: number;
+      maxTokens?: number;
+      reasoningEffort?: string | null;
+      timeoutS?: number;
+    },
+  ) =>
+    invoke<TeacherBenchReport>("benchmark_teacher", {
+      endpoint,
+      model,
+      concurrency: opts?.concurrency ?? null,
+      maxTokens: opts?.maxTokens ?? null,
+      reasoningEffort: opts?.reasoningEffort ?? null,
+      timeoutS: opts?.timeoutS ?? null,
+    }),
   testTrainedModel: (runId: string, prompt: string) =>
     invoke<string>("test_trained_model", { runId, prompt }),
   runInferenceBenchmark: (runId: string, sampleSize?: number) =>

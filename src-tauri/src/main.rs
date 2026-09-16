@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod bench;
 mod config;
 mod digitalocean;
 mod droplet_usage;
@@ -2443,13 +2444,17 @@ async fn teacher_chat(
     endpoint: String,
     model: String,
     messages: Vec<serde_json::Value>,
+    reasoning_effort: Option<String>,
 ) -> Result<String> {
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "messages": messages,
         "temperature": 0.3,
         "max_tokens": 4096
     });
+    if let Some(kwargs) = config::chat_template_kwargs(reasoning_effort.as_deref()) {
+        body["chat_template_kwargs"] = kwargs;
+    }
     let c = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()
@@ -2476,6 +2481,27 @@ async fn teacher_chat(
         .and_then(|c| c.as_str())
         .unwrap_or("")
         .to_string())
+}
+
+/// Benchmark a deployed OpenAI-compatible teacher endpoint. Returns token-level
+/// metrics (TTFT / TPOT / ITL / tokens-per-second) alongside latency, so the
+/// teacher can be compared against the student and against published numbers.
+#[tauri::command]
+async fn benchmark_teacher(
+    endpoint: String,
+    model: String,
+    concurrency: Option<u32>,
+    max_tokens: Option<u32>,
+    reasoning_effort: Option<String>,
+    timeout_s: Option<u64>,
+) -> Result<bench::BenchReport> {
+    let opts = bench::BenchOptions {
+        concurrency: concurrency.unwrap_or(1).clamp(1, 32),
+        max_tokens: max_tokens.unwrap_or(512).clamp(16, 32768),
+        reasoning_effort,
+        timeout_s: timeout_s.unwrap_or(300).clamp(10, 1800),
+    };
+    bench::benchmark_endpoint(&endpoint, &model, &opts).await
 }
 
 #[tauri::command]
@@ -2666,6 +2692,59 @@ except TypeError:
 model = PeftModel.from_pretrained(base, adapter_path)
 model.eval()
 
+# ── Perf probe ───────────────────────────────────────────────────────────
+# Streaming generation so TTFT is observable: a plain model.generate() call
+# only yields a total wall time, from which time-to-first-token cannot be
+# separated out. Metrics mirror the teacher benchmark (TTFT / TPOT / tok/s).
+import time
+PERF_PROMPTS = [
+    "Write a Python function that reverses a linked list.",
+    "Explain the difference between TCP and UDP in 2 sentences.",
+    "What is 1337 * 42? Show your work step by step.",
+    "Summarize the concept of gradient descent in one paragraph.",
+    "List 3 advantages of transformer architecture over RNNs.",
+]
+perf_samples = []
+try:
+    from transformers import TextIteratorStreamer
+    from threading import Thread
+    for perf_prompt in PERF_PROMPTS:
+        perf_msgs = [{{"role": "user", "content": perf_prompt}}]
+        perf_text = tokenizer.apply_chat_template(perf_msgs, tokenize=False, add_generation_prompt=True)
+        perf_inputs = tokenizer([perf_text], return_tensors="pt").to(model.device)
+        streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+        gen_kwargs = dict(
+            **perf_inputs,
+            max_new_tokens=256,
+            do_sample=False,
+            repetition_penalty=1.05,
+            pad_token_id=tokenizer.eos_token_id,
+            streamer=streamer,
+        )
+        worker = Thread(target=model.generate, kwargs=gen_kwargs)
+        t0 = time.perf_counter()
+        worker.start()
+        ttft_ms = None
+        streamed = 0
+        for _ in streamer:
+            if ttft_ms is None:
+                ttft_ms = (time.perf_counter() - t0) * 1000.0
+            streamed += 1
+        worker.join()
+        e2el_ms = (time.perf_counter() - t0) * 1000.0
+        ttft_ms = ttft_ms or 0.0
+        perf_samples.append({{
+            "prompt": perf_prompt,
+            "ttft_ms": ttft_ms,
+            "e2el_ms": e2el_ms,
+            "output_tokens": streamed,
+            "tpot_ms": (e2el_ms - ttft_ms) / max(streamed - 1, 1),
+            "output_tps": streamed / max(e2el_ms / 1000.0, 1e-9),
+        }})
+except Exception as exc:
+    print(f"[perf] streaming probe unavailable: {{exc!r}}", flush=True)
+    perf_samples = []
+
 # Load eval samples from qa_dataset.jsonl
 samples = []
 from pathlib import Path
@@ -2714,6 +2793,8 @@ if total == 0:
 correct = 0
 partial = 0
 results = []
+accuracy_gen_ms = []
+accuracy_out_tokens = []
 
 for i, s in enumerate(samples):
     question = s["question"]
@@ -2724,6 +2805,7 @@ for i, s in enumerate(samples):
     ]
     text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = tokenizer([text], return_tensors="pt").to(model.device)
+    gen_started = time.perf_counter()
     with torch.no_grad():
         output_ids = model.generate(
             **inputs,
@@ -2732,7 +2814,10 @@ for i, s in enumerate(samples):
             do_sample=False,
             repetition_penalty=1.05,
         )
+    gen_ms = (time.perf_counter() - gen_started) * 1000.0
     generated = output_ids[0][inputs.input_ids.shape[-1]:]
+    accuracy_gen_ms.append(gen_ms)
+    accuracy_out_tokens.append(int(generated.shape[-1]))
     model_answer = tokenizer.decode(generated, skip_special_tokens=True).strip()
     
     # Normalize for comparison
@@ -2764,12 +2849,36 @@ for i, s in enumerate(samples):
     }})
 
 accuracy = (correct + partial * 0.5) / total * 100
+# Aggregate generation speed over the accuracy pass (no streaming, so this is
+# throughput only) plus the streamed perf probe, which supplies TTFT.
+accuracy_total_ms = sum(accuracy_gen_ms)
+accuracy_total_tokens = sum(accuracy_out_tokens)
+perf = None
+if perf_samples:
+    perf = {{
+        "samples": perf_samples,
+        "mean_ttft_ms": sum(s["ttft_ms"] for s in perf_samples) / len(perf_samples),
+        "mean_tpot_ms": sum(s["tpot_ms"] for s in perf_samples) / len(perf_samples),
+        "mean_e2el_ms": sum(s["e2el_ms"] for s in perf_samples) / len(perf_samples),
+        "output_tokens_per_s": sum(s["output_tps"] for s in perf_samples) / len(perf_samples),
+        "total_output_tokens": sum(s["output_tokens"] for s in perf_samples),
+        "concurrency": 1,
+    }}
 summary = {{
     "total": total,
     "correct": correct,
     "partial": partial,
     "missed": total - correct - partial,
     "accuracy": round(accuracy, 2),
+    "perf": perf,
+    "generation": {{
+        "requests": total,
+        "total_output_tokens": accuracy_total_tokens,
+        "total_ms": round(accuracy_total_ms, 1),
+        "mean_ms": round(accuracy_total_ms / max(total, 1), 1),
+        "output_tokens_per_s": round(accuracy_total_tokens / max(accuracy_total_ms / 1000.0, 1e-9), 2),
+        "tpot_ms": round(accuracy_total_ms / max(accuracy_total_tokens, 1), 2),
+    }},
     "samples": results,
 }}
 
@@ -3395,6 +3504,7 @@ fn main() {
             read_run_log,
 ping_teacher,
             teacher_chat,
+            benchmark_teacher,
             test_trained_model,
             run_inference_benchmark,
             merge_and_upload_model,

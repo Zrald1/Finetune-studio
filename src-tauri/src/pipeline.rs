@@ -1409,6 +1409,10 @@ async fn run_pipeline(
         let _ = runs::save(run).await;
     }
     let t = &effective_teacher;
+    // Reasoning-effort kwargs for every generation request, derived once from
+    // the effective teacher config so each topic sends an identical payload.
+    let teacher_template_kwargs =
+        crate::config::chat_template_kwargs(t.reasoning_effort.as_deref());
 
     if !skip_dataset {
         // ── 1. Boot Teacher (vLLM, OpenAI-compatible) ───────────────────────
@@ -2485,6 +2489,7 @@ else: print('NOT_FOUND')\
                     api_key: None,
                     enable_verification: run_cfg.enable_verification.unwrap_or(false),
                     verifier_model: None,
+                    chat_template_kwargs: teacher_template_kwargs.clone(),
                 };
 
                 // Per-topic counter: how many *new* pairs this loop has accepted. Lives

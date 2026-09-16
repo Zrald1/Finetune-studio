@@ -203,6 +203,29 @@ impl Default for ServingEngine {
     }
 }
 
+/// Serving presets for the teacher model.
+///
+/// `Standard` is the conservative, deterministic baseline: BF16 weights, a
+/// 64K context and vLLM's default 0.80 memory budget — nothing exotic, and
+/// nothing that depends on a particular checkpoint's published recipe.
+///
+/// `Optimized` applies the vendor-published serving recipe for the selected
+/// model (for Qwen3.8-27B: the full 262K native context, an FP8 KV cache, and
+/// prefix caching). It is a strict superset of `Standard` and can be reverted
+/// at any time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ServingProfile {
+    Standard,
+    Optimized,
+}
+
+impl Default for ServingProfile {
+    fn default() -> Self {
+        Self::Standard
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct TeacherConfig {
@@ -228,12 +251,31 @@ pub struct TeacherConfig {
     pub extra_serve_args: Option<String>,
     #[serde(default)]
     pub serving_engine: ServingEngine,
+    /// Which serving preset to apply when `auto_tune` is on.
+    #[serde(default)]
+    pub serving_profile: ServingProfile,
+    /// vLLM `--reasoning-parser` value. Required for hybrid-thinking models
+    /// (Qwen3.5+) whose chat template opens every assistant turn with
+    /// ` thinking`: without a parser the reasoning block lands in
+    /// `message.content` and consumes the output budget before the answer
+    /// starts. The dataset generator reads only `message.content`, so leaving
+    /// this unset makes the teacher burn tokens on text that gets stripped.
+    #[serde(default)]
+    pub reasoning_parser: Option<String>,
+    /// How hard the teacher should think before answering. Qwen3.8's chat
+    /// template accepts only `xhigh`, `medium`, and `low`; `none` is this app's
+    /// sentinel for turning thinking off entirely. Applied per request rather
+    /// than via `--default-chat-template-kwargs` because that flag takes JSON,
+    /// and the deploy command embeds its arguments inside a single-quoted
+    /// `bash -lc '...'` where JSON quoting is fragile.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 impl Default for TeacherConfig {
     fn default() -> Self {
         Self {
-            repo_id: "deepseek-ai/DeepSeek-V3".to_string(),
+            repo_id: "Qwen/Qwen3.8-27B".to_string(),
             vllm_port: 8000,
             max_model_len: 32768,
             dtype: "bfloat16".to_string(),
@@ -248,7 +290,44 @@ impl Default for TeacherConfig {
             custom_serve_cmd: None,
             extra_serve_args: None,
             serving_engine: ServingEngine::Vllm,
+            serving_profile: ServingProfile::Standard,
+            reasoning_parser: None,
+            reasoning_effort: None,
         }
+    }
+}
+
+/// Qwen3.8-27B ships a vision tower (`Qwen3_5ForConditionalGeneration` with a
+/// `vision_config`) but its repo id carries no `-vl` / `vision` marker, so
+/// name-based multimodal detection has to special-case it.
+fn is_qwen3_8_multimodal(repo_lower: &str) -> bool {
+    repo_lower.contains("qwen3.8") || repo_lower.contains("qwen3_8")
+}
+
+/// The `chat_template_kwargs` object for a request to this teacher, or `None`
+/// when no effort is configured so the checkpoint's own default applies.
+///
+/// Qwen3.8's `chat_template.jinja` validates the value and calls
+/// `raise_exception` for anything outside `{xhigh, medium, low}`, which vLLM
+/// surfaces as HTTP 500 rather than a 4xx — so unsupported values must never be
+/// forwarded. `high` and `max` are folded into `xhigh` (the alias Qwen later
+/// adopted upstream) instead of being sent verbatim.
+pub fn chat_template_kwargs(effort: Option<&str>) -> Option<serde_json::Value> {
+    let effort = effort?.trim().to_ascii_lowercase();
+    match effort.as_str() {
+        "" => None,
+        "none" | "off" | "false" | "no_thinking" | "nothinking" => {
+            Some(serde_json::json!({ "enable_thinking": false }))
+        }
+        "xhigh" | "medium" | "low" => Some(serde_json::json!({
+            "enable_thinking": true,
+            "reasoning_effort": effort,
+        })),
+        "high" | "max" => Some(serde_json::json!({
+            "enable_thinking": true,
+            "reasoning_effort": "xhigh",
+        })),
+        _ => None,
     }
 }
 
@@ -269,37 +348,70 @@ impl TeacherConfig {
         let repo = resolved.repo_id.to_lowercase();
         let memory_gb = gpu_memory_total_mb.unwrap_or(0.0) / 1024.0;
         let is_qwen3 = repo.contains("qwen3");
-        let is_vl = repo.contains("-vl") || repo.contains("vision");
+        let is_vl = repo.contains("-vl") || repo.contains("vision") || is_qwen3_8_multimodal(&repo);
         let is_gguf = repo.contains("gguf");
 
-        resolved.dtype = "bfloat16".to_string();
-        resolved.gpu_memory_utilization = 0.80;
         resolved.tensor_parallel = resolved.tensor_parallel.max(1);
         resolved.enable_chunked_prefill = true;
+        resolved.dtype = "bfloat16".to_string();
 
-        resolved.max_model_len = if is_qwen3 && is_vl && memory_gb >= 180.0 {
-            100000
-        } else if (is_qwen3 || is_vl) && memory_gb >= 96.0 {
-            65536
-        } else if is_gguf {
-            32768
+        // Hybrid-thinking Qwen3.5+ checkpoints open every assistant turn with
+        // ` thinking`. Without a reasoning parser that block lands in
+        // `message.content`, and the dataset generator — which reads only
+        // `content` — spends its output budget on text it then strips. This is a
+        // correctness fix, so it applies to both profiles.
+        resolved.reasoning_parser = if is_qwen3 {
+            Some("qwen3".to_string())
         } else {
-            resolved.max_model_len.max(32768)
+            None
         };
 
-        resolved.max_num_batched_tokens = Some(if memory_gb > 0.0 && memory_gb < 64.0 {
-            4096
+        if resolved.serving_profile == ServingProfile::Optimized {
+            // Vendor-published serving recipe: full native context, a larger
+            // memory budget and higher concurrency. Clamped by VRAM so the same
+            // profile stays valid on a 48 GB card as well as a 256 GB MI325X.
+            resolved.gpu_memory_utilization = 0.90;
+            resolved.max_model_len = if memory_gb >= 140.0 {
+                262144
+            } else if memory_gb >= 96.0 {
+                131072
+            } else if memory_gb >= 48.0 {
+                65536
+            } else {
+                32768
+            };
+            resolved.max_num_batched_tokens = Some(16384);
+            resolved.max_num_seqs = Some(if memory_gb > 0.0 && memory_gb < 48.0 {
+                8
+            } else {
+                64
+            });
         } else {
-            8192
-        });
+            resolved.gpu_memory_utilization = 0.80;
+            resolved.max_model_len = if is_qwen3 && is_vl && memory_gb >= 180.0 {
+                100000
+            } else if (is_qwen3 || is_vl) && memory_gb >= 96.0 {
+                65536
+            } else if is_gguf {
+                32768
+            } else {
+                resolved.max_model_len.max(32768)
+            };
 
-        resolved.max_num_seqs = Some(if memory_gb > 0.0 && memory_gb < 64.0 {
-            4
-        } else if memory_gb > 0.0 && memory_gb < 128.0 {
-            8
-        } else {
-            16
-        });
+            resolved.max_num_batched_tokens = Some(if memory_gb > 0.0 && memory_gb < 64.0 {
+                4096
+            } else {
+                8192
+            });
+
+            resolved.max_num_seqs = Some(if memory_gb > 0.0 && memory_gb < 64.0 {
+                4
+            } else if memory_gb > 0.0 && memory_gb < 128.0 {
+                8
+            } else {
+                16
+            });
+        }
 
         if is_qwen3 {
             resolved.enable_auto_tool_choice = true;
@@ -357,6 +469,17 @@ impl TeacherConfig {
         if let Some(seqs) = self.max_num_seqs.filter(|n| *n > 0) {
             args.push(format!("--max-num-seqs {}", seqs));
         }
+        // Separates the model's ` thinking` block into `reasoning_content`.
+        // Without it that text stays in `message.content` and eats the
+        // generation budget before the answer starts.
+        if let Some(parser) = self
+            .reasoning_parser
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            args.push(format!("--reasoning-parser {parser}"));
+        }
         if self.enable_auto_tool_choice {
             args.push("--enable-auto-tool-choice".to_string());
             if let Some(parser) = self
@@ -367,6 +490,22 @@ impl TeacherConfig {
                 args.push(format!("--tool-call-parser {}", parser.trim()));
             }
         }
+
+        if self.serving_profile == ServingProfile::Optimized {
+            // Dataset generation sends the same prompt template for every chunk,
+            // so prefix caching is the single largest throughput win here.
+            args.push("--enable-prefix-caching".to_string());
+            // FP8 KV cache is native on gfx942 (MI300X/MI325X) as the E4M3FNUZ
+            // dialect and roughly doubles the KV pool, which is what lets the
+            // raised --max-num-seqs actually stay resident.
+            args.push("--kv-cache-dtype fp8".to_string());
+            // Qwen3.8-27B carries a vision tower even for text-only prompts;
+            // vLLM needs this to shard the encoder instead of replicating it.
+            if is_qwen3_8_multimodal(&self.repo_id.to_lowercase()) {
+                args.push("--mm-encoder-tp-mode data".to_string());
+            }
+        }
+
         // User-supplied advanced flags from the Deploy page (quantization,
         // block-size, swap-space, kv-cache-dtype, prefix caching, …). Appended
         // last so they can override defaults set above.
@@ -388,6 +527,26 @@ impl TeacherConfig {
 
         if repo.contains("deepseek-v4") || repo.contains("deepseek_v4") {
             prepare.push_str("python3 -c \"from transformers.models.auto.configuration_auto import CONFIG_MAPPING; import sys; sys.exit(0 if \\\"deepseek_v4\\\" in CONFIG_MAPPING else 1)\" || { echo [compat] installing Transformers with DeepSeek V4 support; python3 -m pip install --no-cache-dir --upgrade transformers || exit 42; }; ");
+        }
+
+        // Qwen3.5+ checkpoints (including Qwen3.8-27B) declare model_type
+        // `qwen3_5_text` and were written by transformers 5.8.0. vLLM parses the
+        // text config itself, but the Qwen3-VL processor path needs a matching
+        // transformers, so enforce the floor explicitly rather than relying on
+        // the generic CONFIG_MAPPING probe below (which passes as soon as the
+        // type exists, even on an older release).
+        if repo.contains("qwen3.5")
+            || repo.contains("qwen3.6")
+            || repo.contains("qwen3.7")
+            || repo.contains("qwen3.8")
+            || repo.contains("qwen3_5")
+            || repo.contains("qwen3_6")
+            || repo.contains("qwen3_7")
+            || repo.contains("qwen3_8")
+        {
+            prepare.push_str(
+                "python3 -c \"import transformers,sys; p=[int(x) for x in transformers.__version__.split('.')[:2] if x.isdigit()]; sys.exit(0 if len(p)==2 and tuple(p)>=(5,8) else 1)\" 2>/dev/null || { echo '[compat] installing Transformers >= 5.8 for Qwen3.5+ (config.json was written by 5.8.0)'; python3 -m pip install --no-cache-dir --upgrade 'transformers>=5.8.0' || exit 42; }; ",
+            );
         }
 
         let model_slug = self.repo_id.split('/').last().unwrap_or(&self.repo_id);
@@ -447,6 +606,11 @@ pub struct DockerConfig {
 #[serde(default, rename_all = "camelCase")]
 pub struct DigitalOceanConfig {
     pub api_key: String,
+    /// Optional control-plane override, e.g. an AMD Developer Cloud host for a
+    /// tenant whose token is not a DigitalOcean personal access token. Empty
+    /// means "use the standard DigitalOcean API", which also serves AMD-team
+    /// tokens and the AMD Instinct MI-series plans.
+    pub api_base: String,
     pub droplet_name: String,
     pub region: String,
     pub size: String,
@@ -465,6 +629,7 @@ impl Default for DigitalOceanConfig {
     fn default() -> Self {
         Self {
             api_key: String::new(),
+            api_base: String::new(),
             droplet_name: String::new(),
             region: String::new(),
             size: String::new(),
@@ -713,4 +878,339 @@ pub async fn save(cfg: &AppConfig) -> Result<()> {
     let txt = serde_json::to_string_pretty(&cfg)?;
     fs::write(config_path()?, txt).await?;
     Ok(())
+}
+
+// ── Deploy simulation ────────────────────────────────────────────────────────
+//
+// These exercise the same code paths the Deploy page drives, without a GPU:
+// profile resolution against reported VRAM, the flags each profile emits, the
+// reasoning-effort payload sent per request, and the shell-safety of the
+// assembled argument string. Run with `cargo test`.
+#[cfg(test)]
+mod deploy_simulation {
+    use super::*;
+
+    const GB: f64 = 1024.0; // resolved_for_gpu takes MiB
+
+    fn teacher(repo: &str, profile: ServingProfile) -> TeacherConfig {
+        TeacherConfig {
+            repo_id: repo.to_string(),
+            auto_tune: true,
+            serving_profile: profile,
+            ..Default::default()
+        }
+    }
+
+    fn qwen38(profile: ServingProfile) -> TeacherConfig {
+        teacher("Qwen/Qwen3.8-27B", profile)
+    }
+
+    fn args(t: &TeacherConfig) -> Vec<String> {
+        t.vllm_extra_args()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn has_arg(t: &TeacherConfig, needle: &str) -> bool {
+        t.vllm_extra_args().contains(needle)
+    }
+
+    // ── Standard profile ────────────────────────────────────────────────────
+
+    #[test]
+    fn standard_profile_is_conservative() {
+        let r = qwen38(ServingProfile::Standard).resolved_for_gpu(Some(256.0 * GB));
+        assert_eq!(r.gpu_memory_utilization, 0.80, "standard keeps the 0.80 budget");
+        assert_eq!(r.max_model_len, 100000, "standard caps Qwen3-VL below native");
+        assert_eq!(r.max_num_batched_tokens, Some(8192));
+        assert_eq!(r.max_num_seqs, Some(16));
+        assert_eq!(r.dtype, "bfloat16");
+    }
+
+    #[test]
+    fn standard_profile_omits_optimization_flags() {
+        let t = qwen38(ServingProfile::Standard).resolved_for_gpu(Some(256.0 * GB));
+        assert!(!has_arg(&t, "--enable-prefix-caching"), "prefix caching is opt-in");
+        assert!(!has_arg(&t, "--kv-cache-dtype"), "FP8 KV cache is opt-in");
+        assert!(!has_arg(&t, "--mm-encoder-tp-mode"));
+    }
+
+    #[test]
+    fn standard_profile_still_sets_correctness_flags() {
+        // The reasoning parser is a correctness fix, not an optimization, so it
+        // must be present even in the conservative profile.
+        let t = qwen38(ServingProfile::Standard).resolved_for_gpu(Some(256.0 * GB));
+        assert!(has_arg(&t, "--reasoning-parser qwen3"));
+        assert!(has_arg(&t, "--enable-auto-tool-choice"));
+        assert!(has_arg(&t, "--tool-call-parser qwen3_coder"));
+        assert!(has_arg(&t, "--enable-chunked-prefill"));
+    }
+
+    // ── Optimized profile ───────────────────────────────────────────────────
+
+    #[test]
+    fn optimized_profile_emits_vendor_recipe() {
+        let t = qwen38(ServingProfile::Optimized).resolved_for_gpu(Some(256.0 * GB));
+        assert_eq!(t.gpu_memory_utilization, 0.90);
+        assert_eq!(t.max_model_len, 262144, "full native context on a 256 GB card");
+        assert_eq!(t.max_num_batched_tokens, Some(16384));
+        assert_eq!(t.max_num_seqs, Some(64));
+        assert!(has_arg(&t, "--enable-prefix-caching"));
+        assert!(has_arg(&t, "--kv-cache-dtype fp8"));
+        assert!(has_arg(&t, "--mm-encoder-tp-mode data"));
+        assert!(has_arg(&t, "--reasoning-parser qwen3"));
+    }
+
+    #[test]
+    fn optimized_context_is_clamped_by_vram() {
+        let cases = [
+            (256.0, 262144),
+            (192.0, 262144),
+            (140.0, 262144),
+            (128.0, 131072),
+            (96.0, 131072),
+            (80.0, 65536),
+            (48.0, 65536),
+            (24.0, 32768),
+        ];
+        for (gb, expected) in cases {
+            let t = qwen38(ServingProfile::Optimized).resolved_for_gpu(Some(gb * GB));
+            assert_eq!(
+                t.max_model_len, expected,
+                "optimized context wrong at {gb} GB VRAM"
+            );
+        }
+    }
+
+    #[test]
+    fn optimized_seq_count_drops_on_small_cards() {
+        let small = qwen38(ServingProfile::Optimized).resolved_for_gpu(Some(24.0 * GB));
+        assert_eq!(small.max_num_seqs, Some(8), "small VRAM gets fewer sequences");
+        let large = qwen38(ServingProfile::Optimized).resolved_for_gpu(Some(256.0 * GB));
+        assert_eq!(large.max_num_seqs, Some(64));
+    }
+
+    #[test]
+    fn profiles_differ_in_the_expected_directions() {
+        let std = qwen38(ServingProfile::Standard).resolved_for_gpu(Some(256.0 * GB));
+        let opt = qwen38(ServingProfile::Optimized).resolved_for_gpu(Some(256.0 * GB));
+        assert!(opt.max_model_len > std.max_model_len);
+        assert!(opt.gpu_memory_utilization > std.gpu_memory_utilization);
+        assert!(opt.max_num_seqs.unwrap() > std.max_num_seqs.unwrap());
+        assert!(opt.max_num_batched_tokens.unwrap() > std.max_num_batched_tokens.unwrap());
+    }
+
+    // ── Model-family behaviour ──────────────────────────────────────────────
+
+    #[test]
+    fn multimodal_encoder_flag_only_for_qwen38() {
+        // Qwen3.8-27B carries a vision tower with no "-vl" marker in its id.
+        let q38 = qwen38(ServingProfile::Optimized).resolved_for_gpu(Some(256.0 * GB));
+        assert!(has_arg(&q38, "--mm-encoder-tp-mode data"));
+
+        let llama = teacher("meta-llama/Llama-3.1-8B-Instruct", ServingProfile::Optimized)
+            .resolved_for_gpu(Some(256.0 * GB));
+        assert!(!has_arg(&llama, "--mm-encoder-tp-mode"));
+    }
+
+    #[test]
+    fn non_qwen_models_get_no_qwen_flags() {
+        let t = teacher("meta-llama/Llama-3.1-8B-Instruct", ServingProfile::Optimized)
+            .resolved_for_gpu(Some(256.0 * GB));
+        assert!(!has_arg(&t, "--reasoning-parser"));
+        assert!(!has_arg(&t, "--enable-auto-tool-choice"));
+        assert!(!has_arg(&t, "--tool-call-parser"));
+        assert!(t.reasoning_parser.is_none());
+    }
+
+    #[test]
+    fn manual_mode_leaves_config_untouched() {
+        let mut t = qwen38(ServingProfile::Optimized);
+        t.auto_tune = false;
+        t.max_model_len = 4096;
+        t.gpu_memory_utilization = 0.42;
+        let r = t.resolved_for_gpu(Some(256.0 * GB));
+        assert_eq!(r.max_model_len, 4096, "manual settings must survive");
+        assert_eq!(r.gpu_memory_utilization, 0.42);
+    }
+
+    #[test]
+    fn custom_serve_cmd_disables_tuning() {
+        let mut t = qwen38(ServingProfile::Optimized);
+        t.custom_serve_cmd = Some("vllm serve my-own-thing".to_string());
+        t.max_model_len = 8192;
+        let r = t.resolved_for_gpu(Some(256.0 * GB));
+        assert_eq!(r.max_model_len, 8192, "custom command wins over auto-tune");
+    }
+
+    #[test]
+    fn unknown_vram_does_not_panic() {
+        for profile in [ServingProfile::Standard, ServingProfile::Optimized] {
+            let r = qwen38(profile).resolved_for_gpu(None);
+            assert!(r.max_model_len > 0);
+            assert!(r.max_num_seqs.unwrap() > 0);
+        }
+    }
+
+    // ── Reasoning effort ────────────────────────────────────────────────────
+
+    #[test]
+    fn reasoning_effort_levels_map_to_valid_template_kwargs() {
+        let cases = [
+            ("xhigh", "xhigh"),
+            ("medium", "medium"),
+            ("low", "low"),
+            ("XHIGH", "xhigh"),
+            (" Medium ", "medium"),
+        ];
+        for (input, expected) in cases {
+            let kw = chat_template_kwargs(Some(input)).expect("level should produce kwargs");
+            assert_eq!(kw["reasoning_effort"], expected, "input {input:?}");
+            assert_eq!(kw["enable_thinking"], true);
+        }
+    }
+
+    #[test]
+    fn no_thinking_disables_thinking_without_a_level() {
+        for input in ["none", "off", "false", "no_thinking", "NOTHINKING"] {
+            let kw = chat_template_kwargs(Some(input)).expect("should produce kwargs");
+            assert_eq!(kw["enable_thinking"], false, "input {input:?}");
+            assert!(
+                kw.get("reasoning_effort").is_none(),
+                "must not send a level alongside enable_thinking=false"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_levels_never_reach_the_template() {
+        // Qwen3.8's chat template raises on anything outside xhigh/medium/low,
+        // which vLLM reports as HTTP 500. "high" is the OpenAI spelling and is
+        // folded into xhigh; junk is dropped so the model default applies.
+        for input in ["high", "max", "HIGH"] {
+            let kw = chat_template_kwargs(Some(input)).expect("high folds to xhigh");
+            assert_eq!(kw["reasoning_effort"], "xhigh", "input {input:?}");
+        }
+        for input in ["bogus", "ultra", "7", ""] {
+            assert!(
+                chat_template_kwargs(Some(input)).is_none(),
+                "input {input:?} must be dropped, not forwarded"
+            );
+        }
+        assert!(chat_template_kwargs(None).is_none());
+    }
+
+    // ── Shell safety ────────────────────────────────────────────────────────
+
+    #[test]
+    fn extra_args_are_safe_inside_bash_lc_single_quotes() {
+        // The deploy path embeds these args in `bash -lc '...'`, so a single
+        // quote anywhere would terminate the wrapper and break the launch.
+        for profile in [ServingProfile::Standard, ServingProfile::Optimized] {
+            let t = qwen38(profile).resolved_for_gpu(Some(256.0 * GB));
+            let args = t.vllm_extra_args();
+            assert!(!args.contains('\''), "single quote in args: {args}");
+            assert!(!args.contains('`'), "backtick in args: {args}");
+            assert!(!args.contains("$("), "command substitution in args: {args}");
+        }
+    }
+
+    #[test]
+    fn every_emitted_flag_has_a_value() {
+        let t = qwen38(ServingProfile::Optimized).resolved_for_gpu(Some(256.0 * GB));
+        let toks = args(&t);
+        let value_flags = [
+            "--max-num-batched-tokens",
+            "--max-num-seqs",
+            "--reasoning-parser",
+            "--tool-call-parser",
+            "--kv-cache-dtype",
+            "--mm-encoder-tp-mode",
+        ];
+        for (i, tok) in toks.iter().enumerate() {
+            if value_flags.contains(&tok.as_str()) {
+                assert!(
+                    toks.get(i + 1).is_some_and(|v| !v.starts_with("--")),
+                    "{tok} is missing its value in: {}",
+                    t.vllm_extra_args()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn full_serve_command_assembles_cleanly() {
+        // Mirrors the format string the deploy path uses, so a regression in
+        // any single flag shows up as a malformed command here.
+        for (profile, effort) in [
+            (ServingProfile::Standard, "xhigh"),
+            (ServingProfile::Optimized, "none"),
+        ] {
+            let mut t = qwen38(profile);
+            t.reasoning_effort = Some(effort.to_string());
+            let t = t.resolved_for_gpu(Some(256.0 * GB));
+            let cmd = format!(
+                "cd /app && vllm serve {model} --port {port} --host 0.0.0.0 \
+                 --max-model-len {mml} --dtype {dtype} --download-dir /root/hf-cache \
+                 --tensor-parallel-size {tp} --gpu-memory-utilization {gpu_mem} {extra}",
+                model = t.repo_id,
+                port = t.vllm_port,
+                mml = t.max_model_len,
+                dtype = t.dtype,
+                tp = t.tensor_parallel,
+                gpu_mem = t.gpu_memory_utilization,
+                extra = t.vllm_extra_args(),
+            );
+            assert!(cmd.starts_with("cd /app && vllm serve Qwen/Qwen3.8-27B"));
+            assert!(cmd.contains(&format!("--max-model-len {}", t.max_model_len)));
+            assert!(cmd.contains(&format!("--gpu-memory-utilization {}", t.gpu_memory_utilization)));
+            assert!(!cmd.contains("  "), "double space means an empty placeholder: {cmd}");
+            assert!(!cmd.contains("None"), "unset Option leaked into command: {cmd}");
+        }
+    }
+
+    // ── Fresh-install defaults ──────────────────────────────────────────────
+
+    #[test]
+    fn defaults_carry_no_credentials() {
+        // A new install must start empty: no tokens, no keys, no hosts.
+        let cfg = AppConfig::default();
+        assert!(cfg.hf_token.is_none());
+        assert!(cfg.ssh.host.is_empty());
+        assert!(cfg.ssh.private_key.is_none());
+        assert!(cfg.ssh.private_key_path.is_none());
+        assert!(cfg.ssh.password.is_none());
+        assert!(cfg.digital_ocean.api_key.is_empty());
+        assert!(cfg.digital_ocean.project_id.is_empty());
+        assert!(cfg.digital_ocean.ssh_keys.is_empty());
+        assert!(cfg.qdrant.api_key.is_empty());
+        assert!(cfg.qdrant.endpoint.is_empty());
+        assert!(cfg.ai_agent.is_none());
+        assert!(cfg.embedding.is_none());
+    }
+
+    #[test]
+    fn teacher_default_targets_qwen38() {
+        let t = TeacherConfig::default();
+        assert_eq!(t.repo_id, "Qwen/Qwen3.8-27B");
+        assert_eq!(t.serving_profile, ServingProfile::Standard);
+        assert!(t.reasoning_effort.is_none());
+        assert!(t.custom_serve_cmd.is_none());
+    }
+
+    #[test]
+    fn config_roundtrips_without_secrets_leaking_into_unknown_fields() {
+        // Old config.json files (written before servingProfile/reasoningEffort
+        // existed) must still parse, with the new fields defaulted.
+        let legacy = r#"{
+            "teacher": { "repoId": "Qwen/Qwen3.8-27B", "autoTune": true },
+            "ssh": { "host": "" }
+        }"#;
+        let cfg: AppConfig = serde_json::from_str(legacy).expect("legacy config must parse");
+        assert_eq!(cfg.teacher.repo_id, "Qwen/Qwen3.8-27B");
+        assert_eq!(cfg.teacher.serving_profile, ServingProfile::Standard);
+        assert!(cfg.teacher.reasoning_effort.is_none());
+        assert!(cfg.teacher.reasoning_parser.is_none());
+    }
 }

@@ -759,6 +759,20 @@ export default function CredentialsPanel({
             className="w-full px-4 py-3 premium-input rounded-xl text-sm-fluid font-mono placeholder-white/10 focus:outline-none shadow-inner"
           />
         </div>
+        <div className="space-y-2">
+          <label className="text-[10px] uppercase tracking-widest theme-muted font-black ml-1">API Base (optional)</label>
+          <input
+            type="text"
+            placeholder="https://api.digitalocean.com/v2"
+            value={digitalOcean.apiBase}
+            onChange={(e) => onChange({ digitalOcean: { ...digitalOcean, apiBase: e.target.value } })}
+            className="w-full px-4 py-3 premium-input rounded-xl text-sm-fluid font-mono placeholder-white/10 focus:outline-none shadow-inner"
+          />
+          <p className="text-[10px] theme-muted font-mono ml-1 opacity-70">
+            Leave blank for the standard DigitalOcean API. AMD-team tokens and AMD Instinct plans are served there too; only set this for a
+            Developer Cloud-native endpoint.
+          </p>
+        </div>
       </div>
 
       {/* Qdrant */}

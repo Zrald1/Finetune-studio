@@ -6,18 +6,25 @@ A **Tauri 2 desktop app** that drives the entire LLM fine-tuning pipeline from a
 Qdrant chunks → Teacher LLM (vLLM) → JSONL dataset → LoRA training (LLaMA-Factory) → adapter
 ```
 
-All heavy ML work runs on a **remote GPU droplet over SSH** (built and tested on an MI300X DigitalOcean instance). The local app is a pure **orchestrator**: it generates the scripts, streams the logs, parses the metrics, and persists run history. Your laptop never needs a GPU.
+All heavy ML work runs on a **remote GPU droplet over SSH** (built and tested on AMD Instinct MI300X / MI325X DigitalOcean instances). The local app is a pure **orchestrator**: it generates the scripts, streams the logs, parses the metrics, and persists run history. Your laptop never needs a GPU.
 
 ---
 
 ## Table of contents
 
 - [What it does](#what-it-does)
+- [Teacher model](#teacher-model)
+- [Serving profiles](#serving-profiles)
+- [Benchmarking](#benchmarking)
+- [ZRALD post-training](#zrald-post-training)
+- [Training methods](#training-methods)
+- [GPU provisioning](#gpu-provisioning)
 - [Architecture](#architecture)
 - [Project structure](#project-structure)
 - [Quick start](#quick-start)
 - [Using the app](#using-the-app)
-- [Reusing it for any domain or model](#reusing-it-for-any-domain-or-model)
+- [Testing](#testing)
+- [Privacy and credentials](#privacy-and-credentials)
 - [Troubleshooting](#troubleshooting)
 - [Tech stack](#tech-stack)
 - [License](#license)
@@ -35,32 +42,131 @@ Fine-Tune Studio turns a raw knowledge base into a fine-tuned LoRA adapter with 
 
 Throughout, you get **live logs, kept/scanned/rejected counters, a dataset preview, and a live loss curve**. The app automatically unloads the teacher before training so the full GPU VRAM is free for LoRA.
 
+Six top-level tabs: **Pipeline**, **GPU Servers**, **Credentials**, **Runs**, **Deploy**, **Robot Vision**, plus an AI-assisted terminal in the sidebar.
+
+---
+
+## Teacher model
+
+The teacher is the model that writes your dataset. The curated roster is a single entry:
+
+| Preset | Why |
+|---|---|
+| `Qwen/Qwen3.8-27B` | 27B dense hybrid-attention checkpoint, 262K native context, native vision-language, Apache 2.0, and the model vLLM publishes a verified serving recipe for on AMD Instinct MI300X / MI325X / MI355X. |
+| *Custom Hugging Face Repo ID* | Any other repo — GGUF, quantized, or a different family. Auto-tuning adapts to what it can detect. |
+
+Anything else is reachable through the Custom entry. Nothing in the code is hard-coded to one family; the profile logic keys off the repo id (see `src/lib/servingProfiles.ts`).
+
+### Thinking effort
+
+Hybrid-thinking Qwen3.5+ checkpoints open every assistant turn with a ` thinking` block. Two settings control that:
+
+- **Reasoning parser** (`--reasoning-parser qwen3`) — splits the thinking into `reasoning_content` so it stops consuming the dataset generator's output budget. Set automatically for any `qwen3*` repo, in **both** serving profiles, because it is a correctness fix rather than an optimization.
+- **Thinking effort** — `XHigh` / `Medium` / `Low` / `No Thinking`, applied per request via `chat_template_kwargs`, so changing it needs no redeploy.
+
+> **Why there is no `High` option.** Qwen3.8's `chat_template.jinja` validates the value and calls `raise_exception` for anything outside `{xhigh, medium, low}`, which vLLM surfaces as **HTTP 500** rather than a 4xx. `high` is the OpenAI/Anthropic spelling, not a Qwen3.8 one. If it reaches the backend from a hand-edited config it is folded into `xhigh` rather than forwarded.
+
+---
+
+## Serving profiles
+
+The Teacher step exposes two presets, switchable at any time:
+
+| | **Standard** | **Optimized** |
+|---|---|---|
+| Intent | Conservative, deterministic baseline | Vendor-published serving recipe |
+| Context (≥140 GB VRAM) | 100,000 | **262,144** (native) |
+| GPU memory budget | 0.80 | 0.90 |
+| Batched tokens | 8,192 | 16,384 |
+| Max sequences | 16 | 64 |
+| Prefix caching | — | ✓ |
+| FP8 KV cache | — | ✓ |
+| Vision-encoder sharding | — | ✓ |
+
+The optimized context is **clamped by reported VRAM** so the same profile stays valid on smaller cards:
+
+| VRAM | Context | Sequences |
+|---|---|---|
+| ≥ 140 GB | 262,144 | 64 |
+| ≥ 96 GB | 131,072 | 64 |
+| ≥ 48 GB | 65,536 | 64 |
+| < 48 GB | 32,768 | 8 |
+
+Switching to Optimized shows a one-line summary of what changed, and a **Revert to Standard** link puts it back. Manual mode (Auto Tune off) and a custom serve command both bypass tuning entirely.
+
+FP8 KV cache is **native on gfx942** (MI300X / MI325X) as the E4M3FNUZ dialect, so it roughly doubles the KV pool at no emulation cost.
+
+---
+
+## Benchmarking
+
+### Teacher — token-level, from the Teacher step
+
+A **Benchmark** button sits beside *Verify* / *Deploy Teacher*. Metric definitions deliberately mirror vLLM's own `vllm bench serve` so results are comparable with upstream tooling:
+
+| Metric | Definition |
+|---|---|
+| **TTFT** | Time to first streamed token (mean / median / p95) |
+| **TPOT** | `(e2el − ttft) / (output_tokens − 1)` — decode-only per-token cost |
+| **ITL** | Mean observed inter-token gap |
+| **Output tok/s** | Generation throughput |
+| **E2EL** | End-to-end latency per request |
+
+TTFT is not observable from a non-streaming response, so every request sets `stream: true` with `stream_options.include_usage` to get exact token counts back from the server instead of estimating them. A per-sample table adds a **Think** column — the gap between the first token and the first *content* token, i.e. what the thinking phase actually costs you.
+
+A **Serial / Concurrent ×4** toggle switches between single-stream latency (what dataset generation experiences) and aggregate throughput under load.
+
+### Student — accuracy plus generation speed
+
+The Runs tab benchmarks a completed run against its own dataset. It reports **accuracy** (exact / partial / keyword-overlap) and, since the streaming probe was added, **TTFT, TPOT and tokens/sec** measured with `TextIteratorStreamer` — a plain `model.generate()` call only yields total wall time, from which TTFT cannot be separated.
+
 ---
 
 ## ZRALD post-training
 
-Fine-Tune Studio includes an experimental ZRALD workflow:
-**Zero-shot Retrieval-Augmented Learning with Dynamic rewards**.
+**Zero-shot Retrieval-Augmented Learning with Dynamic rewards** extends the RAG dataset pipeline into a teacher-student post-training loop. A teacher reads retrieved chunks, generates grounded questions and reference answers, then scores student answers against the stored source context. The best answers become training signal for a smaller student.
 
-ZRALD extends the normal RAG dataset pipeline into a teacher-student
-post-training loop. A teacher model reads retrieved source chunks, generates
-grounded questions and reference answers, and later scores student answers
-against the stored source context. The selected answers become supervised
-training examples for a smaller student model.
+Two paths are maintained:
 
-Two ZRALD paths are maintained:
+- **ZRALD Online** (`zrald`) — GRPO via Unsloth + TRL, keeping the reward teacher available during student training.
+- **ZRALD Offline** (`zrald_offline`) — stages teacher generation, student candidate generation, teacher scoring, and student LoRA training separately, so a single AMD ROCm GPU can run the whole loop without holding both models at once.
 
-- **ZRALD Online:** keeps the reward teacher available during student training
-  when enough VRAM is available.
-- **ZRALD Offline:** stages teacher generation, student candidate generation,
-  teacher scoring, and student LoRA training separately so a single AMD ROCm
-  GPU can run the workflow without keeping teacher and student models loaded at
-  the same time.
+Both build their trainer and environment at runtime:
 
-Current focus: validating dataset generation quality and moving the staged
-ZRALD Offline loop into repeatable post-training experiments on AMD ROCm GPU
-droplets.
+- The GRPO stack installs into an **isolated `.zrald_venv`**. A `--force-reinstall torch` in the container's system Python would overwrite the torch the resident vLLM teacher's prebuilt C extensions need (undefined symbol / triton `constexpr_function` crashes).
+- The offline runner **only boots a local reward teacher when no external reward endpoint is configured** — otherwise it would fight the deployed teacher for VRAM.
+- `gpt-oss` students skip 4-bit loading; their MXFP4 weights cannot be re-quantized.
 
+See [../method.md](../method.md) for the technical method notes.
+
+---
+
+## Training methods
+
+Fourteen methods ship, dispatched by `src-tauri/src/method/mod.rs`:
+
+| Family | Methods |
+|---|---|
+| LoRA family | `lora`, `qlora`, `dora`, `loraplus`, `pissa`, `unsloth` |
+| Full-parameter | `full`, `freeze` |
+| Memory-efficient optimizers | `galore`, `badam` |
+| RL | `grpo`, `zrald`, `zrald_offline` |
+| Escape hatch | `custom` (arbitrary command sequence) |
+
+`full` and `freeze` save a **complete** model (`model.safetensors` + `config.json`) rather than a PEFT adapter, so the post-training existence check, Hub upload, and merge steps treat them differently — there is nothing to merge into a base.
+
+---
+
+## GPU provisioning
+
+The **GPU Servers** tab manages DigitalOcean droplets directly: plan selection, images, SSH keys, projects, live GPU droplet listing, and local usage/cost accounting.
+
+**AMD Developer Cloud notes.** `dop_v1_` personal access tokens are served by the **standard control plane** (`api.digitalocean.com/v2`), which lists the AMD Instinct MI-series plans. The legacy `api-amd.digitalocean.com` host now 301-redirects to `api.devcloud.amd.com`, which rejects DigitalOcean tokens with `401`, so it is no longer used by default. An optional **API Base** override exists in the Credentials panel for tenants holding a Developer Cloud-native token.
+
+Two behaviours worth knowing:
+
+- Plan availability is **per team**. A plan can report `available: true` with an empty `regions` array and still refuse every create — the app retries the documented regions, then fails with an actionable message naming plans that *do* publish a creatable region.
+- Older `-devcloud` / `-contracted` slug suffixes are **retired** and are normalised away automatically, so configs saved by earlier builds keep working.
 
 ---
 
@@ -68,11 +174,13 @@ droplets.
 
 ```
    React UI            Rust core              Remote GPU droplet
-   ────────            ──────────             ─────────────────────
+   ────────            ──────────             ───────────────────
    PipelineWizard ──▶  pipeline.rs   ──SSH──▶ vllm serve <teacher>
+   DeployPanel    ──▶  bench.rs      ─https─▶ /v1/chat/completions
    RunDashboard   ◀──  ssh.rs        ─https─▶ Qdrant (knowledge base)
    Live Logs      ◀──  generator.rs
    LoRA chart     ◀──  llamafactory.rs ─SSH─▶ llamafactory-cli train
+   GPU Servers    ──▶  digitalocean.rs ─https─▶ DigitalOcean API
 ```
 
 The local app stores config + run history in `%APPDATA%/fine-tune/` (Windows)
@@ -81,6 +189,8 @@ or `~/.config/fine-tune/` (Linux). Each run gets its own folder:
 ```
 %APPDATA%/fine-tune/
 ├── config.json              # SSH, Qdrant, HF token, defaults
+├── droplet_usage.json       # local droplet time + estimated cost
+├── droplet_usage.csv
 └── runs/
     └── 01HXYZ.../           # ULID per run
         ├── qa_dataset.jsonl
@@ -91,7 +201,7 @@ or `~/.config/fine-tune/` (Linux). Each run gets its own folder:
 
 The same run folder is mirrored on the droplet at `/root/fine-tune/runs/{id}/`.
 
-> **Note on secrets:** SSH keys, Qdrant API keys, and Hugging Face tokens are entered in the app at runtime and stored locally in `config.json`. **Nothing sensitive is committed to this repo.**
+Training and serving run inside a **`rocm-vllm` Docker container** on the host (`--device=/dev/kfd --device=/dev/dri --network=host --ipc=host --group-add video -v /root:/root`), so the app can pipe commands through `docker exec` without a separate ROCm install on the droplet. The default image is `vllm/vllm-openai-rocm:nightly`.
 
 ---
 
@@ -103,52 +213,75 @@ FineTune/
 ├── index.html                       # Vite entry point
 ├── package.json                     # npm scripts + JS deps
 ├── tsconfig.json
-├── vite.config.ts                   # Vite + Tailwind + React config
+├── vite.config.ts
+│
+├── scripts/
+│   └── simulate-deploy.ts           # Deploy-page simulation (see Testing)
 │
 ├── src/                             # ── Frontend (React + TypeScript) ──
-│   ├── main.tsx                     # React root
+│   ├── main.tsx                     # React root + context-menu suppression
 │   ├── App.tsx                      # Top-level state, config load/save, tabs
 │   ├── types.ts                     # Shared TS types + config defaults
 │   ├── index.css                    # Tailwind entry
 │   │
 │   ├── components/
-│   │   ├── PipelineWizard.tsx       # The 4-step fine-tuning wizard
-│   │   ├── RunDashboard.tsx         # Run list + detail (logs, progress, loss chart)
-│   │   ├── CredentialsPanel.tsx     # SSH / Qdrant / HF token entry + Test SSH
+│   │   ├── PipelineWizard.tsx       # 4-step wizard + Teacher/Dataset/Train steps
+│   │   ├── DeployPanel.tsx          # Serving profiles, vLLM tuning, chat, metrics
+│   │   ├── RunDashboard.tsx         # Run detail, logs, loss chart, student benchmark
+│   │   ├── CredentialsPanel.tsx     # SSH / Qdrant / HF / DO / AI agent entry
+│   │   ├── GpuServerManager.tsx     # DigitalOcean droplet provisioning + usage
+│   │   ├── GPUStatsDashboard.tsx    # Live GPU stats
 │   │   ├── TrainingConfigForm.tsx   # LoRA hyperparameter form
 │   │   ├── DatasetPreview.tsx       # Inline JSONL sample viewer
-│   │   ├── GpuServerManager.tsx     # Droplet / GPU server controls
-│   │   ├── GPUStatsDashboard.tsx    # Live nvidia-smi / GPU stats
-│   │   ├── EmbeddingWidget.tsx      # Embedding / knowledge-base helpers
-│   │   ├── AITerminalPanel.tsx      # AI-assisted terminal
-│   │   ├── TerminalPanel.tsx        # Raw SSH terminal panel
+│   │   ├── EmbeddingWidget.tsx      # Embedder lifecycle helpers
+│   │   ├── AITerminalPanel.tsx      # AI-assisted terminal (sidebar)
+│   │   ├── TerminalPanel.tsx        # ⚠ legacy, not imported anywhere
+│   │   ├── RoboticsWidget.tsx       # Robot capture / model-pull bridge
 │   │   └── ThemeSwitcher.tsx        # Light/dark theme toggle
 │   │
 │   └── lib/
-│       ├── tauri.ts                 # Typed invoke()/listen() wrappers to Rust
-│       └── runStreams.ts            # Live log/metric stream handling
+│       ├── tauri.ts                 # Typed invoke()/listen() wrappers
+│       ├── runStreams.ts            # Live log/metric stream handling
+│       ├── servingProfiles.ts       # Standard/Optimized profile logic (pure)
+│       ├── setupLogs.ts             # Setup log buffer
+│       ├── textSanitize.ts          # Model-output sanitising
+│       └── vllmProfiles.ts          # ⚠ legacy duplicate, currently unused
 │
 └── src-tauri/                       # ── Backend (Rust / Tauri core) ──
-    ├── Cargo.toml                   # Rust deps
+    ├── Cargo.toml
     ├── tauri.conf.json              # App identity, window, bundle config
-    ├── build.rs
-    ├── capabilities/default.json    # Tauri permission capabilities
-    ├── icons/                       # App icons
+    ├── capabilities/default.json
     └── src/
         ├── main.rs                  # Tauri command surface + event wiring
-        ├── config.rs                # Load/save config.json
-        ├── ssh.rs                   # russh client (connect, exec, stream, nvidia-smi)
-        ├── qdrant.rs                # Qdrant HTTP scroll/count
+        ├── lib.rs                   # Shared library (headless server reuses it)
+        ├── config.rs                # Config load/save + serving-profile resolution
+        ├── pipeline.rs              # State machine: ssh ▶ teacher ▶ generate ▶ train ▶ done
         ├── generator.rs             # Teacher prompt + OpenAI-compat call + parse
-        ├── llamafactory.rs          # JSONL → ShareGPT, dataset_info.json, train.yaml, metrics
-        ├── pipeline.rs              # State machine: ssh ▶ teacher_up ▶ generate ▶ unload ▶ train ▶ done
+        ├── bench.rs                 # Token-level inference benchmark (TTFT/TPOT/ITL)
+        ├── ssh.rs                   # russh client (connect, exec, stream, GPU stats)
+        ├── llamafactory.rs          # JSONL → ShareGPT, dataset_info.json, train.yaml
+        ├── digitalocean.rs          # Droplet CRUD, plans, images, regions
+        ├── droplet_usage.rs         # Local usage/cost ledger
         ├── runs.rs                  # One JSON per run, durable across restarts
-        ├── serve.rs                 # Model serving / embedder boot helpers
-        ├── ingest.rs                # Document ingestion
+        ├── serve.rs                 # Embedder / model serving helpers
+        ├── ingest.rs                # Document ingestion + embedding
+        ├── qdrant.rs                # Qdrant HTTP scroll/count
         ├── hf.rs                    # Hugging Face whoami / list models & datasets
-        ├── digitalocean.rs          # Droplet management
-        ├── guides.rs                # In-app guidance content
-        └── error.rs                 # Error types
+        ├── guides.rs                # Model-specific hyperparameter guidance
+        ├── research.rs              # Web-research provider (robot pipeline)
+        ├── robot.rs                 # Robot↔server bridge
+        ├── manifest.rs              # Model manifest store
+        ├── error.rs                 # Error types
+        │
+        ├── method/                  # Training-method strategies
+        │   ├── mod.rs               # Dispatch + ZRALD simulation tests
+        │   ├── lora.rs  qlora.rs  dora.rs  loraplus.rs  pissa.rs  unsloth.rs
+        │   ├── full.rs  freeze.rs
+        │   ├── galore.rs  badam.rs
+        │   ├── grpo.rs  zrald.rs  zrald_offline.rs
+        │   └── custom.rs
+        │
+        └── bin/server.rs            # Headless VPS server (robot intake + REST API)
 ```
 
 ---
@@ -164,11 +297,7 @@ FineTune/
 | MSVC build tools (Windows) | Visual Studio 2022 with the C++ workload |
 | WebView2 runtime | ships with Windows 11 |
 
-On the remote GPU droplet:
-
-```bash
-pip install vllm llamafactory torch transformers accelerate datasets peft trl
-```
+On the remote GPU host, the app expects Docker with ROCm access. vLLM, LLaMA-Factory, and the training stack are installed into the container by the app as needed.
 
 ### Run in dev
 
@@ -177,8 +306,6 @@ cd FineTune
 npm install
 npm run dev        # spawns Vite + Tauri together
 ```
-
-The app window opens. The first panel asks for SSH host, Qdrant endpoint + key, and Hugging Face token.
 
 ### Build the installer
 
@@ -190,37 +317,72 @@ npm run build      # produces .msi / .exe under src-tauri/target/release/bundle/
 
 ## Using the app
 
-1. **Credentials panel** (left): paste your SSH host, drop in an SSH key file, paste the Qdrant endpoint + key, and your HF token. Click **Test SSH** — the droplet's `uname -a` + GPU detection appears.
+1. **Credentials panel**: SSH host + key, Qdrant endpoint + key, HF token. Click **Test SSH** — the host's `uname -a` and GPU detection appear.
 
-2. **Pipeline tab → Step 1 Knowledge Base**: click **Refresh** to see the total chunk count + 3 sample chunks from Qdrant.
+2. **Pipeline → Step 1 Knowledge Base**: **Refresh** to see the chunk count and sample chunks from Qdrant.
 
-3. **Step 2 Teacher**: choose an HF repo (e.g. `Qwen/Qwen2.5-7B-Instruct` for fast tests, or a 70B distill for production quality), the serve port, dtype, and max length.
+3. **Step 2 Teacher**: pick `Qwen/Qwen3.8-27B` (or Custom), choose a **serving profile**, set the thinking effort, then **Deploy Teacher**. Optionally hit **Benchmark** to record TTFT / tok/s before generating.
 
-4. **Step 3 Dataset**: edit the prompt template, set concurrency and the pairs-per-chunk target. Use a small **Max Chunks** for smoke tests.
+4. **Step 3 Dataset**: edit the prompt template, set concurrency and pairs-per-chunk. Use a small **Max Chunks** for smoke tests.
 
-5. **Step 4 Student & Train**: pick the student HF repo, tune the LoRA params, click **Start Pipeline**.
+5. **Step 4 Student & Train**: pick the student repo, choose a training method, tune the hyperparameters, **Start Pipeline**.
 
-6. **Runs tab** (opens automatically): watch live logs, the kept/scanned/rejected counters, the dataset preview, and the loss curve as it trains. When status = `done`, your adapter lives at `/root/fine-tune/runs/{id}/lora/` on the droplet — pull it with:
+6. **Runs tab**: watch live logs, the kept/scanned/rejected counters, the dataset preview, and the loss curve. When status = `done`, the adapter is at `/root/fine-tune/runs/{id}/lora/` on the host:
 
    ```bash
    scp -r root@<host>:/root/fine-tune/runs/<id>/lora ./adapter
    ```
 
-The pipeline automatically **unloads the teacher (`pkill -f vllm`) before launching the student** so the full GPU VRAM is available for LoRA training.
+The pipeline automatically unloads the teacher before launching the student so the full GPU VRAM is available for training.
 
----
-
-## Reusing it for any domain or model
-
-Nothing in the code is hard-coded to a single domain. To fine-tune a new one:
+### Reusing it for any domain
 
 1. Build a new **Qdrant collection** of your raw documents.
 2. Change the **Collection** field in the Credentials panel.
-3. Rewrite the **prompt template** in Step 3 to fit the new domain.
-4. Pick any **Teacher + Student** HF repos.
-5. Click **Start**.
+3. Rewrite the **prompt template** in Step 3.
+4. Pick any **Teacher + Student** repos.
 
 No code changes are needed for new domains, models, or datasets.
+
+---
+
+## Testing
+
+There is no browser test framework. Verification is split between Rust unit tests and a Node-driven simulation of the frontend profile logic.
+
+```bash
+npm test               # everything: Rust suite + deploy simulation
+npm run test:rust      # cargo test only
+npm run simulate       # deploy-page simulation only
+npm run simulate:zrald # ZRALD simulation only
+npm run lint           # tsc --noEmit
+```
+
+| Suite | Count | Covers |
+|---|---|---|
+| `config::deploy_simulation` | 21 | Standard/Optimized resolution across 8 VRAM sizes, reasoning-effort mapping, shell safety of emitted flags, fresh-install defaults, legacy-config roundtrip |
+| `method::zrald_simulation` | 22 | Placeholder substitution, heredoc integrity, generated Python **compiled with a real interpreter**, generated shell **parsed with a real `bash -n`**, clamping, reward-endpoint fallback, venv isolation |
+| `scripts/simulate-deploy.ts` | 336 assertions | The frontend profile logic, imported from the same module the app uses — not a reimplementation |
+
+The deploy simulation and the Rust tests assert the **same VRAM ladder**, so a change on one side that isn't mirrored on the other fails loudly instead of silently diverging at deploy time.
+
+> **Scope.** These validate that generated artifacts are structurally sound and syntactically valid. They do **not** prove vLLM accepts the flags, that the model loads, or that GRPO trains — those need real hardware.
+
+---
+
+## Privacy and credentials
+
+**No credentials ship with the app.** Verified:
+
+- The installer bundles **only icons** — `tauri.conf.json` declares no `resources`, so there is no `config.json` inside the build.
+- Config is created per-user at first run in the OS config dir. `AppConfig` derives `Default`, so every field starts empty.
+- No tokens are hard-coded anywhere in the source tree.
+
+A `defaults_carry_no_credentials` test locks this in, so it cannot silently regress.
+
+SSH keys, Qdrant API keys, Hugging Face tokens, and DigitalOcean tokens are entered at runtime and stored locally in `config.json`. **Nothing sensitive is committed to this repo**, and `.gitignore` excludes `.env` files.
+
+The webview's right-click context menu is suppressed so the app reads as a native desktop tool; editable fields are exempted so right-click paste still works in text boxes.
 
 ---
 
@@ -228,26 +390,26 @@ No code changes are needed for new domains, models, or datasets.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `teacher boot timeout (20 min)` | vLLM weight download slow or wrong dtype | Try `--dtype auto` or a smaller model. Watch `/root/fine-tune/runs/<id>/teacher.log` on the droplet. |
-| Generator errors `Connection refused` | Firewall blocks the vLLM port | Open the port (`ufw allow 8000/tcp`) or change the port in Step 2. |
-| `no valid Q&A pairs generated` | Teacher ignoring the response format | Tighten the prompt template, lower temperature, or use an instruct-tuned model. |
-| `adapter_model.safetensors not found` | Training crashed (probably OOM) | Check `train.log` on the droplet. Lower `batch_size` or `cutoff_len`. |
+| `teacher boot timeout` | vLLM weight download slow, or wrong dtype | Try `--dtype auto` or a smaller model. Watch `/root/fine-tune/runs/<id>/teacher.log`. |
+| Generator errors `Connection refused` | Firewall blocks the vLLM port | Open the port (`ufw allow <port>/tcp`) or change it in Step 2. |
+| `no valid Q&A pairs generated` | Teacher ignoring the response format | Tighten the prompt template, lower temperature, or use an instruct-tuned model. Check the **Reasoning parser** is set — without it the thinking block can consume the whole output budget. |
+| `adapter_model.safetensors not found` | Training crashed (usually OOM) | Check `train.log`. Lower `batch_size` or `cutoff_len`, or switch to a smaller serving profile. |
 | SSH "no auth method" | Both key and password fields empty | Drop a key file in the Credentials panel or paste a password. |
+| `422 Size is not available in this region` | The plan is retired or not entitled for this team | The error names plans that *do* publish a creatable region — pick one of those. |
+| `422 This size is unavailable` | A retired `-devcloud` / `-contracted` slug | Slugs are normalised automatically; re-sync the account to refresh the plan list. |
+| `401 Unable to authenticate you` | A Developer Cloud host was set as **API Base** with a `dop_v1_` token | Clear the API Base field — DigitalOcean tokens are served by the standard control plane. |
+| Teacher output truncated mid-answer | Thinking consumed the token budget | Lower the thinking effort, or raise the generator's `max_tokens`. |
 
 ---
 
 ## Tech stack
 
 - **Frontend:** React 19, TypeScript, Tailwind CSS 4, Vite 6, Motion, lucide-react
-- **Backend:** Rust, Tauri 2, russh (SSH), Qdrant HTTP, OpenAI-compatible vLLM client
-- **Remote ML:** vLLM (teacher serving), LLaMA-Factory (LoRA training), Hugging Face Hub
+- **Backend:** Rust, Tauri 2, russh (SSH), reqwest, Qdrant HTTP, OpenAI-compatible vLLM client
+- **Remote ML:** vLLM (teacher serving), LLaMA-Factory (supervised training), Unsloth + TRL (GRPO / ZRALD), Hugging Face Hub
+- **Infrastructure:** DigitalOcean GPU droplets (AMD Instinct MI300X / MI325X), Docker + ROCm
 
 ---
-## About
-
-Fine-Tune Model is a desktop fine-tuning workspace for building LoRA adapters from a knowledge base. The main app, Fine-Tune Studio, is a Tauri 2 desktop application that orchestrates Qdrant retrieval, vLLM teacher serving, JSONL dataset generation, LLaMA-Factory training, and adapter output on a remote GPU droplet over SSH.
-
-The local machine stays lightweight while the GPU server handles model serving and training. The app also records local droplet usage time and estimated cost without relying on provider usage reports.
 
 ## License
 

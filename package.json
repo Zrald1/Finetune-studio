@@ -10,6 +10,10 @@
     "build": "tauri build",
     "preview": "vite preview",
     "lint": "tsc --noEmit",
+    "simulate": "node scripts/simulate-deploy.ts",
+    "simulate:zrald": "cargo test --manifest-path src-tauri/Cargo.toml zrald_simulation",
+    "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "test": "npm run test:rust && npm run simulate",
     "tauri": "tauri"
   },
   "dependencies": {

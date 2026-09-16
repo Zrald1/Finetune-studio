@@ -43,7 +43,7 @@ interface QuantInfo {
 const QUANT_PATTERNS: Array<{ pattern: RegExp; info: Omit<QuantInfo, "format"> }> = [
   { pattern: /\bawq\b/i, info: { vllmFlag: "awq", label: "AWQ", colorClass: "text-violet-300", bgClass: "bg-violet-500/10", borderClass: "border-violet-500/30", description: "Activation-Aware Weight Quantization — INT4 with Marlin kernel. Best accuracy/speed balance." } },
   { pattern: /\bgptq\b/i, info: { vllmFlag: "gptq", label: "GPTQ", colorClass: "text-blue-300", bgClass: "bg-blue-500/10", borderClass: "border-blue-500/30", description: "GPTQ post-training INT4/INT8. Use with Marlin kernel for best performance." } },
-  { pattern: /\bfp8\b/i, info: { vllmFlag: "fp8", label: "FP8", colorClass: "text-cyan-300", bgClass: "bg-cyan-500/10", borderClass: "border-cyan-500/30", description: "FP8 — ideal for H100/H200/Blackwell. ~1.6× speedup over BF16." } },
+  { pattern: /\bfp8\b/i, info: { vllmFlag: "fp8", label: "FP8", colorClass: "text-cyan-300", bgClass: "bg-cyan-500/10", borderClass: "border-cyan-500/30", description: "FP8 — half-precision weights, ~1.6× faster than BF16 on FP8-capable accelerators." } },
   { pattern: /\b(gguf|q4_k_m|q5_k_m|q8_0|q4_0|ggml)\b/i, info: { vllmFlag: "gguf", label: "GGUF", colorClass: "text-amber-300", bgClass: "bg-amber-500/10", borderClass: "border-amber-500/30", description: "GGUF/llama.cpp format. Served via vLLM GGUF backend." } },
   { pattern: /\b(bnb|bitsandbytes|int8|8bit|8-bit)\b/i, info: { vllmFlag: "bitsandbytes", label: "BnB INT8", colorClass: "text-orange-300", bgClass: "bg-orange-500/10", borderClass: "border-orange-500/30", description: "BitsAndBytes INT8. Good for consumer GPUs with limited VRAM." } },
   { pattern: /\b(int4|4bit|4-bit)\b/i, info: { vllmFlag: "awq", label: "INT4", colorClass: "text-fuchsia-300", bgClass: "bg-fuchsia-500/10", borderClass: "border-fuchsia-500/30", description: "INT4 quantized. Auto-selecting AWQ kernel for best throughput." } },
@@ -698,10 +698,9 @@ export default function DeployPanel({ config }: Props) {
                   </Field>
                   <Field label="KV Cache Dtype">
                     <select value={kvCacheDtype} onChange={(e) => setKvCacheDtype(e.target.value)} className="w-full px-2 py-1.5 theme-field border rounded text-[11px] font-mono text-white focus:outline-none focus:border-theme-accent">
-                      <option value="auto">auto (match model)</option>
-                      <option value="fp8">fp8 — H100/H200 (2× capacity)</option>
-                      <option value="fp8_e4m3">fp8_e4m3 — high precision</option>
-                      <option value="fp8_e5m2">fp8_e5m2 — high dynamic range</option>
+                      <option value="auto">Auto — match model</option>
+                      <option value="fp8">FP8 — 2× KV capacity</option>
+                      <option value="fp8_e5m2">FP8 E5M2 — wider range</option>
                     </select>
                   </Field>
                   <Field label="CPU Swap Space (GB)">

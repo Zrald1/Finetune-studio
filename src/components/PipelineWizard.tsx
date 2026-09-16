@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   AppConfig,
   Chunk,
@@ -13,6 +13,8 @@ import type {
   PaddleOcrConfig,
   Run,
   RunConfig,
+  ServingProfile,
+  TeacherBenchReport,
   TeacherConfig,
   TopicTarget,
 } from "../types";
@@ -23,12 +25,21 @@ import {
   DEFAULT_LORA,
   DEFAULT_PADDLE_OCR,
   DEFAULT_TEACHER,
+  REASONING_EFFORT_OPTIONS,
 } from "../types";
 import { api, events } from "../lib/tauri";
+import {
+  autoTuneTeacherConfig,
+  optimizedProfileSummary,
+  PRESET_TEACHER_MODELS,
+  standardProfileSummary,
+  teacherConfigEquals,
+} from "../lib/servingProfiles";
 import { clearSetupLogs, getSetupLogSnapshot, subscribeSetupLogs } from "../lib/setupLogs";
 import { stripModelThinking } from "../lib/textSanitize";
 import TrainingConfigForm, { type StudentModelOption } from "./TrainingConfigForm";
 import {
+  BarChart3,
   CheckCircle2,
   ChevronRight,
   ChevronLeft,
@@ -326,52 +337,12 @@ const SELECT_CLASS =
   "w-full px-4 py-2.5 premium-input rounded-xl text-sm-fluid font-black font-mono focus:outline-none appearance-none cursor-pointer [color-scheme:dark]";
 const OPTION_CLASS = "theme-surface theme-text";
 
-const PRESET_TEACHER_MODELS = [
-  { value: "Qwen/Qwen3.6-35B-A3B", label: "Qwen 3.6 35B A3B (Recommended MoE)" },
-  { value: "Qwen/Qwen2.5-72B-Instruct", label: "Qwen 2.5 72B Instruct (High Parameter)" },
-  { value: "Qwen/Qwen2.5-32B-Instruct", label: "Qwen 2.5 32B Instruct" },
-  { value: "Qwen/Qwen2.5-14B-Instruct", label: "Qwen 2.5 14B Instruct" },
-  { value: "Qwen/Qwen2.5-7B-Instruct", label: "Qwen 2.5 7B Instruct (Lightweight)" },
-  { value: "Qwen/Qwen2.5-Coder-32B-Instruct", label: "Qwen 2.5 Coder 32B Instruct" },
-  { value: "Qwen/Qwen2.5-Coder-7B-Instruct", label: "Qwen 2.5 Coder 7B Instruct" },
-  { value: "deepseek-ai/DeepSeek-R1-Distill-Llama-70B", label: "DeepSeek R1 Distill Llama 70B" },
-];
-
-function autoTuneTeacherConfig(base: TeacherConfig, gpuStatus?: GPUState | null): TeacherConfig {
-  if (!base.autoTune || (base.customServeCmd || "").trim()) return base;
-
-  const repo = (base.repoId || "").toLowerCase();
-  const memoryGb = (gpuStatus?.memoryTotal || 0) / 1024;
-  const isQwen3 = repo.includes("qwen3");
-  const isVision = repo.includes("-vl") || repo.includes("vision");
-  const isGguf = repo.includes("gguf");
-
-  let maxModelLen = Math.max(base.maxModelLen || 32768, 32768);
-  if (isQwen3 && isVision && memoryGb >= 180) maxModelLen = 100000;
-  else if ((isQwen3 || isVision) && memoryGb >= 96) maxModelLen = 65536;
-  else if (isGguf) maxModelLen = 32768;
-
-  const maxNumBatchedTokens = memoryGb > 0 && memoryGb < 64 ? 4096 : 8192;
-  const maxNumSeqs = memoryGb > 0 && memoryGb < 64 ? 4 : memoryGb > 0 && memoryGb < 128 ? 8 : 16;
-
-  return {
-    ...base,
-    maxModelLen,
-    dtype: "bfloat16",
-    tensorParallel: Math.max(base.tensorParallel || 1, 1),
-    gpuMemoryUtilization: 0.80,
-    enableChunkedPrefill: true,
-    maxNumBatchedTokens,
-    maxNumSeqs,
-    enableAutoToolChoice: isQwen3,
-    toolCallParser: isQwen3 ? "qwen3_coder" : "",
-    servingEngine: "vllm",
-  };
-}
-
-function teacherConfigEquals(a: TeacherConfig, b: TeacherConfig): boolean {
-  return JSON.stringify(a) === JSON.stringify(b);
-}
+// Curated teacher roster. Qwen3.8-27B is the supported default: 27B dense
+// hybrid-attention checkpoint, 262K native context, Apache 2.0, and the model
+// vLLM publishes a verified recipe for on AMD Instinct MI300X/MI325X/MI355X.
+// Everything else is reachable through "Custom Hugging Face Repo ID".
+// The profile logic lives in ../lib/servingProfiles so it can be simulated
+// without a browser (see scripts/simulate-deploy.ts).
 
 /** Multi-select HF dataset picker used in Training-Only mode. */
 function MultiDatasetPicker(props: {
@@ -1972,6 +1943,7 @@ function TeacherStep({
   deploying,
   deployLogs,
   deployError,
+  teacherEndpoint,
   onCheckStatus,
   onDeploy,
   onCancelDeploy,
@@ -1986,6 +1958,8 @@ function TeacherStep({
   deploying: boolean;
   deployLogs: string;
   deployError: string | null;
+  /** Base URL of the running teacher, e.g. http://1.2.3.4:8000 */
+  teacherEndpoint: string;
   onCheckStatus: () => void;
   onDeploy: () => void;
   onCancelDeploy: () => void;
@@ -1995,14 +1969,48 @@ function TeacherStep({
     onChange(autoTuneTeacherConfig(next, gpuStatus));
   };
 
+  // Switching profile must patch and re-tune in one pass: two sequential set()
+  // calls would both read the same pre-render `value`, so the second would
+  // re-apply the profile the user just left.
+  const setServingProfile = (profile: ServingProfile) => {
+    onChange(autoTuneTeacherConfig({ ...value, servingProfile: profile, autoTune: true }, gpuStatus));
+  };
+
   useEffect(() => {
     const tuned = autoTuneTeacherConfig(value, gpuStatus);
     if (!teacherConfigEquals(tuned, value)) onChange(tuned);
-  }, [value.repoId, value.autoTune, value.customServeCmd, gpuStatus?.memoryTotal]);
+  }, [value.repoId, value.autoTune, value.servingProfile, value.customServeCmd, gpuStatus?.memoryTotal]);
 
   const autoTuneActive = !!value.autoTune && !(value.customServeCmd || "").trim();
   const managedDisabled = !!value.customServeCmd || autoTuneActive;
   const canDeployTeacher = !!((value.customServeCmd || "").trim() || (value.repoId || "").trim());
+
+  // ── Benchmark ───────────────────────────────────────────────────────────
+  const [benchRunning, setBenchRunning] = useState(false);
+  const [benchReport, setBenchReport] = useState<TeacherBenchReport | null>(null);
+  const [benchError, setBenchError] = useState<string | null>(null);
+  const [benchConcurrent, setBenchConcurrent] = useState(false);
+
+  const runBenchmark = useCallback(async () => {
+    if (benchRunning) return;
+    setBenchRunning(true);
+    setBenchError(null);
+    try {
+      const reachable = await api.pingTeacher(teacherEndpoint);
+      if (!reachable) throw new Error("Teacher endpoint is not reachable — deploy the model first.");
+      const report = await api.benchmarkTeacher(teacherEndpoint, value.repoId, {
+        // Single-stream by default: that is what dataset generation experiences.
+        concurrency: benchConcurrent ? 4 : 1,
+        maxTokens: 512,
+        reasoningEffort: value.reasoningEffort ?? null,
+      });
+      setBenchReport(report);
+    } catch (e: any) {
+      setBenchError(String(e));
+    } finally {
+      setBenchRunning(false);
+    }
+  }, [benchRunning, teacherEndpoint, value.repoId, value.reasoningEffort, benchConcurrent]);
 
   const deployLogRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
@@ -2123,25 +2131,73 @@ function TeacherStep({
           </div>
         )}
 
-        <div className="grid grid-cols-1 md:grid-cols-[1fr_auto] gap-3 items-center rounded-xl border border-white/5 bg-white/[0.015] px-4 py-3">
-          <div className="min-w-0">
-            <div className="text-[10px] uppercase tracking-widest theme-muted font-black">Adaptive ROCm Serving Profile</div>
-            <div className="mt-1 text-[9px] theme-faint font-mono uppercase tracking-tight">
-              {autoTuneActive
-                ? `Model and GPU tuned: ${value.dtype}, ${value.maxModelLen} ctx, ${value.maxNumBatchedTokens || 0} batched tokens, ${value.maxNumSeqs || 0} seqs`
-                : "Manual vLLM parameters are active"}
+        <div className="rounded-xl border border-white/5 bg-white/[0.015] px-4 py-3 space-y-3">
+          <div className="grid grid-cols-1 md:grid-cols-[1fr_auto] gap-3 items-center">
+            <div className="min-w-0">
+              <div className="text-[10px] uppercase tracking-widest theme-muted font-black">ROCm Serving Profile</div>
+              <div className="mt-1 text-[9px] theme-faint font-mono uppercase tracking-tight">
+                {!value.autoTune
+                  ? "Manual vLLM parameters are active"
+                  : value.servingProfile === "optimized"
+                    ? optimizedProfileSummary((gpuStatus?.memoryTotal || 0) / 1024)
+                    : standardProfileSummary(value)}
+              </div>
+            </div>
+            <div className="flex items-center gap-2 justify-end shrink-0">
+              <button
+                type="button"
+                onClick={() => setServingProfile("standard")}
+                disabled={!!value.customServeCmd}
+                className={`px-4 py-2 rounded-xl border text-[10px] uppercase tracking-widest font-black transition-all disabled:opacity-30 ${
+                  value.autoTune && value.servingProfile !== "optimized"
+                    ? "theme-accent-soft theme-accent border-theme-accent/40"
+                    : "border-white/10 theme-muted hover:theme-text"
+                }`}
+              >
+                Standard
+              </button>
+              <button
+                type="button"
+                onClick={() => setServingProfile("optimized")}
+                disabled={!!value.customServeCmd}
+                className={`px-4 py-2 rounded-xl border text-[10px] uppercase tracking-widest font-black transition-all flex items-center gap-2 disabled:opacity-30 ${
+                  value.autoTune && value.servingProfile === "optimized"
+                    ? "theme-accent-soft theme-accent border-theme-accent/40"
+                    : "border-white/10 theme-muted hover:theme-text"
+                }`}
+              >
+                <Zap className="w-3.5 h-3.5" />
+                Optimized
+              </button>
             </div>
           </div>
-          <label className="flex items-center gap-3 cursor-pointer select-none justify-end">
-            <input
-              type="checkbox"
-              checked={!!value.autoTune}
-              onChange={(e) => set("autoTune", e.target.checked)}
-              disabled={!!value.customServeCmd}
-              className="h-4 w-4 accent-[rgb(var(--app-accent-rgb))]"
-            />
-            <span className="text-[10px] uppercase tracking-widest theme-accent font-black">Auto Tune</span>
-          </label>
+          {value.autoTune && value.servingProfile === "optimized" && (
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-t border-white/5 pt-3">
+              <div className="text-[9px] theme-faint font-mono leading-relaxed">
+                Vendor recipe for this checkpoint: full native context, FP8 KV cache (native on gfx942), prefix caching,
+                reasoning parser and higher concurrency.
+              </div>
+              <button
+                type="button"
+                onClick={() => setServingProfile("standard")}
+                className="text-[9px] uppercase tracking-widest theme-muted font-black hover:theme-text shrink-0 self-start sm:self-auto"
+              >
+                Revert to Standard
+              </button>
+            </div>
+          )}
+          {!value.autoTune && (
+            <div className="border-t border-white/5 pt-3">
+              <button
+                type="button"
+                onClick={() => set("autoTune", true)}
+                disabled={!!value.customServeCmd}
+                className="text-[9px] uppercase tracking-widest theme-accent font-black hover:brightness-125 disabled:opacity-30"
+              >
+                Re-enable automatic tuning
+              </button>
+            </div>
+          )}
         </div>
 
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
@@ -2213,6 +2269,51 @@ function TeacherStep({
           </div>
         )}
 
+        <div className="space-y-2">
+          <label className="text-[9px] uppercase tracking-[0.15em] theme-muted font-black ml-1">Reasoning Parser</label>
+          <input
+            type="text"
+            value={value.reasoningParser || ""}
+            onChange={(e) => set("reasoningParser", e.target.value)}
+            disabled={managedDisabled}
+            placeholder="qwen3"
+            className="w-full px-4 py-3 premium-input rounded-xl text-[11px] font-black font-mono focus:outline-none"
+          />
+          <p className="text-[9px] theme-faint font-mono ml-1 leading-relaxed">
+            Splits the model's thinking into <span className="theme-muted">reasoning_content</span>. Qwen3.5+ models need this
+            (<span className="theme-muted">qwen3</span>) or the reasoning stays in the message body and consumes the output budget.
+          </p>
+        </div>
+
+        <div className="space-y-2.5">
+          <label className="text-[9px] uppercase tracking-[0.15em] theme-muted font-black ml-1">Thinking Effort</label>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+            {REASONING_EFFORT_OPTIONS.map((option) => {
+              const active = (value.reasoningEffort || "xhigh") === option.value;
+              return (
+                <button
+                  key={option.value}
+                  type="button"
+                  title={option.hint}
+                  onClick={() => set("reasoningEffort", option.value)}
+                  className={`px-3 py-2.5 rounded-xl border text-[10px] font-black uppercase tracking-widest transition-all ${
+                    active
+                      ? "theme-accent-soft theme-accent border-theme-accent/40"
+                      : "border-white/10 theme-muted hover:theme-text hover:border-white/20"
+                  }`}
+                >
+                  {option.label}
+                </button>
+              );
+            })}
+          </div>
+          <p className="text-[9px] theme-faint font-mono ml-1 leading-relaxed">
+            Sent per request as <span className="theme-muted">chat_template_kwargs</span>, so it applies without redeploying.
+            Qwen3.8 accepts only XHigh / Medium / Low — <span className="theme-muted">high</span> is not a valid Qwen3.8 level
+            and would fail the request, so it is not offered.
+          </p>
+        </div>
+
         <div className="space-y-3 pt-2">
            <div className="flex items-center justify-between ml-1">
             <label className="text-[10px] uppercase tracking-widest theme-muted font-black">Execution Binary Sequence <span className="opacity-40 font-mono tracking-normal text-[8px]">(OVERRIDE)</span></label>
@@ -2255,6 +2356,16 @@ function TeacherStep({
               >
                 Verify
               </button>
+              <button
+                type="button"
+                disabled={benchRunning || !teacherEndpoint}
+                onClick={runBenchmark}
+                title="Measure TTFT, per-token latency and tokens/sec on the deployed teacher"
+                className="px-5 py-2 rounded-xl border border-white/10 theme-surface-soft theme-muted hover:theme-text hover:border-theme-accent/30 text-[10px] font-black uppercase tracking-widest transition-all shadow-sm flex items-center gap-2 disabled:opacity-30"
+              >
+                {benchRunning ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <BarChart3 className="w-3.5 h-3.5" />}
+                {benchRunning ? "Benchmarking" : "Benchmark"}
+              </button>
               {deploying ? (
                 <button
                   type="button"
@@ -2275,6 +2386,115 @@ function TeacherStep({
               )}
             </div>
           </div>
+
+          {(benchRunning || benchReport || benchError) && (
+            <div className="animate-premium rounded-2xl border border-white/5 bg-white/[0.015] overflow-hidden">
+              <div className="px-5 py-3 border-b border-white/5 flex items-center justify-between gap-3 flex-wrap">
+                <div className="flex items-center gap-2">
+                  <BarChart3 className="w-4 h-4 theme-accent" />
+                  <span className="text-[10px] uppercase tracking-[0.2em] theme-accent font-black font-mono">Teacher Inference Benchmark</span>
+                  <span className="text-[9px] theme-faint font-mono">TTFT · TPOT · ITL · tokens/sec</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setBenchConcurrent((v) => !v)}
+                    title="Serial measures single-stream latency (what dataset generation sees). Concurrent fires 4 requests at once to measure aggregate throughput."
+                    className={`px-3 py-1.5 rounded-lg border text-[9px] uppercase tracking-widest font-black transition-all ${
+                      benchConcurrent
+                        ? "theme-accent-soft theme-accent border-theme-accent/40"
+                        : "border-white/10 theme-muted hover:theme-text"
+                    }`}
+                  >
+                    {benchConcurrent ? "Concurrent ×4" : "Serial"}
+                  </button>
+                  {benchReport && (
+                    <button
+                      type="button"
+                      onClick={() => { setBenchReport(null); setBenchError(null); }}
+                      className="text-[9px] uppercase tracking-widest theme-muted font-black hover:theme-text"
+                    >
+                      Clear
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {benchRunning && (
+                <div className="px-5 py-6 text-[11px] theme-muted font-mono flex items-center gap-3">
+                  <Loader2 className="w-4 h-4 animate-spin theme-accent" />
+                  Streaming benchmark prompts — measuring time-to-first-token…
+                </div>
+              )}
+
+              {benchError && !benchRunning && (
+                <div className="px-5 py-4 text-[10px] text-red-400 font-mono uppercase tracking-widest">✕ {benchError}</div>
+              )}
+
+              {benchReport && !benchRunning && (
+                <div className="p-5 space-y-4">
+                  <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+                    {[
+                      { label: "TTFT", value: `${benchReport.meanTtftMs.toFixed(0)} ms`, sub: `p95 ${benchReport.p95TtftMs.toFixed(0)} ms`, accent: true },
+                      { label: "TPOT", value: `${benchReport.meanTpotMs.toFixed(1)} ms`, sub: "per output token" },
+                      { label: "ITL", value: `${benchReport.meanItlMs.toFixed(1)} ms`, sub: "inter-token" },
+                      { label: "Output", value: `${benchReport.outputTokensPerS.toFixed(1)} tok/s`, sub: "generation", accent: true },
+                      { label: "Total", value: `${benchReport.totalTokensPerS.toFixed(1)} tok/s`, sub: "in + out" },
+                      { label: "E2EL", value: `${(benchReport.meanE2elMs / 1000).toFixed(2)} s`, sub: "per request" },
+                    ].map((m) => (
+                      <div key={m.label} className={`rounded-xl border px-4 py-3 ${m.accent ? "border-theme-accent/30 bg-theme-accent/[0.04]" : "border-white/5 bg-white/[0.015]"}`}>
+                        <div className="text-[9px] uppercase tracking-[0.2em] theme-muted font-black">{m.label}</div>
+                        <div className={`mt-1.5 text-lg font-black font-mono tabular-nums ${m.accent ? "theme-accent" : "text-white"}`}>{m.value}</div>
+                        <div className="text-[9px] theme-faint font-mono uppercase tracking-tight mt-0.5">{m.sub}</div>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-x-5 gap-y-1 text-[9px] theme-faint font-mono uppercase tracking-tight">
+                    <span>{benchReport.completed} ok{benchReport.failed ? ` · ${benchReport.failed} failed` : ""}</span>
+                    <span>{benchReport.totalOutputTokens} output tokens · {benchReport.totalInputTokens} input</span>
+                    <span>{benchReport.requestThroughput.toFixed(2)} req/s</span>
+                    <span>{benchReport.durationS.toFixed(1)}s wall</span>
+                    <span>{benchReport.concurrency > 1 ? `concurrent ×${benchReport.concurrency}` : "serial"}</span>
+                    <span>thinking: {benchReport.reasoningEffort || "model default"}</span>
+                    <span>max {benchReport.maxTokens} tok</span>
+                  </div>
+
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-[10px] font-mono">
+                      <thead>
+                        <tr className="text-[9px] uppercase tracking-widest theme-muted">
+                          <th className="text-left font-black pb-2 pr-3">Prompt</th>
+                          <th className="text-right font-black pb-2 px-2">TTFT</th>
+                          <th className="text-right font-black pb-2 px-2">Think</th>
+                          <th className="text-right font-black pb-2 px-2">Tok</th>
+                          <th className="text-right font-black pb-2 px-2">TPOT</th>
+                          <th className="text-right font-black pb-2 pl-2">tok/s</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {benchReport.samples.map((s) => (
+                          <tr key={s.index} className="border-t border-white/5">
+                            <td className="py-1.5 pr-3 theme-muted truncate max-w-[280px]" title={s.prompt}>{s.prompt}</td>
+                            <td className="py-1.5 px-2 text-right text-white tabular-nums">{s.ttftMs.toFixed(0)}ms</td>
+                            <td className="py-1.5 px-2 text-right theme-faint tabular-nums">
+                              {s.ttfcMs != null ? `${Math.max(0, s.ttfcMs - s.ttftMs).toFixed(0)}ms` : "—"}
+                            </td>
+                            <td className="py-1.5 px-2 text-right text-white tabular-nums">{s.outputTokens}</td>
+                            <td className="py-1.5 px-2 text-right theme-muted tabular-nums">{s.tpotMs.toFixed(1)}ms</td>
+                            <td className="py-1.5 pl-2 text-right theme-accent tabular-nums">{s.outputTps.toFixed(1)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  {benchReport.errors.length > 0 && (
+                    <div className="text-[9px] text-amber-300 font-mono">{benchReport.errors.length} request(s) failed — first: {benchReport.errors[0]}</div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
 
           {(deploying || deployLogs || deployError) && (
             <div className="animate-premium">
@@ -3530,7 +3750,7 @@ const [pipelineMode, setPipelineMode] = useState<PipelineMode>("rag");
 
       <div className="p-8 space-y-8 min-h-[520px]">
         {step === 0 && <KnowledgeBaseStep gpuStatus={gpuStatus ?? null} samples={samples} loading={loadingKb} error={kbError} config={config} onConfigChange={onConfigChange} onSkip={() => setStep(1)} />}
-        {step === 1 && <TeacherStep value={teacher} onChange={(t) => { setTeacher(t); onConfigChange({ teacher: t }); }} gpuStatus={gpuStatus} hfToken={config.hfToken || ""} checkingTeacher={checkingTeacher} teacherDeployed={teacherDeployed} deployedTeacherModel={deployedTeacherModel} deploying={deploying} deployLogs={deployLogs} deployError={deployError} onCheckStatus={() => checkDeployment(teacher)} onDeploy={startDeployment} onCancelDeploy={cancelDeployment} />}
+        {step === 1 && <TeacherStep value={teacher} onChange={(t) => { setTeacher(t); onConfigChange({ teacher: t }); }} gpuStatus={gpuStatus} hfToken={config.hfToken || ""} checkingTeacher={checkingTeacher} teacherDeployed={teacherDeployed} deployedTeacherModel={deployedTeacherModel} deploying={deploying} deployLogs={deployLogs} deployError={deployError} teacherEndpoint={config.ssh.host ? `http://${config.ssh.host}:${teacher.vllmPort}` : ""} onCheckStatus={() => checkDeployment(teacher)} onDeploy={startDeployment} onCancelDeploy={cancelDeployment} />}
         {step === 2 && !isTrainingOnly && <DatasetStep config={config} onConfigChange={onConfigChange} trainingOnly={isTrainingOnly} onSwitchToGenerateDataset={() => { setPipelineMode("rag"); setStep(0); }} topics={topics} onTopicsChange={setTopics} prompt={prompt} onPromptChange={handlePromptChange} maxPairsPerChunk={maxPairsPerChunk} onMaxPairsChange={setMaxPairsPerChunk} concurrency={concurrency} onConcurrencyChange={setConcurrency} maxChunks={maxChunks} onMaxChunksChange={setMaxChunks} hubDataset={hubDataset} onHubDatasetChange={setHubDataset} hfTokenSet={!!config.hfToken} hfUsername={hfUsername} hfDatasets={hfDatasets} hfLoading={hfLoading} hfError={hfError} onRefreshHf={refreshHf} generating={generatingDataset} generated={datasetGenerated} progress={generationProgress} logs={generationLogs} error={generationError} onGenerate={startDatasetGeneration} onCancel={cancelDatasetGeneration} sshHostSet={!!config.ssh.host} method={lora.method} enableVerification={enableVerification} onEnableVerificationChange={setEnableVerification} bundleWindow={bundleWindow} onBundleWindowChange={setBundleWindow} datasetFormat={datasetFormat} onDatasetFormatChange={setDatasetFormat} />}
         {step === 3 && <TrainStep trainingOnly={isTrainingOnly} requiresCloudTrainingDataset={requiresCloudTrainingDataset} zraldUsesHf={zraldUsesHf} trainingDataset={(isTrainingOnly || zraldUsesHf) ? <DatasetStep config={config} onConfigChange={onConfigChange} trainingOnly={requiresCloudTrainingDataset} onSwitchToGenerateDataset={() => { setPipelineMode("rag"); setStep(0); }} topics={topics} onTopicsChange={setTopics} prompt={prompt} onPromptChange={handlePromptChange} maxPairsPerChunk={maxPairsPerChunk} onMaxPairsChange={setMaxPairsPerChunk} concurrency={concurrency} onConcurrencyChange={setConcurrency} maxChunks={maxChunks} onMaxChunksChange={setMaxChunks} hubDataset={hubDataset} onHubDatasetChange={setHubDataset} hfTokenSet={!!config.hfToken} hfUsername={hfUsername} hfDatasets={hfDatasets} hfLoading={hfLoading} hfError={hfError} onRefreshHf={refreshHf} generating={generatingDataset} generated={datasetGenerated} progress={generationProgress} logs={generationLogs} error={generationError} onGenerate={startDatasetGeneration} onCancel={cancelDatasetGeneration} sshHostSet={!!config.ssh.host} method={lora.method} enableVerification={enableVerification} onEnableVerificationChange={setEnableVerification} bundleWindow={bundleWindow} onBundleWindowChange={setBundleWindow} datasetFormat={datasetFormat} onDatasetFormatChange={setDatasetFormat} /> : null} runName={runName} onRunNameChange={setRunName} lora={lora} onLoraChange={setLora} studentModel={studentModel} onStudentChange={setStudentModel} studentModelOptions={studentModelOptions} hfLoading={hfLoading} hfTokenSet={!!config.hfToken} onRefreshModels={refreshModelPickers} hub={hub} onHubChange={setHub} hfUsername={hfUsername} canLaunch={!!canLaunch} launching={launching} launchError={launchError} onLaunch={launch} validatingDataset={validatingDataset} datasetsValidated={datasetsValidated} trainingOnlyDatasets={trainingOnlyDatasets} hubDatasetValidation={hubDataset.validationResult || {}} onValidateDatasets={openValidateModal} validateButtonRef={validateButtonRef} />}
       </div>
