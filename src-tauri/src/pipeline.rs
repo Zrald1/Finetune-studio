@@ -2792,7 +2792,7 @@ else: print('NOT_FOUND')\
                         );
                         return Ok(());
                     }
-                    let prompt = match generator::build_prompt_bundled(&gen_c.prompt_template, &chunk, &qd_in, bundle_window).await {
+                    let mut prompt = match generator::build_prompt_bundled(&gen_c.prompt_template, &chunk, &qd_in, bundle_window).await {
                         Ok(p) => p,
                         Err(e) => {
                             emit_log(
@@ -2804,6 +2804,18 @@ else: print('NOT_FOUND')\
                             generator::build_prompt(&gen_c.prompt_template, &chunk)
                         }
                     };
+
+                    // Push onto an uncovered aspect. Without this, repeated
+                    // calls on one chunk converge on the same fact: measured,
+                    // four generations from a three-fact source all produced
+                    // pairs about one of them, so a student trained on the
+                    // result answered that fact and invented the rest.
+                    {
+                        let asked = seen_questions_in.lock().clone();
+                        if !asked.is_empty() {
+                            prompt.push_str(&generator::coverage_hint(&asked, 8));
+                        }
+                    }
                     match generator::ask_teacher(&gen_c, &prompt).await {
                         Ok(raw) => {
                             match generator::parse_pair(&raw, &chunk, dataset_format) {

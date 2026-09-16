@@ -936,6 +936,57 @@ pub fn parse_conversational(
     })
 }
 
+/// Prompt addendum that pushes the teacher onto an uncovered aspect.
+///
+/// Without this, repeated calls on one chunk converge. Measured on a source
+/// containing three distinct facts, four consecutive generations all produced
+/// pairs about the same one. Nothing was individually wrong — every pair was
+/// grounded, well-formed and above the length floor — but the dataset did not
+/// span the document, so a student trained on it answered the covered fact
+/// correctly and invented the others. That failure is invisible from the
+/// dataset side, which is why it has to be prevented at generation time.
+///
+/// Showing the questions already written and asking for a different aspect is
+/// the cheap version of Evol-Instruct's in-breadth evolution: no extra model, no
+/// scoring pass, no parser changes.
+///
+/// Returns an empty string when nothing has been asked yet, so the first
+/// question from a chunk stays unconstrained.
+pub fn coverage_hint(already_asked: &[String], max_shown: usize) -> String {
+    let usable: Vec<&str> = already_asked
+        .iter()
+        .map(|q| q.trim())
+        .filter(|q| !q.is_empty())
+        .collect();
+    if usable.is_empty() {
+        return String::new();
+    }
+
+    // Show the most recent questions — the ones the teacher is most likely to
+    // drift back toward — and cap the count so the prompt cannot grow without
+    // bound over a long run.
+    let limit = max_shown.max(1);
+    let start = usable.len().saturating_sub(limit);
+    let shown = &usable[start..];
+
+    let mut out = String::from(
+        "\n\nCOVERAGE REQUIREMENT:\n\
+         The following questions have already been written from this same material and are \
+         already in the dataset. Repeating them adds nothing:\n",
+    );
+    for (i, q) in shown.iter().enumerate() {
+        out.push_str(&format!("{}. {}\n", i + 1, q));
+    }
+    out.push_str(
+        "\nWrite about a DIFFERENT fact, relationship, or aspect of the source that none of the \
+         above covers. Prefer a part of the source that has not been used yet — a different \
+         entity, a different mechanism, or a different consequence.\n\
+         If the source contains no further distinct fact worth testing, respond with exactly: \
+         SKIP: exhausted\n",
+    );
+    out
+}
+
 pub fn parse_pair(
     raw: &str,
     chunk: &Chunk,
@@ -1570,4 +1621,76 @@ pub async fn build_prompt_bundled(
         chunk.text.clone()
     };
     Ok(template.replace("{chunk_text}", &bundled_text))
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::coverage_hint;
+
+    fn asked() -> Vec<String> {
+        vec![
+            "What do the light-dependent reactions produce?".to_string(),
+            "Where does the Calvin cycle take place?".to_string(),
+        ]
+    }
+
+    #[test]
+    fn no_hint_when_nothing_has_been_asked() {
+        // The first question from a chunk must stay unconstrained.
+        assert_eq!(coverage_hint(&[], 8), "");
+        assert_eq!(coverage_hint(&["".to_string(), "   ".to_string()], 8), "");
+    }
+
+    #[test]
+    fn lists_the_questions_already_written() {
+        let hint = coverage_hint(&asked(), 8);
+        assert!(hint.contains("What do the light-dependent reactions produce?"));
+        assert!(hint.contains("Where does the Calvin cycle take place?"));
+        assert!(hint.contains("1."), "should be numbered");
+    }
+
+    #[test]
+    fn demands_a_different_aspect_and_offers_an_exit() {
+        // The exit matters: without it the teacher invents a distinction that
+        // is not in the source just to satisfy the instruction.
+        let hint = coverage_hint(&asked(), 8);
+        assert!(hint.contains("DIFFERENT"));
+        assert!(hint.contains("SKIP: exhausted"));
+    }
+
+    #[test]
+    fn caps_the_number_of_questions_shown() {
+        // A long run must not grow the prompt without bound.
+        let many: Vec<String> = (0..50).map(|i| format!("Question number {i}?")).collect();
+        let hint = coverage_hint(&many, 5);
+        assert!(hint.contains("Question number 49?"), "most recent should appear");
+        assert!(!hint.contains("Question number 10?"), "old ones should be dropped");
+        assert_eq!(hint.matches("?").count(), 5, "exactly the cap");
+    }
+
+    #[test]
+    fn keeps_the_most_recent_questions() {
+        let many: Vec<String> = (0..10).map(|i| format!("Q{i}?")).collect();
+        let hint = coverage_hint(&many, 3);
+        assert!(hint.contains("Q9?") && hint.contains("Q8?") && hint.contains("Q7?"));
+        assert!(!hint.contains("Q6?"));
+    }
+
+    #[test]
+    fn a_zero_cap_still_shows_one() {
+        // Showing none would make the hint useless while still costing tokens.
+        // One is the most recent question, which is the one the teacher is most
+        // likely to drift back toward.
+        let hint = coverage_hint(&asked(), 0);
+        assert!(hint.contains("Where does the Calvin cycle take place?"));
+        assert_eq!(hint.matches("1.").count(), 1);
+    }
+
+    #[test]
+    fn ignores_blank_entries() {
+        let mixed = vec!["".to_string(), "  ".to_string(), "Real question?".to_string()];
+        let hint = coverage_hint(&mixed, 8);
+        assert!(hint.contains("Real question?"));
+        assert_eq!(hint.matches("1.").count(), 1, "only one numbered entry");
+    }
 }

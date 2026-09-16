@@ -180,11 +180,27 @@ Every built-in prompt now shows the expected *shape* of each field. A length flo
 would have rejected the entire run rather than fixing it. Training loss on the same source
 fell from **1.2281 to 0.4087** once answers carried real content.
 
-**Known limitation:** the teacher tends to cover one concept per chunk repeatedly rather than
-spanning the source. All four test pairs addressed the same fact, so the trained student
-answered that fact correctly and hallucinated an untested one. The fix is to vary the
-extraction angle across calls on the same chunk; until then, `question diversity` in the
-coverage report is the signal to watch.
+### Coverage — spanning the source, not repeating one fact
+
+The teacher converges on one concept when called repeatedly against the same chunk. Measured
+on a source with three distinct facts, four consecutive generations all produced pairs about
+the *same* one. Every pair was individually fine — grounded, well-formed, above the length
+floor — so nothing in the dataset looked wrong. The trained student then answered the covered
+fact correctly and **invented** the others.
+
+The fix is a coverage requirement appended to the prompt: it lists the questions already
+written and asks for a different aspect, with an explicit `SKIP: exhausted` exit so the
+teacher stops rather than manufacturing a distinction the source does not contain.
+
+| | Before | After |
+|---|---|---|
+| Questions about the light reactions | 4/4 | 1/4 |
+| Calvin cycle / RuBisCO | 0 | 2 |
+| Chlorophyll / leaf colour | **0** | **1** |
+| Source exhausted | never | `SKIP: exhausted` |
+
+Training loss on the same source: **1.2281 → 0.4087 → 0.3263** across the prompt fix and this
+one. The student now answers the previously-invented question correctly.
 
 ### Custom templates
 
@@ -481,7 +497,7 @@ No code changes are needed for new domains, models, or datasets.
 
 ## Testing
 
-**197 Rust tests and 343 frontend assertions**, all passing.
+**204 Rust tests and 343 frontend assertions**, all passing.
 
 There is no browser test framework. Verification is split between Rust unit tests and a Node-driven simulation of the frontend profile logic.
 
@@ -541,7 +557,7 @@ The webview's right-click context menu is suppressed so the app reads as a nativ
 | `[template] … rejected — using the built-in` | A custom template cannot work (no `{chunk_text}`, or missing parser markers) | The reason is in the log; the run continues with the built-in. |
 | Most pairs rejected as `not-grounded` | The teacher is answering from memory, not the source | Check the chunk actually reaches the prompt, and that retrieval is returning relevant text. |
 | `[quality] WARNING: … exceed cutoff_len` | LLaMA-Factory will silently truncate those examples | Raise `cutoff_len` in the Train step to the reported value. |
-| Student answers correctly on one fact, invents another | The dataset covered only part of the source | Watch `question diversity`; the fix is varying the extraction angle per chunk. |
+| Student answers correctly on one fact, invents another | The dataset covered only part of the source | Fixed: the coverage requirement now spans the source. If it recurs, check `question diversity` in the coverage report. |
 | `error: unrecognized arguments: --swap-space` | Those flags were removed from vLLM | The Deploy page no longer emits them; update to this version. |
 | `RuntimeError: reshape_and_cache, cache_kernels.hip` | `--kv-cache-dtype fp8_e5m2` is broken on gfx942 | Use `fp8` (native E4M3FNUZ) or `auto`; the UI no longer offers e5m2. |
 | `ValueError: Free memory ... is less than desired GPU memory utilization` | Another model is still resident (often the teacher) | Unload it first — two vLLM engines cannot share the card. |
